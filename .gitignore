@@ -11,12 +11,8 @@ dist/
 build/
 *.spec.bak
 
-# ---- 运行期数据(发动计划/日志/任务) ----
-data/runtime/
-data/logs/
-data/plans/
-data/training/
-data/state.json
+# ---- 运行期数据(设置/发动计划/语料/任务/日志,全部不入库) ----
+data/
 
 # ---- IDE / 系统 ----
 .vscode/
