@@ -51,9 +51,10 @@ WINUI-EXE/
 │   ├── tpq_adapter.py   # 与 TPQ-Final 的唯一集成层(不改动对方代码)
 │   ├── chat.py          # OpenAI 兼容聊天代理(SSE 透传)
 │   ├── training.py      # 语料扫描引擎 + 目标体积规划 + 导出
-│   └── state.py         # data/ 轻量持久化
-├── shell/               # pywebview 原生深色窗口外壳
+│   ├── state.py         # data/ 轻量持久化
+│   └── shell/           # pywebview 原生深色窗口外壳(降级浏览器)
 ├── webui/               # 深色 SPA(原生 HTML/JS/CSS,无构建链)
+├── app_entry.py         # PyInstaller 冻结入口(解决相对导入)
 ├── profiles/builtin/    # 内置领域配置文件(可被导入的同名 id 覆盖)
 ├── docs/INTERFACE.md    # ⇄ TPQ-Final 接口契约(I-0 落地;I-1~I-5 待 TPQ 开发)
 ├── tests/               # pytest 单元测试
