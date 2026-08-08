@@ -1,0 +1,28 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# ---- 打包产物 ----
+dist/
+build/
+*.spec.bak
+
+# ---- 运行期数据(发动计划/日志/任务) ----
+data/runtime/
+data/logs/
+data/plans/
+data/training/
+data/state.json
+
+# ---- IDE / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---- 会话目录 ----
+.zcode/
