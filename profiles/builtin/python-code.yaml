@@ -1,0 +1,24 @@
+# 内置 Profile:Python 代码 —— 体积为估算(校准依赖 INTERFACE I-1 专家字节表)
+schema: winui-expert-profile-v1
+id: python-code
+name: Python 代码
+version: 1
+description: Python 编程 / 代码补全 / 调试 / 解释的专家组合。
+tags: [code, python]
+
+recipe:
+  seed: tpq-winui-builtin
+  layers: 60
+  experts_per_layer: 256
+  density: 0.55             # -> 约 8400 专家 / 215 GiB(估算)
+  layer_affinity: deep
+  mean_size_mb: 26
+  size_jitter: 0.35
+
+drop:
+  enabled: true
+  hint_tags: [code, python]
+
+meta:
+  source: builtin
+  calibrated: false

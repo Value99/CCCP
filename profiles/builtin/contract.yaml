@@ -1,0 +1,24 @@
+# 内置 Profile:合同处理 —— 体积为估算(校准依赖 INTERFACE I-1 专家字节表)
+schema: winui-expert-profile-v1
+id: contract
+name: 合同处理
+version: 1
+description: 合同审阅 / 法律条款 / 风险提取的专家组合。
+tags: [legal, contract, cn]
+
+recipe:
+  seed: tpq-winui-builtin
+  layers: 60
+  experts_per_layer: 256
+  density: 0.34             # -> 约 5200 专家 / 107 GiB(估算)
+  layer_affinity: uniform
+  mean_size_mb: 21
+  size_jitter: 0.35
+
+drop:
+  enabled: true
+  hint_tags: [legal, contract]
+
+meta:
+  source: builtin
+  calibrated: false
