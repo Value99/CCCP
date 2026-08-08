@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WINUI-EXE · TPQ Launcher</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">◆</span>
+      <span class="title">WINUI-EXE · TPQ Launcher</span>
+      <span class="ver" id="ver"></span>
+    </div>
+    <nav class="tabs">
+      <button class="tab" data-tab="chat">聊天</button>
+      <button class="tab active" data-tab="profiles">配置</button>
+      <button class="tab" data-tab="training">训练</button>
+      <button class="tab" data-tab="api">API 服务</button>
+    </nav>
+    <div class="status">
+      <span class="dot" id="statusDot"></span>
+      <span id="statusText">未启动</span>
+    </div>
+  </header>
+
+  <!-- ============ 配置 ============ -->
+  <section class="page active" id="page-profiles">
+    <div class="summary-bar" id="summaryBar">
+      <div class="sum-item"><label>已选</label><b id="sumCount">0</b><span>个配置</span></div>
+      <div class="sum-item"><label>合计专家</label><b id="sumExperts">0</b><span>去重后</span></div>
+      <div class="sum-item accent"><label>占用体积</label><b id="sumMem">0</b><span>GB</span></div>
+      <div class="sum-item save"><label>重叠节省</label><b id="sumOverlap">0</b><span>GB</span></div>
+      <div class="sum-item drop"><label>drop 路由</label><span id="sumDrop" class="chips"></span></div>
+      <div class="sum-note">体积为估算值(未校准);多选时重叠专家只计一次。</div>
+    </div>
+    <div id="perProfile" class="chips" style="margin-bottom:12px"></div>
+
+    <div class="cards" id="profileCards"></div>
+
+    <div class="dock">
+      <div class="dock-row">
+        <select id="modelSelect"><option value="">— 选择模型(先在下方设置加 model_roots)—</option></select>
+        <select id="modeSelect">
+          <option value="auto">auto 自动</option>
+          <option value="ram">ram 内存驻留</option>
+          <option value="resident">resident 全显存</option>
+          <option value="mapped">mapped 弹性缓存</option>
+          <option value="parallel">parallel 多卡</option>
+        </select>
+        <select id="deviceSelect"><option value="cuda">cuda</option><option value="cpu">cpu</option></select>
+        <input id="portInput" type="number" value="8801" min="1024" max="65535" title="TPQ API 端口">
+        <button class="ghost" id="dryRunBtn">预检</button>
+        <button class="primary" id="launchBtn">启动组合</button>
+        <button class="danger" id="stopBtn" disabled>停止</button>
+      </div>
+      <div class="dock-row">
+        <button class="ghost" id="importBtn">导入配置文件…</button>
+        <input type="file" id="importFile" accept=".yaml,.yml,.json" hidden>
+        <span class="hint" id="launchHint"></span>
+      </div>
+      <pre class="log" id="launchLog" hidden></pre>
+
+      <div class="settings-panel" id="settingsPanel">
+        <div>
+          <label>TPQ-Final 路径(tpq_path)</label>
+          <input id="setTpqPath" type="text" placeholder="自动探测 ../TPQ-Final">
+        </div>
+        <div>
+          <label>模型扫描根目录(model_roots,每行一个,内含 cccp.json 的上级目录)</label>
+          <textarea id="setModelRoots" placeholder="D:\models"></textarea>
+        </div>
+        <div class="actions">
+          <button class="ghost sm" id="saveSettingsBtn">保存设置</button>
+          <span class="hint" id="settingsHint"></span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 聊天 ============ -->
+  <section class="page" id="page-chat">
+    <div class="chat-wrap">
+      <aside class="chat-side">
+        <div class="side-block">
+          <label>当前实例</label>
+          <div id="chatInstance" class="mono dim">未启动模型</div>
+        </div>
+        <div class="side-block">
+          <label>会话</label>
+          <div class="session-list" id="sessionList"></div>
+          <button class="ghost sm" id="newSessionBtn" style="margin-top:6px">新会话</button>
+        </div>
+        <div class="side-block">
+          <label>生成参数</label>
+          <div class="param"><span>temperature</span><input id="tempInput" type="number" step="0.1" value="0.7" min="0" max="2"></div>
+          <div class="param"><span>max_tokens</span><input id="maxTokInput" type="number" value="512" min="16" max="32768"></div>
+        </div>
+        <div class="side-block">
+          <label>上下文 profiles</label>
+          <div id="chatProfiles" class="chips"></div>
+        </div>
+        <button class="ghost sm" id="clearChatBtn">清空当前会话</button>
+      </aside>
+      <div class="chat-main">
+        <div class="messages" id="messages"></div>
+        <div class="composer">
+          <textarea id="chatInput" rows="2" placeholder="输入消息… (Enter 发送 / Shift+Enter 换行)"></textarea>
+          <div class="composer-actions">
+            <button class="ghost sm" id="stopGenBtn" hidden>停止</button>
+            <button class="primary" id="sendBtn">发送</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 训练 ============ -->
+  <section class="page" id="page-training">
+    <div class="train-grid">
+      <div class="panel">
+        <h3>语料</h3>
+        <div class="dock-row">
+          <button class="ghost" id="corpusBtn">上传语料…</button>
+          <input type="file" id="corpusFile" accept=".jsonl,.txt" multiple hidden>
+        </div>
+        <div id="corpusList" class="file-list"></div>
+        <p class="hint">jsonl: {"prompt": "…"} / {"text": "…"} / {"messages": [...]};txt: 每行一条。</p>
+      </div>
+
+      <div class="panel">
+        <h3>扫描配置</h3>
+        <div class="param"><span>模式</span>
+          <label class="radio"><input type="radio" name="tmode" value="cpu" checked> CPU 全量推理</label>
+          <label class="radio"><input type="radio" name="tmode" value="disk"> 硬盘(离线)推理</label>
+        </div>
+        <div class="param"><span>目标体积 GB(0=不限)</span><input id="targetGb" type="number" value="128" min="0" step="1"></div>
+        <input id="targetGbRange" type="range" min="0" max="1024" value="128">
+        <div class="param"><span>采样上限</span><input id="sampleLimit" type="number" value="2000" min="10" step="100"></div>
+        <div class="param"><span>关联 profiles</span><select id="relatedProfiles" multiple size="4"></select></div>
+        <div class="hint" id="trainCalibHint">当前为估算模式(heuristic-fallback);TPQ 路由计数接口(I-3)就绪后自动切换 calibrated。</div>
+        <button class="primary" id="trainStartBtn">开始扫描</button>
+      </div>
+
+      <div class="panel wide">
+        <h3>任务</h3>
+        <div id="jobList" class="job-list"></div>
+        <div id="jobDetail" class="job-detail" hidden>
+          <h4 id="jobDetailTitle"></h4>
+          <div id="jobDetailMeta" class="mono dim"></div>
+          <div class="bars" id="topExperts"></div>
+          <div class="dock-row">
+            <button class="ghost sm" data-export="scores">下载 scores.json</button>
+            <button class="ghost sm" data-export="counts">下载 profile.json(counts)</button>
+            <button class="ghost sm" data-export="profile">下载 profile.yaml</button>
+            <button class="primary sm" id="registerBtn">注册为 trained profile</button>
+            <button class="danger sm" id="jobDeleteBtn">删除任务</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ API 服务 ============ -->
+  <section class="page" id="page-api">
+    <div class="api-grid">
+      <div class="api-card">
+        <h3>OpenAI 兼容服务 <span class="state-pill off" id="apiStatePill">未就绪</span></h3>
+        <div class="kv"><span>Base URL</span><b id="apiBase">—</b></div>
+        <div class="kv"><span>对话端点</span><b id="apiEndpoint">—</b></div>
+        <div class="kv"><span>鉴权(TPQ_API_KEY)</span><span class="state-pill off" id="apiAuthPill">未启用</span></div>
+        <div class="kv"><span>当前模型</span><b id="apiModel">—</b></div>
+        <pre id="apiCurl">curl 示例加载中…</pre>
+      </div>
+      <div class="api-card">
+        <h3>REST 端点(本启动器)</h3>
+        <ul id="apiEndpoints"></ul>
+        <p class="hint">第三方直接调用 OpenAI 端点即可;管理端点以 /api/ 前缀。
+        TPQ-Final 集成契约见 docs/INTERFACE.md(I-0 已落地,I-1~I-5 待 TPQ 开发)。</p>
+        <button class="ghost sm" id="apiRefreshBtn">刷新状态</button>
+      </div>
+    </div>
+  </section>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
