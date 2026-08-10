@@ -73,34 +73,56 @@
 
   <!-- ============ 首页(快速选择 + 一键启动)============ -->
   <section class="page active" id="page-home">
-    <div class="hero">
-      <div class="hero-eyebrow">CCCP 启动器</div>
-      <h1>选模型、勾配置、一键启动</h1>
-      <p class="hero-sub">多选配置自动去重叠计费;启动就绪后到「聊天」页对话</p>
-      <div class="hero-meta">
-        <span class="state-pill hero-pill" id="homeStatusPill">未启动</span>
-        <span class="hero-chip" id="homeSelChip">未选择模型 / 配置</span>
+    <!-- ===== 启动面板:左半选择区 + 右半操作区(启动按钮右下角)===== -->
+    <div class="launch-panel">
+      <!-- 左:标题 + 状态 -->
+      <div class="lp-header">
+        <div class="lp-brand">
+          <div class="lp-logo"><svg class="ic"><use href="#i-layers"/></svg></div>
+          <div>
+            <h1>CCCP 启动器</h1>
+            <p>让人人都能运行顶级模型</p>
+          </div>
+        </div>
+        <span class="state-pill lp-pill" id="homeStatusPill">未启动</span>
       </div>
-      <div class="hero-actions">
-        <button class="hero-launch" id="homeLaunchBtn"><svg class="ic"><use href="#i-rocket"/></svg> 一键启动</button>
-        <button class="hero-btn" id="homeDryBtn">预检</button>
-        <button class="hero-btn danger-text" id="homeStopBtn" disabled>停止</button>
+
+      <!-- 中:模型 + 配置选择 -->
+      <div class="lp-select">
+        <div class="lp-field">
+          <label>模型</label>
+          <select id="homeModelSelect"><option value="">— 未发现模型(「模型库」下载或「设置」添加目录)—</option></select>
+        </div>
+        <div class="lp-field">
+          <label>配置(可多选 · 与「配置库」同步)</label>
+          <div class="qchips" id="homeChips"></div>
+        </div>
       </div>
-      <div class="hero-hint" id="homeLaunchHint"></div>
-      <pre class="log on-hero" id="homeLaunchLog" hidden></pre>
+
+      <!-- 右下:操作区 -->
+      <div class="lp-footer">
+        <div class="lp-summary">
+          <span id="homeSelChip" class="hero-chip">未选择模型 / 配置</span>
+          <span id="homeSummary" class="lp-sum-text">勾选配置后显示合计体积</span>
+        </div>
+        <div class="lp-actions">
+          <div class="lp-opts">
+            <select id="homeDeviceSelect"><option value="cuda">cuda</option><option value="cpu">cpu</option></select>
+            <input id="homePortInput" type="number" value="8801" min="1024" max="65535" title="TPQ API 端口">
+          </div>
+          <div class="lp-btns">
+            <button class="hero-btn sm" id="homeDryBtn">预检</button>
+            <button class="hero-btn danger-text sm" id="homeStopBtn" disabled>停止</button>
+            <button class="hero-launch" id="homeLaunchBtn"><svg class="ic"><use href="#i-rocket"/></svg> 一键启动</button>
+          </div>
+        </div>
+        <div class="hero-hint" id="homeLaunchHint"></div>
+        <pre class="log on-hero" id="homeLaunchLog" hidden></pre>
+      </div>
     </div>
 
+    <!-- ===== 下方:上次启动 + 社区 ===== -->
     <div class="home-grid">
-      <div class="card-box">
-        <h3>快速选择</h3>
-        <label class="fld">模型</label>
-        <select id="homeModelSelect" style="width:100%"><option value="">— 未发现模型(「模型库」下载或「设置」添加目录)—</option></select>
-        <label class="fld">配置(可多选,与「配置库」页同步)</label>
-        <div class="qchips" id="homeChips"></div>
-        <div class="q-summary" id="homeSummary">勾选配置后显示合计体积</div>
-        <div class="q-row"><span>TPQ API 端口</span><input id="homePortInput" type="number" value="8801" min="1024" max="65535">
-          <span>设备</span><select id="homeDeviceSelect"><option value="cuda">cuda</option><option value="cpu">cpu</option></select></div>
-      </div>
       <div class="card-box">
         <h3>上次启动</h3>
         <div id="lastLaunchBox" class="mono dim">暂无记录</div>
@@ -119,6 +141,7 @@
         <div class="hint" id="communityCfgHint" style="margin-top:8px"></div>
       </div>
     </div>
+  </section>
   </section>
 
   <!-- ============ 配置启动 ============ -->
