@@ -1,4 +1,4 @@
-/* WINUI-EXE · TPQ Launcher 前端逻辑(原生 JS,无构建依赖) */
+/* WINUI-EXE · TPQ Launcher 前端逻辑(原生 JS,无构建依赖) — 浅色应用外壳 */
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
@@ -29,17 +29,18 @@ async function api(path, opts = {}) {
 const fmtGB = (gb) => (gb >= 100 ? gb.toFixed(0) : gb.toFixed(1));
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
-/* ---------- 选项卡 ---------- */
-$$(".tab").forEach((b) =>
+/* ---------- 左侧导航 ---------- */
+$$(".nav-item").forEach((b) =>
   b.addEventListener("click", () => {
-    $$(".tab").forEach((x) => x.classList.toggle("active", x === b));
+    $$(".nav-item").forEach((x) => x.classList.toggle("active", x === b));
     $$(".page").forEach((p) => p.classList.toggle("active", p.id === `page-${b.dataset.tab}`));
     if (b.dataset.tab === "training") refreshTraining();
     if (b.dataset.tab === "api") refreshApiInfo();
+    if (b.dataset.tab === "settings") loadSettings().catch(() => {});
   })
 );
 
-/* ---------- 状态轮询 ---------- */
+/* ---------- 状态轮询(侧栏状态卡) ---------- */
 async function pollStatus() {
   try {
     const h = await api("/api/health");
@@ -82,7 +83,6 @@ function renderCards() {
         <span><b>${fmtGB(p.memory_gb)}</b> GB</span>
       </div>
       <div class="calib">${p.calibrated ? "体积已校准" : "体积为估算"}</div>
-      ${p.source !== "builtin" || !p.builtin ? "" : ""}
       <div class="check">${state.selected.has(p.id) ? "✓" : ""}</div>`;
     if (p.source === "imported" || p.source === "trained") {
       const del = document.createElement("button");
@@ -148,7 +148,7 @@ async function loadModels() {
     const sel = $("#modelSelect");
     sel.innerHTML = models.length
       ? models.map((m) => `<option value="${esc(m.path)}">${esc(m.name)} (${esc(m.architecture)})</option>`).join("")
-      : `<option value="">— 未发现模型(在下方设置 model_roots)—</option>`;
+      : `<option value="">— 未发现模型(「设置」里添加 model_roots)—</option>`;
   } catch { /* 静默 */ }
 }
 
@@ -161,7 +161,7 @@ async function launch(dry) {
   const ids = [...state.selected];
   if (!ids.length) return alert("请先选择至少一个 profile");
   const model = $("#modelSelect").value;
-  if (!model) return alert("请先选择模型目录");
+  if (!model) return alert("请先选择模型目录(「设置」里先添加 model_roots 扫描)");
   const body = {
     profile_ids: ids, model_path: model,
     profile_mode: $("#modeSelect").value, device: $("#deviceSelect").value,
@@ -204,12 +204,13 @@ $("#importFile").addEventListener("change", async (ev) => {
   ev.target.value = "";
 });
 
-/* ---------- 设置面板(配置页) ---------- */
+/* ---------- 设置页 ---------- */
 async function loadSettings() {
   const s = await api("/api/settings");
   state.settings = s;
   $("#setTpqPath").value = s.tpq_path || "";
   $("#setModelRoots").value = (s.model_roots || []).join("\n");
+  $("#aboutTpq").textContent = s.tpq_path || "未探测到";
 }
 $("#saveSettingsBtn").addEventListener("click", async () => {
   const body = {
@@ -221,6 +222,7 @@ $("#saveSettingsBtn").addEventListener("click", async () => {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
     $("#settingsHint").textContent = "已保存,重新扫描模型…";
+    $("#aboutTpq").textContent = body.tpq_path || "自动探测";
     await loadModels();
     setTimeout(() => ($("#settingsHint").textContent = ""), 3000);
   } catch (e) { alert(e.message); }
@@ -298,7 +300,7 @@ async function send() {
   const input = $("#chatInput");
   const text = input.value.trim();
   if (!text) return;
-  if (!state.ready) return alert("模型未就绪:请到「配置」页启动组合");
+  if (!state.ready) return alert("模型未就绪:请到「配置启动」页选择一个组合并发动");
   input.value = "";
   state.messages.push({ role: "user", content: text });
   addMsg("user", text);
@@ -471,15 +473,13 @@ $$("[data-export]").forEach((b) =>
     if (!state.currentJob) return;
     const kind = b.dataset.export;
     const data = await api(`/api/training/jobs/${state.currentJob.id}/export?kind=${kind}`);
-    const blob = new Blob([kind === "profile" ? toYamlFallback(data) : JSON.stringify(data, null, 2)],
-                          { type: "application/octet-stream" });
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/octet-stream" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = `${kind}-${state.currentJob.id}.${kind === "profile" ? "yaml" : "json"}`;
     a.click();
   })
 );
-function toYamlFallback(data) { return JSON.stringify(data, null, 2); }  // profile 导出本身是 dict;注册走服务端
 $("#registerBtn").addEventListener("click", async () => {
   if (!state.currentJob) return;
   const name = prompt("profile 显示名:", `训练产物 ${state.currentJob.id}`);
@@ -532,9 +532,11 @@ $("#apiRefreshBtn").addEventListener("click", refreshApiInfo);
   state.sessionId = newSessionId();
   await loadProfiles();
   await loadModels();
-  await loadSettings().catch(() => {});
   refreshSessions();
   pollStatus();
+  const h = await api("/api/health").catch(() => null);
+  if (h?.version) $("#aboutVer").textContent = `v${h.version}`;
+  loadSettings().catch(() => {});
   const s = await api("/api/launch/status").catch(() => null);
   if (s?.instance) state.instance = s.instance;
 })();
