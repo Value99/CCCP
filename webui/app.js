@@ -725,6 +725,25 @@ $("#apiRefreshBtn").addEventListener("click", refreshApiInfo);
     e.stopPropagation();
     if (native()?.win_close) native().win_close(); else window.close();
   });
+  const tb = $("#titlebar");
+  if (!tb) return;
+  tb.addEventListener("dblclick", (e) => {
+    if (e.target.closest(".tb-btn")) return;
+    native()?.win_toggle_max?.();
+  });
+  tb.addEventListener("mousedown", (e) => {
+    if (e.button !== 0 || e.target.closest(".tb-btn")) return;
+    const api = native();
+    if (!api?.win_move) return;
+    const ox = e.screenX - window.screenX, oy = e.screenY - window.screenY;
+    const onmove = (ev) => api.win_move(ev.screenX - ox, ev.screenY - oy);
+    const onup = () => {
+      document.removeEventListener("mousemove", onmove);
+      document.removeEventListener("mouseup", onup);
+    };
+    document.addEventListener("mousemove", onmove);
+    document.addEventListener("mouseup", onup);
+  });
 })();
 
 /* ---------- 终端页(可见时轮询)---------- */
