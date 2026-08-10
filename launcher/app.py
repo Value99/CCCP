@@ -24,6 +24,7 @@ from .resources import builtin_profile_dir, user_profile_dir, webui_static
 from .settings import load_settings, Settings
 from .state import AppState
 from .tpq_adapter import LaunchConfig, TPQAdapter, TPQError, discover_models
+from .downloads import DownloadEngine, fetch_index, fetch_profile_text
 from .training import (
     CORPUS_DIR, TrainingEngine, delete_corpus, export_counts, export_profile,
     export_scores, list_corpus, save_corpus_file,
@@ -35,12 +36,23 @@ BUILTIN_PROFILE_DIR = builtin_profile_dir()
 USER_PROFILE_DIR = user_profile_dir()
 
 
+def downloads_default_hint(s: Settings) -> str:
+    """模型下载默认落盘根目录(前端占位提示用)。"""
+    if s.model_download_dir:
+        return s.model_download_dir
+    if s.model_roots:
+        return s.model_roots[0]
+    from .resources import runtime_root
+    return str(runtime_root() / "data" / "models")
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
     registry = ProfileRegistry(BUILTIN_PROFILE_DIR, USER_PROFILE_DIR)
     adapter = TPQAdapter(settings)
     chat = ChatProxy(adapter)
     training = TrainingEngine(registry)
+    downloads = DownloadEngine(settings)
     state = AppState()
 
     app = FastAPI(title="TPQ-Final WINUI-EXE Launcher", version=__version__)
@@ -94,6 +106,55 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "roots": settings.model_roots,
             "hint": "在设置里添加 model_roots(含 cccp.json 的上级目录)以发现模型",
         }
+
+    # ------------------------------------------------------------------
+    # 社区(profile 下载 / Discord 链接)(v0.3)
+    # ------------------------------------------------------------------
+    @app.get("/api/community/config")
+    async def api_community_config():
+        return {"discord_url": settings.discord_url,
+                "index_url": settings.community_index_url}
+
+    @app.get("/api/community/profiles")
+    async def api_community_profiles():
+        url = (settings.community_index_url or "").strip()
+        if not url:
+            return {"profiles": [],
+                    "note": "未配置 community_index_url(到「设置 · 社区与下载」填写索引地址)"}
+        return {"profiles": await fetch_index(url)}
+
+    @app.post("/api/community/profiles/install")
+    async def api_community_install(req: Request):
+        url = str((await req.json()).get("url") or "").strip()
+        if not url:
+            raise ProfileError("url 不能为空")
+        text = await fetch_profile_text(url)
+        p = registry.import_text(text, filename=url.rsplit("/", 1)[-1] or "profile.yaml")
+        return {"ok": True, "profile": p.to_dict()}
+
+    # ------------------------------------------------------------------
+    # 模型下载(HuggingFace / ModelScope)(v0.3)
+    # ------------------------------------------------------------------
+    @app.post("/api/models/download")
+    async def api_model_download(req: Request):
+        job = downloads.submit(await req.json())
+        return {"ok": True, "job": job.to_dict()}
+
+    @app.get("/api/models/download/jobs")
+    async def api_download_jobs():
+        return {"jobs": downloads.list(),
+                "default_dir": downloads_default_hint(settings)}
+
+    @app.get("/api/models/download/jobs/{jid}")
+    async def api_download_job(jid: str):
+        j = downloads.get(jid)
+        if not j:
+            raise ValueError(f"下载任务不存在: {jid}")
+        return j.to_dict()
+
+    @app.delete("/api/models/download/jobs/{jid}")
+    async def api_download_delete(jid: str):
+        return {"deleted": downloads.delete(jid)}
 
     # ------------------------------------------------------------------
     # Profiles
@@ -334,6 +395,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                            "GET /api/launch/status", "POST /api/launch/dry-run"],
                 "training": ["POST /api/training/jobs", "GET /api/training/jobs",
                              "GET /api/training/jobs/{id}/export"],
+                "community": ["GET /api/community/config", "GET /api/community/profiles",
+                              "POST /api/community/profiles/install"],
+                "downloads": ["POST /api/models/download", "GET /api/models/download/jobs",
+                              "DELETE /api/models/download/jobs/{id}"],
                 "chat": ["POST /api/chat/completions", "GET /api/chat/models"],
             },
             "curl_example": (

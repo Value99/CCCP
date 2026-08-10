@@ -18,9 +18,11 @@
       </div>
     </div>
     <nav class="nav">
-      <button class="nav-item" data-tab="chat"><span class="ico">💬</span>聊天</button>
-      <button class="nav-item active" data-tab="profiles"><span class="ico">🧩</span>配置启动</button>
+      <button class="nav-item active" data-tab="home"><span class="ico">🏠</span>首页</button>
+      <button class="nav-item" data-tab="profiles"><span class="ico">🧩</span>配置库</button>
+      <button class="nav-item" data-tab="models"><span class="ico">🗃️</span>模型库</button>
       <button class="nav-item" data-tab="training"><span class="ico">📈</span>训练</button>
+      <button class="nav-item" data-tab="chat"><span class="ico">💬</span>聊天</button>
       <button class="nav-item" data-tab="api"><span class="ico">🔗</span>API 服务</button>
       <button class="nav-item" data-tab="settings"><span class="ico">⚙️</span>设置</button>
     </nav>
@@ -34,11 +36,73 @@
   <!-- ============ 主区 ============ -->
   <main class="main">
 
+  <!-- ============ 首页(快速选择 + 一键启动)============ -->
+  <section class="page active" id="page-home">
+    <div class="hero">
+      <div class="hero-eyebrow">WINUI-EXE · TPQ-Final 启动器</div>
+      <h1>选模型、勾配置、一键启动</h1>
+      <p class="hero-sub">多选配置自动去重叠计费;启动就绪后到「聊天」页对话</p>
+      <div class="hero-meta">
+        <span class="state-pill hero-pill" id="homeStatusPill">未启动</span>
+        <span class="hero-chip" id="homeSelChip">未选择模型 / 配置</span>
+      </div>
+      <div class="hero-actions">
+        <button class="hero-launch" id="homeLaunchBtn">🚀 一键启动</button>
+        <button class="hero-btn" id="homeDryBtn">预检</button>
+        <button class="hero-btn danger-text" id="homeStopBtn" disabled>停止</button>
+      </div>
+      <div class="hero-hint" id="homeLaunchHint"></div>
+      <pre class="log on-hero" id="homeLaunchLog" hidden></pre>
+    </div>
+
+    <div class="home-grid">
+      <div class="card-box">
+        <h3>快速选择</h3>
+        <label class="fld">模型</label>
+        <select id="homeModelSelect" style="width:100%"><option value="">— 未发现模型(「模型库」下载或「设置」添加目录)—</option></select>
+        <label class="fld">配置(可多选,与「配置库」页同步)</label>
+        <div class="qchips" id="homeChips"></div>
+        <div class="q-summary" id="homeSummary">勾选配置后显示合计体积</div>
+        <div class="q-row"><span>TPQ API 端口</span><input id="homePortInput" type="number" value="8801" min="1024" max="65535"></div>
+      </div>
+      <div class="card-box">
+        <h3>上次启动</h3>
+        <div id="lastLaunchBox" class="mono dim">暂无记录</div>
+        <div class="dock-row" style="margin-top:10px">
+          <button class="ghost sm" id="relaunchBtn" disabled>↻ 复用并一键启动</button>
+        </div>
+        <p class="hint">直接复用上次的模型 + 配置组合发动。</p>
+      </div>
+      <div class="card-box">
+        <h3>社区</h3>
+        <p class="hint">从社区下载他人分享的 profile;Discord 交流配置经验。</p>
+        <div class="dock-row" style="margin-top:10px">
+          <button class="primary sm" id="discordBtn">💬 Discord 社区</button>
+          <button class="ghost sm" id="goModelsBtn">⬇ 去下载模型</button>
+        </div>
+        <div class="hint" id="communityCfgHint" style="margin-top:8px"></div>
+      </div>
+    </div>
+  </section>
+
   <!-- ============ 配置启动 ============ -->
-  <section class="page active" id="page-profiles">
+  <section class="page" id="page-profiles">
     <div class="page-header">
-      <h1>配置启动</h1>
-      <p>按领域选择专家组合,多选自动去重叠;一键发动 TPQ-Final</p>
+      <h1>配置库</h1>
+      <p>专家组合详情与社区下载;多选自动去重叠,一键发动 TPQ-Final</p>
+    </div>
+
+    <div class="community-banner card-box">
+      <div class="cb-left">
+        <h3>☁️ 社区配置下载</h3>
+        <p class="hint">粘贴 profile 文件 URL 直接安装;或「刷新社区列表」从索引挑选。</p>
+      </div>
+      <div class="cb-right">
+        <input id="communityUrlInput" placeholder="https://…/my-profile.yaml">
+        <button class="primary sm" id="communityInstallBtn">安装</button>
+        <button class="ghost sm" id="communityRefreshBtn">刷新社区列表</button>
+      </div>
+      <div id="communityList" class="community-list"></div>
     </div>
 
     <div class="stat-row">
@@ -80,6 +144,42 @@
           <span class="hint" id="launchHint"></span>
         </div>
         <pre class="log" id="launchLog" hidden></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 模型库(下载 + 本地)============ -->
+  <section class="page" id="page-models">
+    <div class="page-header">
+      <h1>模型库</h1>
+      <p>把模型下载到指定目录(HuggingFace / ModelScope);管理本地可启动模型</p>
+      <div class="spacer"></div>
+      <button class="ghost sm" id="modelsRefreshBtn">刷新</button>
+    </div>
+    <div class="models-grid">
+      <div class="card-box">
+        <h3>⬇ 下载新模型</h3>
+        <label class="fld">来源</label>
+        <select id="dlSource">
+          <option value="hf">HuggingFace(经 hf_endpoint 镜像/官方)</option>
+          <option value="modelscope">ModelScope(需 pip install modelscope)</option>
+        </select>
+        <label class="fld">仓库 ID</label>
+        <input id="dlRepo" placeholder="如 Qwen/Qwen2.5-7B-Instruct">
+        <label class="fld">版本(revision,可空)</label>
+        <input id="dlRevision" placeholder="main / tag / 分支">
+        <label class="fld">下载到目录</label>
+        <input id="dlTarget" placeholder="留空使用默认目录">
+        <button class="primary" id="dlStartBtn" style="margin-top:12px;width:100%">开始下载</button>
+        <p class="hint">注:TPQ 启动要求 CCCP 归档(目录含 cccp.json);本页下载的通用权重需经 TPQ 工具链归档后方可被启动识别。</p>
+      </div>
+      <div class="card-box">
+        <h3>⏳ 下载任务</h3>
+        <div id="dlJobs" class="job-list"></div>
+      </div>
+      <div class="card-box span2">
+        <h3>🗂 本地模型(含 cccp.json,可直接启动)</h3>
+        <div id="localModels" class="model-list"></div>
       </div>
     </div>
   </section>
@@ -220,6 +320,17 @@
           <button class="primary sm" id="saveSettingsBtn">保存设置</button>
           <span class="hint" id="settingsHint"></span>
         </div>
+      </div>
+      <div class="card-box">
+        <h3 style="font-size:14px">社区与下载</h3>
+        <label>Discord 社区链接(discord_url,首页/配置库展示)</label>
+        <input id="setDiscord" placeholder="https://discord.gg/…">
+        <label>社区配置索引 URL(community_index_url)</label>
+        <input id="setIndexUrl" placeholder="https://…/profiles.json">
+        <label>HuggingFace 端点(hf_endpoint,镜像或官方)</label>
+        <input id="setHfEndpoint" placeholder="https://hf-mirror.com">
+        <label>模型默认下载目录(model_download_dir)</label>
+        <input id="setDlDir" placeholder="D:\models">
       </div>
       <div class="card-box">
         <h3 style="font-size:14px">关于</h3>

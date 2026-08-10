@@ -83,6 +83,23 @@ print(f"OK: export scores 全覆盖 {n_scores} 项")
 info = json.load(urllib.request.urlopen(base + "/api/service/info"))
 assert info["openai_endpoint"].endswith("/v1/chat/completions")
 print("OK: /api/service/info base=", info["base_url"])
+
+# v0.3: 社区 + 下载 API(不触网,仅结构校验)
+comm = json.load(urllib.request.urlopen(base + "/api/community/config"))
+assert "discord_url" in comm and "index_url" in comm
+dj = json.load(urllib.request.urlopen(base + "/api/models/download/jobs"))
+assert "jobs" in dj and "default_dir" in dj
+bad = urllib.request.Request(
+    base + "/api/models/download",
+    data=json.dumps({"repo": ""}).encode(),
+    headers={"Content-Type": "application/json"},
+)
+try:
+    urllib.request.urlopen(bad)
+    raise AssertionError("空 repo 应返回 400")
+except urllib.error.HTTPError as e:
+    assert e.code == 400
+print("OK: community + downloads API")
 PYEOF
 
 echo "== SMOKE 全部通过 ✅"
