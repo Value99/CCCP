@@ -522,7 +522,7 @@ async function send() {
     state.messages.push({ role: "assistant", content: answer });
     saveSession();
   } catch (e) {
-    if (e.name !== "AbortError") bubble.querySelector(".body").textContent = `⚠ ${e.message}`;
+    if (e.name !== "AbortError") bubble.querySelector(".body").textContent = `[错误] ${e.message}`;
   }
   bubble.classList.remove("streaming");
   $("#stopGenBtn").hidden = true;
@@ -749,8 +749,7 @@ $("#apiRefreshBtn").addEventListener("click", refreshApiInfo);
 /* ---------- 终端页(可见时轮询)---------- */
 let termTimer = null;
 function renderTerm(el, lines, empty) {
-  el.textContent = lines && lines.length ? lines.join("
-") : empty;
+  el.textContent = lines && lines.length ? lines.join("\n") : empty;
   el.scrollTop = el.scrollHeight;
 }
 async function refreshTerminal() {

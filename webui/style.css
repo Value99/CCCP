@@ -413,3 +413,15 @@ input[type="range"] { width: 100%; accent-color: var(--accent); padding: 0; }
   height: calc(100vh - 220px); overflow: auto; white-space: pre-wrap; word-break: break-all;
 }
 @media (max-width: 1100px) { .term-grid { grid-template-columns: 1fr; } }
+
+/* ================= v0.5 · SVG 图标 ================= */
+.ic { display: inline-block; vertical-align: -2px; width: 16px; height: 16px;
+      fill: none; stroke: currentColor; stroke-width: 2;
+      stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
+.nav-item .ic { width: 18px; height: 18px; }
+.tb-logo .ic { width: 18px; height: 18px; }
+.tb-btn .ic { width: 14px; height: 14px; }
+.logo-box .ic { width: 20px; height: 20px; color: #fff; stroke-width: 2.2; }
+.hero-launch .ic, .primary .ic { width: 17px; height: 17px; }
+.page-header h1 .ic, h3 .ic { width: 17px; height: 17px; vertical-align: -3px; }
+use { pointer-events: none; }  /* 图标点击穿透到父按钮 */

@@ -7,36 +7,59 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-home" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9.5 12 3l9 6.5V20a1 1 0 0 1-1 1h-5v-6h-6v6H4a1 1 0 0 1-1-1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3h4a1 1 0 0 1 1 1v1.5a1.5 1.5 0 1 0 3 0V4a1 1 0 0 1 1 1h2a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-1.5a1.5 1.5 0 1 0 0 3H21a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-3a1 1 0 0 1-1-1v-1.5a1.5 1.5 0 1 0-3 0V20a1 1 0 0 1-1 1h-3a1 1 0 0 1-1-1v-3a1 1 0 0 0-1-1H6.5a1.5 1.5 0 1 1 0-3H7a1 1 0 0 0 1-1V4a1 1 0 0 1 1-1z"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 2 7l10 5 10-5z"/><path d="m2 12 10 5 10-5"/><path d="m2 17 10 5 10-5"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m7 14 3-4 4 3 5-7"/></symbol>
+  <symbol id="i-term" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 0 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 0 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H10a1.7 1.7 0 0 0 1-1.5V3a2 2 0 0 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V10a1.7 1.7 0 0 0 1.5 1H21a2 2 0 0 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></symbol>
+  <symbol id="i-rocket" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 16.5c-1.5 1.3-2 5-2 5s3.7-.5 5-2c.7-.8.7-2 0-2.8a2 2 0 0 0-3 .1z"/><path d="M12 15 9 12a14 14 0 0 1 3-7c2-3 5-3 8-3 0 3 0 6-3 8a14 14 0 0 1-7 3z"/><path d="M9 12H4s.5-2.5 2-4 5-2 5-2"/><path d="M12 15v5s2.5-.5 4-2 2-5 2-5"/></symbol>
+  <symbol id="i-min" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/></symbol>
+  <symbol id="i-max" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="14" height="14" rx="1.5"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></symbol>
+  <symbol id="i-warn" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h0"/></symbol>
+  <symbol id="i-cloud" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19a4.5 4.5 0 0 0 0-9 6 6 0 0 0-11.6 1.5A4 4 0 0 0 6 19z"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v6c0 1.7 4 3 9 3s9-1.3 9-3V5"/><path d="M3 11v6c0 1.7 4 3 9 3s9-1.3 9-3v-6"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4l14 8-14 8z"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></symbol>
+  <symbol id="i-discord" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 5a16 16 0 0 0-4-1l-.3.5a12 12 0 0 1 3.5 1.7 11 11 0 0 0-9.4 0A12 12 0 0 1 12.3 4.5L12 4a16 16 0 0 0-4 1C5 9 4 13 4 17a16 16 0 0 0 5 2l.6-1a10 10 0 0 1-2-1l.5-.4a11 11 0 0 0 9.8 0l.5.4a10 10 0 0 1-2 1l.6 1a16 16 0 0 0 5-2c0-4-1-8-3-12z"/><circle cx="9.5" cy="13" r="1"/><circle cx="14.5" cy="13" r="1"/></symbol>
+</svg>
 <div class="titlebar" id="titlebar">
   <div class="tb-left">
-    <span class="tb-logo">◆</span>
+    <span class="tb-logo"><svg class="ic"><use href="#i-layers"/></svg></span>
     <span class="tb-title">WINUI-EXE · TPQ-Final 启动器</span>
   </div>
   <div class="tb-right">
-    <button class="tb-btn" id="tbMin" title="最小化">—</button>
-    <button class="tb-btn" id="tbMax" title="最大化 / 还原">▢</button>
-    <button class="tb-btn close" id="tbClose" title="关闭">✕</button>
+    <button class="tb-btn" id="tbMin" title="最小化"><svg class="ic"><use href="#i-min"/></svg></button>
+    <button class="tb-btn" id="tbMax" title="最大化 / 还原"><svg class="ic"><use href="#i-max"/></svg></button>
+    <button class="tb-btn close" id="tbClose" title="关闭"><svg class="ic"><use href="#i-x"/></svg></button>
   </div>
 </div>
 <div id="app">
   <!-- ============ 左侧导航 ============ -->
   <aside class="sidebar">
     <div class="side-brand">
-      <div class="logo-box">◆</div>
+      <div class="logo-box"><svg class="ic"><use href="#i-layers"/></svg></div>
       <div>
         <div class="name">WINUI-EXE</div>
         <div class="sub">TPQ-Final 启动器</div>
       </div>
     </div>
     <nav class="nav">
-      <button class="nav-item active" data-tab="home"><span class="ico">🏠</span>首页</button>
-      <button class="nav-item" data-tab="profiles"><span class="ico">🧩</span>配置库</button>
-      <button class="nav-item" data-tab="models"><span class="ico">🗃️</span>模型库</button>
-      <button class="nav-item" data-tab="training"><span class="ico">📈</span>训练</button>
-      <button class="nav-item" data-tab="chat"><span class="ico">💬</span>聊天</button>
-      <button class="nav-item" data-tab="terminal"><span class="ico">🖥️</span>终端</button>
-      <button class="nav-item" data-tab="api"><span class="ico">🔗</span>API 服务</button>
-      <button class="nav-item" data-tab="settings"><span class="ico">⚙️</span>设置</button>
+      <button class="nav-item active" data-tab="home"><svg class="ic"><use href="#i-home"/></svg>首页</button>
+      <button class="nav-item" data-tab="profiles"><svg class="ic"><use href="#i-puzzle"/></svg>配置库</button>
+      <button class="nav-item" data-tab="models"><svg class="ic"><use href="#i-database"/></svg>模型库</button>
+      <button class="nav-item" data-tab="training"><svg class="ic"><use href="#i-chart"/></svg>训练</button>
+      <button class="nav-item" data-tab="chat"><svg class="ic"><use href="#i-chat"/></svg>聊天</button>
+      <button class="nav-item" data-tab="terminal"><svg class="ic"><use href="#i-term"/></svg>终端</button>
+      <button class="nav-item" data-tab="api"><svg class="ic"><use href="#i-link"/></svg>API 服务</button>
+      <button class="nav-item" data-tab="settings"><svg class="ic"><use href="#i-gear"/></svg>设置</button>
     </nav>
     <div class="side-spacer"></div>
     <div class="side-status">
@@ -59,7 +82,7 @@
         <span class="hero-chip" id="homeSelChip">未选择模型 / 配置</span>
       </div>
       <div class="hero-actions">
-        <button class="hero-launch" id="homeLaunchBtn">🚀 一键启动</button>
+        <button class="hero-launch" id="homeLaunchBtn"><svg class="ic"><use href="#i-rocket"/></svg> 一键启动</button>
         <button class="hero-btn" id="homeDryBtn">预检</button>
         <button class="hero-btn danger-text" id="homeStopBtn" disabled>停止</button>
       </div>
@@ -82,7 +105,7 @@
         <h3>上次启动</h3>
         <div id="lastLaunchBox" class="mono dim">暂无记录</div>
         <div class="dock-row" style="margin-top:10px">
-          <button class="ghost sm" id="relaunchBtn" disabled>↻ 复用并一键启动</button>
+          <button class="ghost sm" id="relaunchBtn" disabled><svg class="ic"><use href="#i-refresh"/></svg> 复用并一键启动</button>
         </div>
         <p class="hint">直接复用上次的模型 + 配置组合发动。</p>
       </div>
@@ -90,8 +113,8 @@
         <h3>社区</h3>
         <p class="hint">从社区下载他人分享的 profile;Discord 交流配置经验。</p>
         <div class="dock-row" style="margin-top:10px">
-          <button class="primary sm" id="discordBtn">💬 Discord 社区</button>
-          <button class="ghost sm" id="goModelsBtn">⬇ 去下载模型</button>
+          <button class="primary sm" id="discordBtn"><svg class="ic"><use href="#i-discord"/></svg> Discord 社区</button>
+          <button class="ghost sm" id="goModelsBtn"><svg class="ic"><use href="#i-download"/></svg> 去下载模型</button>
         </div>
         <div class="hint" id="communityCfgHint" style="margin-top:8px"></div>
       </div>
@@ -107,7 +130,7 @@
 
     <div class="community-banner card-box">
       <div class="cb-left">
-        <h3>☁️ 社区配置下载</h3>
+        <h3><svg class="ic"><use href="#i-cloud"/></svg> 社区配置下载</h3>
         <p class="hint">粘贴 profile 文件 URL 直接安装;或「刷新社区列表」从索引挑选。</p>
       </div>
       <div class="cb-right">
@@ -149,7 +172,7 @@
           <input id="portInput" type="number" value="8801" min="1024" max="65535" title="TPQ API 端口">
         </div>
         <div class="dock-row">
-          <button class="primary big" id="launchBtn">🚀 一键启动组合</button>
+          <button class="primary big" id="launchBtn"><svg class="ic"><use href="#i-rocket"/></svg> 一键启动组合</button>
           <button class="ghost" id="dryRunBtn">预检</button>
           <button class="danger" id="stopBtn" disabled>停止</button>
           <button class="ghost" id="importBtn">导入配置文件…</button>
@@ -171,7 +194,7 @@
     </div>
     <div class="models-grid">
       <div class="card-box">
-        <h3>⬇ 下载新模型</h3>
+        <h3><svg class="ic"><use href="#i-download"/></svg> 下载新模型</h3>
         <label class="fld">来源</label>
         <select id="dlSource">
           <option value="hf">HuggingFace(经 hf_endpoint 镜像/官方)</option>
@@ -191,7 +214,7 @@
         <div id="dlJobs" class="job-list"></div>
       </div>
       <div class="card-box span2">
-        <h3>🗂 本地模型(含 cccp.json,可直接启动)</h3>
+        <h3><svg class="ic"><use href="#i-folder"/></svg> 本地模型(含 cccp.json,可直接启动)</h3>
         <div id="localModels" class="model-list"></div>
       </div>
     </div>
@@ -268,7 +291,7 @@
         <div class="param"><span>采样上限</span><input id="sampleLimit" type="number" value="2000" min="10" step="100"></div>
         <div class="param"><span>关联 profiles</span><select id="relatedProfiles" multiple size="4"></select></div>
         <div class="hint">当前为估算模式(heuristic-fallback);TPQ 路由计数接口(I-3)就绪后自动切换 calibrated。</div>
-        <button class="primary" id="trainStartBtn">📈 开始扫描</button>
+        <button class="primary" id="trainStartBtn"><svg class="ic"><use href="#i-chart"/></svg> 开始扫描</button>
       </div>
 
       <div class="card-box">
