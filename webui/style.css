@@ -152,12 +152,19 @@ button { font: inherit; cursor: pointer; border-radius: 10px; border: 1px solid 
 .icon-btn { background: none; border: none; color: var(--dim); padding: 2px 6px; font-size: 13px; }
 .icon-btn:hover { color: var(--bad); }
 
-input, select, textarea {
+input, textarea {
   background: var(--panel); color: var(--txt); border: 1px solid var(--line);
-  border-radius: 10px; padding: 8px 30px 8px 12px; font: inherit; outline: none;
+  border-radius: 10px; padding: 8px 12px; font: inherit; outline: none;
   width: 100%; box-sizing: border-box;
 }
-textarea { padding: 8px 12px; }
+select {
+  background: var(--panel); color: var(--txt); border: 1px solid var(--line);
+  border-radius: 10px; padding: 8px 36px 8px 12px; font: inherit; outline: none;
+  width: 100%; box-sizing: border-box; appearance: none; -webkit-appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236b7690' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>");
+  background-repeat: no-repeat; background-position: right 12px center; background-size: 12px;
+}
+select[multiple] { padding: 8px 12px; background-image: none; appearance: auto; -webkit-appearance: auto; }
 input[type="radio"], input[type="checkbox"], input[type="range"] { width: auto; padding: 0; }
 input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(229,72,77,.15); }
 select[multiple] { min-width: 200px; }
@@ -351,6 +358,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); padding: 0; }
 .hero-meta { display: flex; gap: 10px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
 .hero-pill { background: rgba(255,255,255,.16); border-color: rgba(255,255,255,.35); color: #fff; }
 .hero-pill.on { background: rgba(16,185,129,.3); }
+.hero-pill.off { color: rgba(255,255,255,.85); border-color: rgba(255,255,255,.35); background: rgba(255,255,255,.12); }
 .hero-chip { font-size: 12px; padding: 3px 12px; border-radius: 999px; background: rgba(255,255,255,.14); border: 1px solid rgba(255,255,255,.25); }
 .hero-actions { display: flex; gap: 10px; align-items: center; margin-top: 20px; flex-wrap: wrap; }
 .hero-launch {
