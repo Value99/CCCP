@@ -1,4 +1,5 @@
 /* WINUI-EXE · TPQ Launcher — 浅色 Fluent 应用外壳(SD 启动器风格) */
+
 :root {
   --bg: #f2f4f8;
   --panel: #ffffff;
@@ -21,6 +22,52 @@
   --radius: 14px;
   --mono: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
 }
+
+/* 深色主题:显式 data-theme=dark 或 system 模式下系统为深色 */
+[data-theme="dark"] {
+  --bg: #1b1b1d;
+  --panel: #252527;
+  --panel2: #2d2d30;
+  --line: #3c3c40;
+  --line2: #333336;
+  --txt: #e6e6ea;
+  --dim: #9b9ba3;
+  --accent: #f76b70;
+  --accent-soft: rgba(247,107,112,.18);
+  --accent2: #f9898c;
+  --ok: #34d399;
+  --ok-soft: rgba(52,211,153,.14);
+  --warn: #fbbf24;
+  --warn-soft: rgba(251,191,36,.14);
+  --bad: #f87171;
+  --bad-soft: rgba(248,113,113,.14);
+  --shadow: 0 1px 2px rgba(0,0,0,.45), 0 10px 26px -14px rgba(0,0,0,.55);
+  --shadow-hover: 0 2px 4px rgba(0,0,0,.5), 0 14px 34px -14px rgba(229,72,77,.5);
+}
+@media (prefers-color-scheme: dark) {
+  [data-theme="system"] {
+    --bg: #1b1b1d;
+    --panel: #252527;
+    --panel2: #2d2d30;
+    --line: #3c3c40;
+    --line2: #333336;
+    --txt: #e6e6ea;
+    --dim: #9b9ba3;
+    --accent: #f76b70;
+    --accent-soft: rgba(247,107,112,.18);
+    --accent2: #f9898c;
+    --ok: #34d399;
+    --ok-soft: rgba(52,211,153,.14);
+    --warn: #fbbf24;
+    --warn-soft: rgba(251,191,36,.14);
+    --bad: #f87171;
+    --bad-soft: rgba(248,113,113,.14);
+    --shadow: 0 1px 2px rgba(0,0,0,.45), 0 10px 26px -14px rgba(0,0,0,.55);
+    --shadow-hover: 0 2px 4px rgba(0,0,0,.5), 0 14px 34px -14px rgba(229,72,77,.5);
+  }
+}
+
+
 * { box-sizing: border-box; margin: 0; }
 html, body { height: 100%; }
 body {
@@ -186,9 +233,14 @@ select[multiple] { min-width: 200px; }
 .chat-side { width: 262px; flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; overflow-y: auto; }
 .chat-side .card-box { display: flex; flex-direction: column; gap: 8px; }
 .side-label { color: var(--dim); font-size: 11.5px; text-transform: uppercase; letter-spacing: .5px; }
-.param { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; font-size: 13px; }
-.param input, .param select { width: 100%; }
-.param > span:first-child { color: var(--dim); font-size: 12px; }
+.param { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 6px 0; font-size: 13px; }
+.param input { width: 90px; }
+/* 训练页块式字段(标签上输入下) */
+.field-block { display: flex; flex-direction: column; gap: 5px; margin: 14px 0; }
+.field-block > label, .field-block > .fb-label { color: var(--dim); font-size: 12px; font-weight: 500; }
+.field-block input, .field-block select { width: 100%; }
+.radio-group { display: flex; gap: 14px; flex-wrap: wrap; }
+.radio-group .radio { margin: 0; }
 .session-list { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
 .session-item {
   display: flex; justify-content: space-between; align-items: center; gap: 6px;
@@ -349,7 +401,6 @@ input[type="range"] { width: 100%; accent-color: var(--accent); padding: 0; }
 .model-item .mi-p { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model-item button { grid-row: 1 / 3; grid-column: 2; }
 
-
 /* ================= v0.4 · 无边框自绘标题栏 ================= */
 .titlebar {
   height: 36px; flex-shrink: 0; display: flex; align-items: center;
@@ -367,43 +418,6 @@ input[type="range"] { width: 100%; accent-color: var(--accent); padding: 0; }
 }
 .tb-btn:hover { background: var(--panel2); color: var(--txt); }
 .tb-btn.close:hover { background: #e81123; color: #fff; }
-
-/* ================= v0.4 · 跟随 Windows 明暗(prefers-color-scheme)================= */
-[data-theme="dark"] {
-  :root {
-    --bg: #1b1b1d;
-    --panel: #252527;
-    --panel2: #2d2d30;
-    --line: #3c3c40;
-    --line2: #333336;
-    --txt: #e6e6ea;
-    --dim: #9b9ba3;
-    --accent: #f76b70;
-    --accent-soft: rgba(247,107,112,.18);
-    --accent2: #f9898c;
-    --ok: #34d399;
-    --ok-soft: rgba(52,211,153,.14);
-    --warn: #fbbf24;
-    --warn-soft: rgba(251,191,36,.14);
-    --bad: #f87171;
-    --bad-soft: rgba(248,113,113,.14);
-    --shadow: 0 1px 2px rgba(0,0,0,.45), 0 10px 26px -14px rgba(0,0,0,.55);
-    --shadow-hover: 0 2px 4px rgba(0,0,0,.5), 0 14px 34px -14px rgba(229,72,77,.5);
-  }
-  body {
-    background-image:
-      radial-gradient(720px 320px at 90% -10%, rgba(247,107,112,.07), transparent),
-      radial-gradient(640px 280px at 0% 110%, rgba(249,137,140,.05), transparent);
-  }
-  ::-webkit-scrollbar-thumb { background: #3a3a3f; }
-  ::-webkit-scrollbar-thumb:hover { background: #4a4a50; }
-  .session-item:hover { background: #2b2b2f; }
-  .job .progress, .bar-row .bar { background: #151517; }
-  .card:hover { border-color: #4c4c54; }
-  .ghost:hover { background: var(--panel2); border-color: #48484f; }
-  .msg.assistant { background: rgba(247,107,112,.12); border-color: rgba(247,107,112,.35); }
-  .hero-launch { color: #b91c1c; }
-}
 
 /* ================= v0.5 · 终端页 ================= */
 .term-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
@@ -425,19 +439,13 @@ input[type="range"] { width: 100%; accent-color: var(--accent); padding: 0; }
 .logo-box .ic { width: 20px; height: 20px; color: #fff; stroke-width: 2.2; }
 .hero-launch .ic, .primary .ic { width: 17px; height: 17px; }
 .page-header h1 .ic, h3 .ic { width: 17px; height: 17px; vertical-align: -3px; }
-use { pointer-events: none; }  /* 图标点击穿透到父按钮 */
-
-/* ================= v0.6 · 显式主题(light/dark)与跟随系统 fallback ================= */
-[data-theme="light"] {
-  --bg: #f2f4f8; --panel: #ffffff; --panel2: #f8fafc;
-  --line: #e3e8f0; --line2: #eef1f6; --txt: #1f2a44; --dim: #6b7690;
-  --accent: #e5484d; --accent-soft: rgba(229,72,77,.10); --accent2: #f9898c;
-  --shadow: 0 1px 2px rgba(16,24,40,.05), 0 8px 24px -14px rgba(16,24,40,.18);
-}
+use { pointer-events: none; }  
 @media (prefers-color-scheme: dark) {
-  [data-theme="system"] {
-    --bg: #1b1b1d; --panel: #252527; --panel2: #2d2d30;
-    --line: #3c3c40; --line2: #333336; --txt: #e6e6ea; --dim: #9b9ba3;
-    --accent: #f76b70; --accent-soft: rgba(247,107,112,.18); --accent2: #f9898c;
-  }
+  
 }
+
+/* ================= 深色模式特殊覆盖 ================= */
+[data-theme="dark"] body, [data-theme="system"] body { background-color: var(--bg); }
+[data-theme="dark"] .session-item:hover, [data-theme="system"] .session-item:hover { background: var(--panel); }
+[data-theme="dark"] .qchip:hover, [data-theme="system"] .qchip:hover { border-color: var(--line); }
+[data-theme="dark"] .term, [data-theme="system"] .term { background: #0d0f12; }

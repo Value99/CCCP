@@ -282,16 +282,28 @@
 
       <div class="card-box">
         <h3>扫描配置</h3>
-        <div class="param"><span>模式</span>
-          <label class="radio"><input type="radio" name="tmode" value="cpu" checked> CPU 全量推理</label>
-          <label class="radio"><input type="radio" name="tmode" value="disk"> 硬盘(离线)推理</label>
+        <div class="field-block">
+          <span class="fb-label">模式</span>
+          <div class="radio-group">
+            <label class="radio"><input type="radio" name="tmode" value="cpu" checked> CPU 全量推理</label>
+            <label class="radio"><input type="radio" name="tmode" value="disk"> 硬盘(离线)推理</label>
+          </div>
         </div>
-        <div class="param"><span>目标体积 GB(0=不限)</span><input id="targetGb" type="number" value="128" min="0" step="1"></div>
-        <input id="targetGbRange" type="range" min="0" max="1024" value="128">
-        <div class="param"><span>采样上限</span><input id="sampleLimit" type="number" value="2000" min="10" step="100"></div>
-        <div class="param"><span>关联 profiles</span><select id="relatedProfiles" multiple size="4"></select></div>
+        <div class="field-block">
+          <span class="fb-label">目标体积 GB(0=不限)</span>
+          <input id="targetGb" type="number" value="128" min="0" step="1">
+          <input id="targetGbRange" type="range" min="0" max="1024" value="128" style="margin-top:6px">
+        </div>
+        <div class="field-block">
+          <span class="fb-label">采样上限</span>
+          <input id="sampleLimit" type="number" value="2000" min="10" step="100">
+        </div>
+        <div class="field-block">
+          <span class="fb-label">关联 profiles</span>
+          <select id="relatedProfiles" multiple size="4"></select>
+        </div>
         <div class="hint">当前为估算模式(heuristic-fallback);TPQ 路由计数接口(I-3)就绪后自动切换 calibrated。</div>
-        <button class="primary" id="trainStartBtn"><svg class="ic"><use href="#i-chart"/></svg> 开始扫描</button>
+        <button class="primary" id="trainStartBtn" style="margin-top:16px"><svg class="ic"><use href="#i-chart"/></svg> 开始扫描</button>
       </div>
 
       <div class="card-box">
