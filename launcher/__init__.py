@@ -1,3 +1,2 @@
-"""WINUI-EXE 启动器后端包。"""
-
-__version__ = "0.3.0"
+"""WINUI-EXE · TPQ-Final 启动器(独立仓库,不修改 TPQ-Final)。"""
+__version__ = "0.5.0"

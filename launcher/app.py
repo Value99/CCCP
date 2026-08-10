@@ -1,9 +1,9 @@
 """WINUI-EXE 入口:FastAPI 应用 + CLI。
 
 职责:
-- 装配 settings / ProfileRegistry / TPQAdapter / ChatProxy / TrainingEngine / AppState
+- 装配 settings / ProfileRegistry / TPQAdapter / ChatProxy / TrainingEngine / AppState / DownloadEngine
 - REST API + OpenAI 兼容 /v1/chat/completions
-- 静态托管 webui/(深色 SPA)
+- 静态托管 webui/(浅色/跟随系统主题 SPA)
 - 统一错误格式 {"error": {"code", "message"}}
 """
 from __future__ import annotations
@@ -25,6 +25,7 @@ from .settings import load_settings, Settings
 from .state import AppState
 from .tpq_adapter import LaunchConfig, TPQAdapter, TPQError, discover_models
 from .downloads import DownloadEngine, fetch_index, fetch_profile_text
+from .logbuf import attach_ring_log, tail_lines
 from .training import (
     CORPUS_DIR, TrainingEngine, delete_corpus, export_counts, export_profile,
     export_scores, list_corpus, save_corpus_file,
@@ -46,6 +47,28 @@ def downloads_default_hint(s: Settings) -> str:
     return str(runtime_root() / "data" / "models")
 
 
+def detect_hardware() -> dict:
+    """CUDA 可用性探测(nvidia-smi,零依赖)+ CPU/平台信息;任何失败降级。"""
+    import os
+    import platform
+    import subprocess
+
+    gpus: list[str] = []
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=3)
+        if r.returncode == 0:
+            gpus = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return {"cuda_available": bool(gpus), "gpus": gpus,
+            "cpu_count": os.cpu_count() or 0,
+            "platform": f"{platform.system()} {platform.release()}",
+            "python": platform.python_version()}
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
     registry = ProfileRegistry(BUILTIN_PROFILE_DIR, USER_PROFILE_DIR)
@@ -61,6 +84,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.adapter = adapter
     app.state.chat = chat
     app.state.training = training
+    app.state.downloads = downloads
     app.state.app_state = state
 
     # -- 统一错误 --
@@ -106,6 +130,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "roots": settings.model_roots,
             "hint": "在设置里添加 model_roots(含 cccp.json 的上级目录)以发现模型",
         }
+
+    # ------------------------------------------------------------------
+    # 系统 / 终端(v0.5):运行环境探测 + 日志查看
+    # ------------------------------------------------------------------
+    @app.get("/api/system")
+    async def api_system():
+        hw = detect_hardware()
+        return {**hw, "default_device": settings.default_device}
+
+    @app.get("/api/terminal/app")
+    async def api_terminal_app():
+        return {"lines": tail_lines(300)}
+
+    @app.get("/api/terminal/tpq")
+    async def api_terminal_tpq():
+        return {"lines": adapter.tail_log(400)}
 
     # ------------------------------------------------------------------
     # 社区(profile 下载 / Discord 链接)(v0.3)
@@ -221,7 +261,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             host=str(body.get("host") or "127.0.0.1"),
             served_model_name=str(body.get("served_model_name") or "winui-model"),
             profile_mode=str(body.get("profile_mode") or "auto"),
-            device=str(body.get("device") or "cuda"),
+            device=str(body.get("device") or settings.default_device),
             cache_gb=body.get("cache_gb"),
             vram_gb=body.get("vram_gb"),
             dense_residency=str(body.get("dense_residency") or "auto"),
@@ -238,7 +278,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         combo = registry.combine(ids)
         cfg = _launch_cfg(body, ids, combo)
         if not cfg.model_path:
-            raise TPQError("缺少 model_path(先在「模型」里扫描并选择)")
+            raise TPQError("缺少 model_path(先在「模型库」里下载/扫描并选择)")
         if body.get("dry_run_only"):
             return {"dry_run": adapter.dry_run(cfg)}
         inst = adapter.launch(cfg)
@@ -399,7 +439,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                               "POST /api/community/profiles/install"],
                 "downloads": ["POST /api/models/download", "GET /api/models/download/jobs",
                               "DELETE /api/models/download/jobs/{id}"],
-                "chat": ["POST /api/chat/completions", "GET /api/chat/models"],
+                "system": ["GET /api/system", "GET /api/terminal/app",
+                           "GET /api/terminal/tpq"],
             },
             "curl_example": (
                 f'curl -N {base}/v1/chat/completions \\\n'
@@ -434,6 +475,7 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    attach_ring_log()
     settings = load_settings()
     if args.tpq_path:
         settings.tpq_path = args.tpq_path

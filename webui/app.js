@@ -36,9 +36,11 @@ $$(".nav-item").forEach((b) =>
     $$(".page").forEach((p) => p.classList.toggle("active", p.id === `page-${b.dataset.tab}`));
     if (b.dataset.tab === "training") refreshTraining();
     if (b.dataset.tab === "api") refreshApiInfo();
-    if (b.dataset.tab === "settings") loadSettings().catch(() => {});
+    if (b.dataset.tab === "settings") { loadSettings().catch(() => {}); loadSystem().catch(() => {}); }
     if (b.dataset.tab === "models") refreshModelsPage();
     if (b.dataset.tab === "home") refreshHome();
+    if (b.dataset.tab === "terminal") startTerminal();
+    if (b.dataset.tab !== "terminal") stopTerminal();
   })
 );
 
@@ -182,7 +184,8 @@ async function launch(dry, src = "profiles") {
   if (!model) return alert("请先选择模型(「模型库」页可下载;「设置」可添加本地目录)");
   const body = {
     profile_ids: ids, model_path: model,
-    profile_mode: $("#modeSelect").value, device: $("#deviceSelect").value,
+    profile_mode: $("#modeSelect").value,
+    device: (src === "home" ? $("#homeDeviceSelect") : $("#deviceSelect")).value,
     port: +portEl.value, dry_run_only: dry,
   };
   btn.disabled = true;
@@ -372,6 +375,9 @@ async function loadSettings() {
   $("#setIndexUrl").value = s.community_index_url || "";
   $("#setHfEndpoint").value = s.hf_endpoint || "";
   $("#setDlDir").value = s.model_download_dir || "";
+  $("#setDefaultDevice").value = s.default_device || "cuda";
+  $("#deviceSelect").value = s.default_device || "cuda";
+  $("#homeDeviceSelect").value = s.default_device || "cuda";
   $("#aboutTpq").textContent = s.tpq_path || "未探测到";
 }
 $("#saveSettingsBtn").addEventListener("click", async () => {
@@ -382,6 +388,7 @@ $("#saveSettingsBtn").addEventListener("click", async () => {
     community_index_url: $("#setIndexUrl").value.trim(),
     hf_endpoint: $("#setHfEndpoint").value.trim(),
     model_download_dir: $("#setDlDir").value.trim(),
+    default_device: $("#setDefaultDevice").value,
   };
   try {
     await api("/api/settings", {
@@ -708,3 +715,40 @@ $("#apiRefreshBtn").addEventListener("click", refreshApiInfo);
   const s = await api("/api/launch/status").catch(() => null);
   if (s?.instance) state.instance = s.instance;
 })();
+
+/* ---------- 无边框自绘标题栏(pywebview 原生窗口;浏览器模式静默降级)---------- */
+(function titlebarWiring() {
+  const native = () => window.pywebview?.api;
+  $("#tbMin")?.addEventListener("click", (e) => { e.stopPropagation(); native()?.win_minimize?.(); });
+  $("#tbMax")?.addEventListener("click", (e) => { e.stopPropagation(); native()?.win_toggle_max?.(); });
+  $("#tbClose")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (native()?.win_close) native().win_close(); else window.close();
+  });
+})();
+
+/* ---------- 终端页(可见时轮询)---------- */
+let termTimer = null;
+function renderTerm(el, lines, empty) {
+  el.textContent = lines && lines.length ? lines.join("
+") : empty;
+  el.scrollTop = el.scrollHeight;
+}
+async function refreshTerminal() {
+  try {
+    const [t, a] = await Promise.all([api("/api/terminal/tpq"), api("/api/terminal/app")]);
+    renderTerm($("#termTpq"), t.lines, "TPQ 未在运行 / 暂无输出");
+    renderTerm($("#termApp"), a.lines, "暂无启动器日志");
+  } catch (e) { $("#termApp").textContent = `读取失败: ${e.message}`; }
+}
+function startTerminal() { stopTerminal(); refreshTerminal(); termTimer = setInterval(refreshTerminal, 3000); }
+function stopTerminal() { if (termTimer) { clearInterval(termTimer); termTimer = null; } }
+$("#termRefreshBtn").addEventListener("click", refreshTerminal);
+
+/* ---------- 运行环境(CUDA / CPU)---------- */
+async function loadSystem() {
+  const d = await api("/api/system");
+  $("#sysInfo").textContent = d.cuda_available
+    ? `CUDA 可用 · GPU: ${d.gpus.join(" | ")} · CPU ${d.cpu_count} 线程 · ${d.platform} · Python ${d.python}`
+    : `未检测到 CUDA(nvidia-smi 不可用)· 将以 CPU 推理 · CPU ${d.cpu_count} 线程 · ${d.platform} · Python ${d.python}`;
+}
