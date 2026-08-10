@@ -370,13 +370,13 @@ input[type="range"] { width: 100%; accent-color: var(--accent); padding: 0; }
 /* ================= v0.4 · 跟随 Windows 明暗(prefers-color-scheme)================= */
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0f1219;
-    --panel: #151a25;
-    --panel2: #1b2231;
-    --line: #273147;
-    --line2: #222b3f;
-    --txt: #dbe4f3;
-    --dim: #8b98b4;
+    --bg: #1b1b1d;
+    --panel: #252527;
+    --panel2: #2d2d30;
+    --line: #3c3c40;
+    --line2: #333336;
+    --txt: #e6e6ea;
+    --dim: #9b9ba3;
     --accent: #818cf8;
     --accent-soft: rgba(129,140,248,.16);
     --accent2: #38bdf8;
@@ -387,23 +387,22 @@ input[type="range"] { width: 100%; accent-color: var(--accent); padding: 0; }
     --bad: #f87171;
     --bad-soft: rgba(248,113,113,.14);
     --shadow: 0 1px 2px rgba(0,0,0,.45), 0 10px 26px -14px rgba(0,0,0,.55);
-    --shadow-hover: 0 2px 4px rgba(0,0,0,.5), 0 14px 34px -14px rgba(99,102,241,.55);
+    --shadow-hover: 0 2px 4px rgba(0,0,0,.5), 0 14px 34px -14px rgba(99,102,241,.5);
   }
   body {
     background-image:
-      radial-gradient(720px 320px at 90% -10%, rgba(99,102,241,.18), transparent),
-      radial-gradient(640px 280px at 0% 110%, rgba(14,165,233,.10), transparent);
+      radial-gradient(720px 320px at 90% -10%, rgba(129,140,248,.07), transparent),
+      radial-gradient(640px 280px at 0% 110%, rgba(56,189,248,.05), transparent);
   }
-  ::-webkit-scrollbar-thumb { background: #2a3548; }
-  ::-webkit-scrollbar-thumb:hover { background: #37445c; }
-  .session-item:hover { background: #1f293d; }
-  .job .progress, .bar-row .bar { background: #0c0f16; }
-  .card:hover { border-color: #3a4763; }
-  .ghost:hover { background: var(--panel2); border-color: #33405a; }
+  ::-webkit-scrollbar-thumb { background: #3a3a3f; }
+  ::-webkit-scrollbar-thumb:hover { background: #4a4a50; }
+  .session-item:hover { background: #2b2b2f; }
+  .job .progress, .bar-row .bar { background: #151517; }
+  .card:hover { border-color: #4c4c54; }
+  .ghost:hover { background: var(--panel2); border-color: #48484f; }
   .msg.assistant { background: rgba(129,140,248,.12); border-color: rgba(129,140,248,.35); }
   .hero-launch { color: #4338ca; }
 }
-
 
 /* ================= v0.5 · 终端页 ================= */
 .term-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }

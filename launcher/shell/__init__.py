@@ -50,6 +50,11 @@ class _WinCtlApi:
         if self._window:
             self._window.destroy()
 
+    def win_move(self, x: float, y: float) -> None:
+        """前端标题栏拖拽:把窗口移到屏幕坐标(x, y)。"""
+        if self._window:
+            self._window.move(int(x), int(y))
+
 
 def _start_uvicorn(app, host: str, port: int) -> tuple[uvicorn.Server, threading.Thread]:
     config = uvicorn.Config(app, host=host, port=port, log_level="info")
@@ -84,7 +89,6 @@ def run_with_shell(app, host: str, port: int) -> None:
             width=1440, height=900, min_size=(1024, 640),
             background_color=BG_COLOR,
             frameless=True,
-            easy_drag=True,  # 鼠标左键拖拽空白区域即可移动窗口
             text_select=True,
             js_api=api,
         )
