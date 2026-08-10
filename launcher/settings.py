@@ -18,6 +18,12 @@ class Settings:
     model_roots: list[str] = field(default_factory=list)  # 扫描 cccp.json 的根目录
     api_port_alloc_start: int = 8801  # 为 TPQ serve 分配的端口起点
     tpq_api_key: str = ""
+    # 社区(v0.3):首页与配置库页展示;均为可选,未配置时前端给提示
+    discord_url: str = ""  # Discord 社区邀请链接
+    community_index_url: str = ""  # 社区 profile 索引 JSON URL
+    # 模型下载(v0.3)
+    hf_endpoint: str = "https://hf-mirror.com"  # HuggingFace 端点(可改官方 https://huggingface.co)
+    model_download_dir: str = ""  # 模型默认下载落盘目录(空 → model_roots[0] 或 data/models)
     # 模型专家规格(校准前为估算默认值;INTERFACE I-2 落地后自动更新)
     model_layers: int = 60
     model_experts_per_layer: int = 256

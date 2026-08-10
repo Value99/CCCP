@@ -37,6 +37,8 @@ $$(".nav-item").forEach((b) =>
     if (b.dataset.tab === "training") refreshTraining();
     if (b.dataset.tab === "api") refreshApiInfo();
     if (b.dataset.tab === "settings") loadSettings().catch(() => {});
+    if (b.dataset.tab === "models") refreshModelsPage();
+    if (b.dataset.tab === "home") refreshHome();
   })
 );
 
@@ -50,7 +52,11 @@ async function pollStatus() {
     dot.className = "dot " + (state.ready ? "ready" : h.tpq?.running ? "loading" : "");
     $("#statusText").textContent = state.ready ? "模型就绪" : h.tpq?.running ? "启动中…" : "未启动";
     $("#stopBtn").disabled = !h.tpq?.running;
-    if (state.ready) $("#launchHint").textContent = "";
+    $("#homeStopBtn").disabled = !h.tpq?.running;
+    const pill = $("#homeStatusPill");
+    pill.textContent = state.ready ? "模型就绪" : h.tpq?.running ? "启动中…" : "未启动";
+    pill.className = "state-pill hero-pill " + (state.ready ? "on" : "off");
+    if (state.ready) { $("#launchHint").textContent = ""; $("#homeLaunchHint").textContent = ""; }
   } catch { $("#statusText").textContent = "后端断连"; $("#statusDot").className = "dot"; }
 }
 setInterval(pollStatus, 5000);
@@ -61,6 +67,7 @@ async function loadProfiles() {
   state.profiles = d.profiles;
   if (d.selected?.length) state.selected = new Set(d.selected);
   renderCards();
+  renderHomeChips();
   renderRelatedSelect();
   updateSummary();
 }
@@ -108,6 +115,7 @@ async function toggleProfile(id) {
   state.selected.has(id) ? state.selected.delete(id) : state.selected.add(id);
   await persistSelection();
   renderCards();
+  renderHomeChips();
   updateSummary();
 }
 
@@ -126,6 +134,7 @@ async function updateSummary() {
     $("#sumExperts").textContent = "0"; $("#sumMem").textContent = "0";
     $("#sumOverlap").textContent = "0"; $("#sumDrop").innerHTML = "";
     $("#perProfile").innerHTML = "";
+    updateHomeSummary(null);
     return;
   }
   const c = await api("/api/profiles/combine", {
@@ -139,16 +148,20 @@ async function updateSummary() {
     .map(([pid, key]) => `<span class="chip acc">${esc(pid)} → ${key ?? "?"}</span>`).join("");
   $("#perProfile").innerHTML = (c.per_profile || [])
     .map((p) => `<span class="chip">${esc(p.id)}: ${fmtGB(p.memory_gb)} GB</span>`).join("");
+  updateHomeSummary(c);
 }
 
 /* 模型 / 启动 */
 async function loadModels() {
   try {
     const { models } = await api("/api/models");
-    const sel = $("#modelSelect");
-    sel.innerHTML = models.length
+    state.models = models;
+    const html = models.length
       ? models.map((m) => `<option value="${esc(m.path)}">${esc(m.name)} (${esc(m.architecture)})</option>`).join("")
-      : `<option value="">— 未发现模型(「设置」里添加 model_roots)—</option>`;
+      : `<option value="">— 未发现模型(「模型库」下载或「设置」添加目录)—</option>`;
+    $("#modelSelect").innerHTML = html;
+    $("#homeModelSelect").innerHTML = html;
+    renderLocalModels(models);
   } catch { /* 静默 */ }
 }
 
@@ -157,37 +170,45 @@ function showLog(text) {
   el.hidden = false; el.textContent = text;
 }
 
-async function launch(dry) {
+async function launch(dry, src = "profiles") {
   const ids = [...state.selected];
-  if (!ids.length) return alert("请先选择至少一个 profile");
-  const model = $("#modelSelect").value;
-  if (!model) return alert("请先选择模型目录(「设置」里先添加 model_roots 扫描)");
+  if (!ids.length) return alert("请先在「首页」或「配置库」勾选至少一个配置");
+  const sel = src === "home" ? $("#homeModelSelect") : $("#modelSelect");
+  const portEl = src === "home" ? $("#homePortInput") : $("#portInput");
+  const hint = src === "home" ? $("#homeLaunchHint") : $("#launchHint");
+  const btn = src === "home" ? $("#homeLaunchBtn") : $("#launchBtn");
+  const logEl = src === "home" ? $("#homeLaunchLog") : $("#launchLog");
+  const model = sel.value;
+  if (!model) return alert("请先选择模型(「模型库」页可下载;「设置」可添加本地目录)");
   const body = {
     profile_ids: ids, model_path: model,
     profile_mode: $("#modeSelect").value, device: $("#deviceSelect").value,
-    port: +$("#portInput").value, dry_run_only: dry,
+    port: +portEl.value, dry_run_only: dry,
   };
-  $("#launchBtn").disabled = true;
-  $("#launchHint").textContent = dry ? "预检中…" : "启动中…(大模型加载可能需要几分钟)";
+  btn.disabled = true;
+  hint.textContent = dry ? "预检中…" : "启动中…(大模型加载可能需要几分钟)";
   try {
     const r = await api(dry ? "/api/launch/dry-run" : "/api/launch", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
     if (dry) {
-      showLog(`预检 ${r.ok ? "通过" : "失败"}\n命令: ${(r.cmd || []).join(" ")}\n${r.stdout}\n${r.stderr}`);
-      $("#launchHint").textContent = r.ok ? "预检通过,可启动" : "预检失败";
+      logEl.hidden = false;
+      logEl.textContent = `预检 ${r.ok ? "通过" : "失败"}\n命令: ${(r.cmd || []).join(" ")}\n${r.stdout}\n${r.stderr}`;
+      hint.textContent = r.ok ? "预检通过,可启动" : "预检失败";
     } else {
-      $("#launchHint").textContent = "已发起,等待就绪…";
+      hint.textContent = "已发起,等待就绪…";
       pollStatus();
     }
-  } catch (e) { alert(e.message); $("#launchHint").textContent = ""; }
-  $("#launchBtn").disabled = false;
+  } catch (e) { alert(e.message); hint.textContent = ""; }
+  btn.disabled = false;
 }
 $("#dryRunBtn").addEventListener("click", () => launch(true));
 $("#launchBtn").addEventListener("click", () => launch(false));
-$("#stopBtn").addEventListener("click", async () => {
-  await api("/api/launch/stop", { method: "POST" }); pollStatus();
-});
+$("#homeDryBtn").addEventListener("click", () => launch(true, "home"));
+$("#homeLaunchBtn").addEventListener("click", () => launch(false, "home"));
+const stopTpq = async () => { await api("/api/launch/stop", { method: "POST" }); pollStatus(); };
+$("#stopBtn").addEventListener("click", stopTpq);
+$("#homeStopBtn").addEventListener("click", stopTpq);
 
 /* 导入 */
 $("#importBtn").addEventListener("click", () => $("#importFile").click());
@@ -204,18 +225,163 @@ $("#importFile").addEventListener("change", async (ev) => {
   ev.target.value = "";
 });
 
+/* ---------- 首页(快速选择 / 一键启动 / 上次启动 / 社区入口)---------- */
+function renderHomeChips() {
+  const root = $("#homeChips");
+  if (!root) return;
+  root.innerHTML = state.profiles.map((p) => `
+    <span class="qchip ${state.selected.has(p.id) ? "on" : ""}" data-pid="${esc(p.id)}" title="${esc(p.description || "")}">${esc(p.name)} <small>${fmtGB(p.memory_gb)}G</small></span>`).join("");
+  $$("#homeChips .qchip").forEach((el) => el.addEventListener("click", () => toggleProfile(el.dataset.pid)));
+}
+
+function updateHomeSummary(c) {
+  $("#homeSummary").textContent = c
+    ? `合计 ${c.expert_count} 专家 · 去重后 ${fmtGB(c.memory_gb)} GB(重叠省 ${fmtGB(c.overlap_gb)} GB)`
+    : "勾选配置后显示合计体积";
+  const ms = $("#homeModelSelect");
+  $("#homeSelChip").textContent = `${ms?.selectedOptions[0]?.textContent || "未选择模型"} · ${state.selected.size} 个配置`;
+}
+
+async function refreshHome() {
+  renderHomeChips();
+  try {
+    const s = await api("/api/launch/status");
+    const ll = s.last_launch;
+    const box = $("#lastLaunchBox");
+    if (ll) {
+      box.textContent = `${ll.model}\nprofiles: ${(ll.profiles || []).join(", ")}\nport ${ll.port} · ${new Date((ll.at || 0) * 1000).toLocaleString()}`;
+      const btn = $("#relaunchBtn");
+      btn.disabled = false;
+      btn.onclick = async () => {
+        state.selected = new Set(ll.profiles || []);
+        await persistSelection();
+        renderCards(); renderHomeChips(); updateSummary();
+        const sel = $("#homeModelSelect");
+        if ([...sel.options].some((o) => o.value === ll.model)) sel.value = ll.model;
+        if (ll.port) $("#homePortInput").value = ll.port;
+        launch(false, "home");
+      };
+    } else { box.textContent = "暂无记录"; $("#relaunchBtn").disabled = true; }
+  } catch { /* 静默 */ }
+  try {
+    const cfg = await api("/api/community/config");
+    $("#communityCfgHint").textContent = cfg.discord_url ? "" : "Discord 链接未配置(到「设置 · 社区与下载」填写)";
+  } catch { /* 静默 */ }
+}
+
+$("#discordBtn").addEventListener("click", async () => {
+  try {
+    const cfg = await api("/api/community/config");
+    if (cfg.discord_url) window.open(cfg.discord_url, "_blank");
+    else alert("社区 Discord 链接未配置:请到「设置 · 社区与下载」填写");
+  } catch (e) { alert(e.message); }
+});
+$("#goModelsBtn").addEventListener("click", () =>
+  $$(".nav-item").find((b) => b.dataset.tab === "models")?.click());
+
+/* ---------- 社区配置下载 ---------- */
+$("#communityInstallBtn").addEventListener("click", async () => {
+  const url = $("#communityUrlInput").value.trim();
+  if (!url) return alert("请粘贴 profile 文件 URL(yaml/json)");
+  installCommunity(url);
+});
+async function installCommunity(url) {
+  try {
+    const r = await api("/api/community/profiles/install", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }) });
+    alert(`已安装: ${r.profile.name}(${r.profile.expert_count} 专家 / ${fmtGB(r.profile.memory_gb)} GB)`);
+    $("#communityUrlInput").value = "";
+    loadProfiles();
+  } catch (e) { alert(`安装失败: ${e.message}`); }
+}
+$("#communityRefreshBtn").addEventListener("click", async () => {
+  const box = $("#communityList");
+  box.innerHTML = `<div class="hint">拉取社区索引中…</div>`;
+  try {
+    const d = await api("/api/community/profiles");
+    box.innerHTML = d.profiles.length
+      ? d.profiles.map((e) => `
+        <div class="community-item">
+          <div class="ci-t"><b>${esc(e.name || e.id || "未命名")}</b><span class="dim">${esc(e.description || "")}</span></div>
+          <button class="primary sm" data-curl="${esc(e.url)}">安装</button>
+        </div>`).join("")
+      : `<div class="hint">${esc(d.note || "社区索引为空")}</div>`;
+    $$("#communityList [data-curl]").forEach((b) =>
+      b.addEventListener("click", () => installCommunity(b.dataset.curl)));
+  } catch (e) { box.innerHTML = `<div class="hint">拉取失败: ${esc(e.message)}</div>`; }
+});
+
+/* ---------- 模型库页 ---------- */
+function renderLocalModels(models) {
+  const box = $("#localModels");
+  if (!box) return;
+  box.innerHTML = models.length ? models.map((m) => `
+    <div class="model-item">
+      <div class="mi-t"><b>${esc(m.name)}</b><span class="badge builtin">${esc(m.architecture)}</span></div>
+      <div class="mi-p mono dim">${esc(m.path)}</div>
+      <button class="ghost sm" data-use="${esc(m.path)}">设为启动模型</button>
+    </div>`).join("")
+    : `<div class="hint">未发现含 cccp.json 的模型目录;在「设置」添加 model_roots,或下载后完成 CCCP 归档。</div>`;
+  $$("#localModels [data-use]").forEach((b) =>
+    b.addEventListener("click", () => {
+      if ([...$("#homeModelSelect").options].some((o) => o.value === b.dataset.use))
+        $("#homeModelSelect").value = b.dataset.use;
+      $("#modelSelect").value = b.dataset.use;
+      $$(".nav-item").find((x) => x.dataset.tab === "home")?.click();
+    }));
+}
+
+async function refreshDlJobs() {
+  try {
+    const d = await api("/api/models/download/jobs");
+    if (d.default_dir) $("#dlTarget").placeholder = `留空使用默认目录: ${d.default_dir}`;
+    $("#dlJobs").innerHTML = d.jobs.map((j) => `
+      <div class="job">
+        <div class="jhead">
+          <span class="mono">${esc(j.repo)} <span class="dim">[${esc(j.source)}]</span></span>
+          <span class="jstatus ${j.status}">${{ running: "下载中", done: "完成", failed: "失败" }[j.status]}</span>
+        </div>
+        <div class="jmsg">${esc(j.message)}${j.error ? " · " + esc(j.error) : ""}</div>
+        <div class="jmsg mono">${esc(j.result_path || j.target_dir)}</div>
+      </div>`).join("") || `<div class="hint">暂无下载任务</div>`;
+    if (d.jobs.some((j) => j.status === "running")) setTimeout(refreshDlJobs, 3000);
+  } catch { /* 静默 */ }
+}
+
+function refreshModelsPage() { loadModels(); refreshDlJobs(); }
+$("#modelsRefreshBtn").addEventListener("click", refreshModelsPage);
+$("#dlStartBtn").addEventListener("click", async () => {
+  const repo = $("#dlRepo").value.trim();
+  if (!repo) return alert("请填写仓库 ID(如 Qwen/Qwen2.5-7B-Instruct)");
+  try {
+    await api("/api/models/download", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repo, source: $("#dlSource").value,
+        revision: $("#dlRevision").value.trim(), target_dir: $("#dlTarget").value.trim() }) });
+    refreshDlJobs();
+  } catch (e) { alert(e.message); }
+});
+
 /* ---------- 设置页 ---------- */
 async function loadSettings() {
   const s = await api("/api/settings");
   state.settings = s;
   $("#setTpqPath").value = s.tpq_path || "";
   $("#setModelRoots").value = (s.model_roots || []).join("\n");
+  $("#setDiscord").value = s.discord_url || "";
+  $("#setIndexUrl").value = s.community_index_url || "";
+  $("#setHfEndpoint").value = s.hf_endpoint || "";
+  $("#setDlDir").value = s.model_download_dir || "";
   $("#aboutTpq").textContent = s.tpq_path || "未探测到";
 }
 $("#saveSettingsBtn").addEventListener("click", async () => {
   const body = {
     tpq_path: $("#setTpqPath").value.trim(),
     model_roots: $("#setModelRoots").value.split("\n").map((x) => x.trim()).filter(Boolean),
+    discord_url: $("#setDiscord").value.trim(),
+    community_index_url: $("#setIndexUrl").value.trim(),
+    hf_endpoint: $("#setHfEndpoint").value.trim(),
+    model_download_dir: $("#setDlDir").value.trim(),
   };
   try {
     await api("/api/settings", {
@@ -300,7 +466,7 @@ async function send() {
   const input = $("#chatInput");
   const text = input.value.trim();
   if (!text) return;
-  if (!state.ready) return alert("模型未就绪:请到「配置启动」页选择一个组合并发动");
+  if (!state.ready) return alert("模型未就绪:请到「首页」勾选配置后一键启动");
   input.value = "";
   state.messages.push({ role: "user", content: text });
   addMsg("user", text);
@@ -537,6 +703,8 @@ $("#apiRefreshBtn").addEventListener("click", refreshApiInfo);
   const h = await api("/api/health").catch(() => null);
   if (h?.version) $("#aboutVer").textContent = `v${h.version}`;
   loadSettings().catch(() => {});
+  refreshHome();
+  refreshDlJobs();
   const s = await api("/api/launch/status").catch(() => null);
   if (s?.instance) state.instance = s.instance;
 })();
