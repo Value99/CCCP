@@ -16,7 +16,7 @@ import uvicorn
 
 log = logging.getLogger("winui.shell")
 
-WINDOW_TITLE = "WINUI-EXE — TPQ-Final 启动器"
+WINDOW_TITLE = "CCCP 启动器 — TPQ-Final"
 BG_COLOR = "#f2f4f8"  # 与前端浅色底色一致,避免暗->闪白
 
 

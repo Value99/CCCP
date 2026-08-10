@@ -25,6 +25,7 @@ class Settings:
     hf_endpoint: str = "https://hf-mirror.com"  # HuggingFace 端点(可改官方 https://huggingface.co)
     model_download_dir: str = ""  # 模型默认下载落盘目录(空 → model_roots[0] 或 data/models)
     default_device: str = "cuda"  # 默认推理设备(cuda|cpu;前端两处下拉默认同步)
+    theme_mode: str = "system"  # 主题:system(跟随系统) | light | dark
     # 模型专家规格(校准前为估算默认值;INTERFACE I-2 落地后自动更新)
     model_layers: int = 60
     model_experts_per_layer: int = 256

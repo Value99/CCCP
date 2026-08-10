@@ -7,9 +7,9 @@
   --line2: #eef1f6;
   --txt: #1f2a44;
   --dim: #6b7690;
-  --accent: #6366f1;
-  --accent-soft: rgba(99,102,241,.10);
-  --accent2: #0ea5e9;
+  --accent: #e5484d;
+  --accent-soft: rgba(229,72,77,.10);
+  --accent2: #f9898c;
   --ok: #10b981;
   --ok-soft: rgba(16,185,129,.12);
   --warn: #f59e0b;
@@ -17,7 +17,7 @@
   --bad: #ef4444;
   --bad-soft: rgba(239,68,68,.10);
   --shadow: 0 1px 2px rgba(16,24,40,.05), 0 8px 24px -14px rgba(16,24,40,.18);
-  --shadow-hover: 0 2px 4px rgba(16,24,40,.06), 0 14px 34px -14px rgba(99,102,241,.28);
+  --shadow-hover: 0 2px 4px rgba(16,24,40,.06), 0 14px 34px -14px rgba(229,72,77,.28);
   --radius: 14px;
   --mono: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
 }
@@ -27,7 +27,7 @@ body {
   display: flex; flex-direction: column;
   background: var(--bg);
   background-image:
-    radial-gradient(720px 320px at 90% -10%, rgba(99,102,241,.07), transparent),
+    radial-gradient(720px 320px at 90% -10%, rgba(229,72,77,.07), transparent),
     radial-gradient(640px 280px at 0% 110%, rgba(14,165,233,.05), transparent);
   color: var(--txt);
   font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
@@ -48,8 +48,8 @@ body {
 .side-brand { display: flex; align-items: center; gap: 10px; padding: 2px 8px 16px; }
 .side-brand .logo-box {
   width: 38px; height: 38px; border-radius: 11px; display: grid; place-items: center;
-  background: linear-gradient(135deg, var(--accent), #818cf8); color: #fff;
-  font-size: 18px; box-shadow: 0 6px 16px -6px rgba(99,102,241,.6);
+  background: linear-gradient(135deg, var(--accent), #f76b70); color: #fff;
+  font-size: 18px; box-shadow: 0 6px 16px -6px rgba(229,72,77,.6);
 }
 .side-brand .name { font-weight: 700; font-size: 14.5px; letter-spacing: .2px; }
 .side-brand .sub { color: var(--dim); font-size: 11px; }
@@ -64,7 +64,7 @@ body {
 .nav-item:hover { background: var(--panel2); color: var(--txt); }
 .nav-item.active {
   background: var(--accent-soft); color: var(--accent); font-weight: 600;
-  box-shadow: inset 0 0 0 1px rgba(99,102,241,.22);
+  box-shadow: inset 0 0 0 1px rgba(229,72,77,.22);
 }
 
 .side-spacer { flex: 1; }
@@ -91,8 +91,8 @@ body {
 /* ---------- 按钮 / 表单 ---------- */
 button { font: inherit; cursor: pointer; border-radius: 10px; border: 1px solid transparent; padding: 9px 18px; }
 .primary {
-  background: linear-gradient(135deg, var(--accent), #818cf8); color: #fff; font-weight: 600;
-  box-shadow: 0 6px 16px -8px rgba(99,102,241,.8);
+  background: linear-gradient(135deg, var(--accent), #f76b70); color: #fff; font-weight: 600;
+  box-shadow: 0 6px 16px -8px rgba(229,72,77,.8);
 }
 .primary:hover { filter: brightness(1.06); }
 .primary:disabled { opacity: .45; cursor: not-allowed; box-shadow: none; }
@@ -109,7 +109,7 @@ input, select, textarea {
   background: var(--panel); color: var(--txt); border: 1px solid var(--line);
   border-radius: 10px; padding: 8px 12px; font: inherit; outline: none;
 }
-input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(99,102,241,.15); }
+input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(229,72,77,.15); }
 select[multiple] { min-width: 200px; }
 .mono { font-family: var(--mono); font-size: 12.5px; white-space: pre-wrap; }
 .dim { color: var(--dim); }
@@ -160,7 +160,7 @@ select[multiple] { min-width: 200px; }
 .card .calib { font-size: 10.5px; color: var(--warn); margin-top: 6px; }
 .card .badges { position: absolute; top: 12px; right: 12px; display: flex; gap: 5px; }
 .badge { font-size: 10.5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--dim); background: var(--panel2); }
-.badge.builtin { color: var(--accent); border-color: rgba(99,102,241,.4); background: var(--accent-soft); }
+.badge.builtin { color: var(--accent); border-color: rgba(229,72,77,.4); background: var(--accent-soft); }
 .badge.trained { color: var(--ok); border-color: rgba(16,185,129,.4); background: var(--ok-soft); }
 .badge.imported { color: var(--warn); border-color: rgba(245,158,11,.4); background: var(--warn-soft); }
 .badge.drop { color: var(--accent2); border-color: rgba(14,165,233,.4); }
@@ -281,9 +281,9 @@ input[type="range"] { width: 100%; accent-color: var(--accent); padding: 0; }
 /* ================= v0.3 · 首页 / 社区 / 模型库 ================= */
 .hero {
   position: relative; overflow: hidden; color: #fff;
-  background: linear-gradient(115deg, #6366f1 0%, #818cf8 52%, #0ea5e9 100%);
+  background: linear-gradient(115deg, #e5484d 0%, #f76b70 52%, #f9898c 100%);
   border-radius: 18px; padding: 34px 36px 30px;
-  box-shadow: 0 18px 40px -18px rgba(99,102,241,.55); margin-bottom: 18px;
+  box-shadow: 0 18px 40px -18px rgba(229,72,77,.55); margin-bottom: 18px;
 }
 .hero::before, .hero::after { content: ""; position: absolute; border-radius: 50%; background: rgba(255,255,255,.14); }
 .hero::before { width: 260px; height: 260px; right: -70px; top: -90px; }
@@ -299,7 +299,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); padding: 0; }
 .hero-launch {
   background: #fff; color: #4f46e5; border: none; font-weight: 800; font-size: 16px;
   padding: 13px 32px; border-radius: 13px; transition: .15s;
-  box-shadow: 0 12px 26px -10px rgba(15,23,42,.45);
+  box-shadow: 0 12px 26px -10px rgba(120,20,24,.45);
 }
 .hero-launch:hover { transform: translateY(-1px); }
 .hero-launch:disabled { opacity: .5; transform: none; }
@@ -368,7 +368,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); padding: 0; }
 .tb-btn.close:hover { background: #e81123; color: #fff; }
 
 /* ================= v0.4 · 跟随 Windows 明暗(prefers-color-scheme)================= */
-@media (prefers-color-scheme: dark) {
+[data-theme="dark"] {
   :root {
     --bg: #1b1b1d;
     --panel: #252527;
@@ -377,9 +377,9 @@ input[type="range"] { width: 100%; accent-color: var(--accent); padding: 0; }
     --line2: #333336;
     --txt: #e6e6ea;
     --dim: #9b9ba3;
-    --accent: #818cf8;
-    --accent-soft: rgba(129,140,248,.16);
-    --accent2: #38bdf8;
+    --accent: #f76b70;
+    --accent-soft: rgba(247,107,112,.18);
+    --accent2: #f9898c;
     --ok: #34d399;
     --ok-soft: rgba(52,211,153,.14);
     --warn: #fbbf24;
@@ -387,11 +387,11 @@ input[type="range"] { width: 100%; accent-color: var(--accent); padding: 0; }
     --bad: #f87171;
     --bad-soft: rgba(248,113,113,.14);
     --shadow: 0 1px 2px rgba(0,0,0,.45), 0 10px 26px -14px rgba(0,0,0,.55);
-    --shadow-hover: 0 2px 4px rgba(0,0,0,.5), 0 14px 34px -14px rgba(99,102,241,.5);
+    --shadow-hover: 0 2px 4px rgba(0,0,0,.5), 0 14px 34px -14px rgba(229,72,77,.5);
   }
   body {
     background-image:
-      radial-gradient(720px 320px at 90% -10%, rgba(129,140,248,.07), transparent),
+      radial-gradient(720px 320px at 90% -10%, rgba(247,107,112,.07), transparent),
       radial-gradient(640px 280px at 0% 110%, rgba(56,189,248,.05), transparent);
   }
   ::-webkit-scrollbar-thumb { background: #3a3a3f; }
@@ -400,8 +400,8 @@ input[type="range"] { width: 100%; accent-color: var(--accent); padding: 0; }
   .job .progress, .bar-row .bar { background: #151517; }
   .card:hover { border-color: #4c4c54; }
   .ghost:hover { background: var(--panel2); border-color: #48484f; }
-  .msg.assistant { background: rgba(129,140,248,.12); border-color: rgba(129,140,248,.35); }
-  .hero-launch { color: #4338ca; }
+  .msg.assistant { background: rgba(247,107,112,.12); border-color: rgba(247,107,112,.35); }
+  .hero-launch { color: #b91c1c; }
 }
 
 /* ================= v0.5 · 终端页 ================= */
@@ -425,3 +425,18 @@ input[type="range"] { width: 100%; accent-color: var(--accent); padding: 0; }
 .hero-launch .ic, .primary .ic { width: 17px; height: 17px; }
 .page-header h1 .ic, h3 .ic { width: 17px; height: 17px; vertical-align: -3px; }
 use { pointer-events: none; }  /* 图标点击穿透到父按钮 */
+
+/* ================= v0.6 · 显式主题(light/dark)与跟随系统 fallback ================= */
+[data-theme="light"] {
+  --bg: #f2f4f8; --panel: #ffffff; --panel2: #f8fafc;
+  --line: #e3e8f0; --line2: #eef1f6; --txt: #1f2a44; --dim: #6b7690;
+  --accent: #e5484d; --accent-soft: rgba(229,72,77,.10); --accent2: #f9898c;
+  --shadow: 0 1px 2px rgba(16,24,40,.05), 0 8px 24px -14px rgba(16,24,40,.18);
+}
+@media (prefers-color-scheme: dark) {
+  [data-theme="system"] {
+    --bg: #1b1b1d; --panel: #252527; --panel2: #2d2d30;
+    --line: #3c3c40; --line2: #333336; --txt: #e6e6ea; --dim: #9b9ba3;
+    --accent: #f76b70; --accent-soft: rgba(247,107,112,.18); --accent2: #f9898c;
+  }
+}

@@ -1,4 +1,4 @@
-/* WINUI-EXE · TPQ Launcher 前端逻辑(原生 JS,无构建依赖) — 浅色应用外壳 */
+/* CCCP 启动器 前端逻辑(原生 JS,无构建依赖) — 浅色应用外壳 */
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
@@ -27,6 +27,13 @@ async function api(path, opts = {}) {
   return data;
 }
 const fmtGB = (gb) => (gb >= 100 ? gb.toFixed(0) : gb.toFixed(1));
+/* ---------- 主题:system/light/dark ---------- */
+function applyTheme(mode) {
+  document.documentElement.setAttribute("data-theme", mode || "system");
+  localStorage.setItem("theme", mode || "system");
+}
+applyTheme(localStorage.getItem("theme") || "system");
+
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 /* ---------- 左侧导航 ---------- */
@@ -376,10 +383,13 @@ async function loadSettings() {
   $("#setHfEndpoint").value = s.hf_endpoint || "";
   $("#setDlDir").value = s.model_download_dir || "";
   $("#setDefaultDevice").value = s.default_device || "cuda";
+  const th = s.theme_mode || "system";
+  $("#setTheme").value = th; applyTheme(th);
   $("#deviceSelect").value = s.default_device || "cuda";
   $("#homeDeviceSelect").value = s.default_device || "cuda";
   $("#aboutTpq").textContent = s.tpq_path || "未探测到";
 }
+$("#setTheme").addEventListener("change", (e) => applyTheme(e.target.value));
 $("#saveSettingsBtn").addEventListener("click", async () => {
   const body = {
     tpq_path: $("#setTpqPath").value.trim(),
@@ -389,6 +399,7 @@ $("#saveSettingsBtn").addEventListener("click", async () => {
     hf_endpoint: $("#setHfEndpoint").value.trim(),
     model_download_dir: $("#setDlDir").value.trim(),
     default_device: $("#setDefaultDevice").value,
+    theme_mode: $("#setTheme").value,
   };
   try {
     await api("/api/settings", {

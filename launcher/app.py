@@ -1,4 +1,4 @@
-"""WINUI-EXE 入口:FastAPI 应用 + CLI。
+"""CCCP 启动器入口:FastAPI 应用 + CLI。
 
 职责:
 - 装配 settings / ProfileRegistry / TPQAdapter / ChatProxy / TrainingEngine / AppState / DownloadEngine
@@ -78,7 +78,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     downloads = DownloadEngine(settings)
     state = AppState()
 
-    app = FastAPI(title="TPQ-Final WINUI-EXE Launcher", version=__version__)
+    app = FastAPI(title="CCCP 启动器", version=__version__)
     app.state.settings = settings
     app.state.registry = registry
     app.state.adapter = adapter
@@ -107,7 +107,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def api_health():
         tpq = await adapter.health()
         return {"winui": "ok", "version": __version__,
-                "tpq_available": adapter.available(), "tpq": tpq}
+                "tpq_available": adapter.available(), "tpq": tpq,
+                "theme_mode": settings.theme_mode}
 
     @app.get("/api/settings")
     async def api_get_settings():
@@ -464,7 +465,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="TPQ-Final WINUI-EXE Launcher")
+    ap = argparse.ArgumentParser(description="CCCP 启动器 (TPQ-Final)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8790)
     ap.add_argument("--tpq-path", default="", help="TPQ-Final 根目录(默认自动探测 ../TPQ-Final)")
@@ -485,7 +486,7 @@ def main() -> None:
     settings.save()
 
     app = create_app(settings)
-    log.info("WINUI-EXE 启动: http://%s:%d (TPQ=%s)",
+    log.info("CCCP 启动器启动: http://%s:%d (TPQ=%s)",
              args.host, args.port, settings.tpq_path or "未探测到")
 
     if args.no_shell:
