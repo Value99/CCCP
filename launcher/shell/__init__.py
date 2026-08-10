@@ -89,6 +89,7 @@ def run_with_shell(app, host: str, port: int) -> None:
             width=1440, height=900, min_size=(1024, 640),
             background_color=BG_COLOR,
             frameless=True,
+            easy_drag=False,  # 关闭全局拖拽(否则吞掉正文文本选择);拖拽仅挂自绘标题栏
             text_select=True,
             js_api=api,
         )
