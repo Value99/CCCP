@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="system">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>WINUI-EXE · TPQ Launcher</title>
+<title>CCCP 启动器 · TPQ-Final</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -33,7 +33,7 @@
 <div class="titlebar" id="titlebar">
   <div class="tb-left">
     <span class="tb-logo"><svg class="ic"><use href="#i-layers"/></svg></span>
-    <span class="tb-title">WINUI-EXE · TPQ-Final 启动器</span>
+    <span class="tb-title">CCCP 启动器 · TPQ-Final</span>
   </div>
   <div class="tb-right">
     <button class="tb-btn" id="tbMin" title="最小化"><svg class="ic"><use href="#i-min"/></svg></button>
@@ -47,7 +47,7 @@
     <div class="side-brand">
       <div class="logo-box"><svg class="ic"><use href="#i-layers"/></svg></div>
       <div>
-        <div class="name">WINUI-EXE</div>
+        <div class="name">CCCP 启动器</div>
         <div class="sub">TPQ-Final 启动器</div>
       </div>
     </div>
@@ -74,7 +74,7 @@
   <!-- ============ 首页(快速选择 + 一键启动)============ -->
   <section class="page active" id="page-home">
     <div class="hero">
-      <div class="hero-eyebrow">WINUI-EXE · TPQ-Final 启动器</div>
+      <div class="hero-eyebrow">CCCP 启动器 · TPQ-Final</div>
       <h1>选模型、勾配置、一键启动</h1>
       <p class="hero-sub">多选配置自动去重叠计费;启动就绪后到「聊天」页对话</p>
       <div class="hero-meta">
@@ -378,6 +378,15 @@
         </div>
       </div>
       <div class="card-box">
+        <h3 style="font-size:14px">外观</h3>
+        <label>主题</label>
+        <select id="setTheme">
+          <option value="system">跟随系统</option>
+          <option value="light">浅色</option>
+          <option value="dark">深色</option>
+        </select>
+      </div>
+      <div class="card-box">
         <h3 style="font-size:14px">运行环境(CUDA / CPU)</h3>
         <div id="sysInfo" class="hint">检测中…</div>
         <label>默认推理设备(default_device,同步到首页与配置库下拉)</label>
@@ -402,7 +411,7 @@
         <div class="about-kv"><span>版本</span><b id="aboutVer">—</b></div>
         <div class="about-kv"><span>TPQ-Final</span><b id="aboutTpq">—</b></div>
         <div class="about-kv"><span>接口契约</span><b>docs/INTERFACE.md</b></div>
-        <p class="hint">WINUI-EXE 不修改 TPQ-Final 任何文件,仅通过子进程 / HTTP / 约定文件集成。
+        <p class="hint">CCCP 启动器不修改 TPQ-Final 任何文件,仅通过子进程 / HTTP / 约定文件集成。
         待 TPQ 侧开发的接口需求 I-1~I-5 见契约文档。</p>
       </div>
     </div>
