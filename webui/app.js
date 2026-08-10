@@ -64,7 +64,7 @@ async function pollStatus() {
     $("#homeStopBtn").disabled = !h.tpq?.running;
     const pill = $("#homeStatusPill");
     pill.textContent = state.ready ? "模型就绪" : h.tpq?.running ? "启动中…" : "未启动";
-    pill.className = "state-pill hero-pill " + (state.ready ? "on" : "off");
+    pill.className = "state-pill lp-pill " + (state.ready ? "on" : "off");
     if (state.ready) { $("#launchHint").textContent = ""; $("#homeLaunchHint").textContent = ""; }
   } catch { $("#statusText").textContent = "后端断连"; $("#statusDot").className = "dot"; }
 }
