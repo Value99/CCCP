@@ -7,6 +7,17 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+<div class="titlebar" id="titlebar">
+  <div class="tb-left">
+    <span class="tb-logo">◆</span>
+    <span class="tb-title">WINUI-EXE · TPQ-Final 启动器</span>
+  </div>
+  <div class="tb-right">
+    <button class="tb-btn" id="tbMin" title="最小化">—</button>
+    <button class="tb-btn" id="tbMax" title="最大化 / 还原">▢</button>
+    <button class="tb-btn close" id="tbClose" title="关闭">✕</button>
+  </div>
+</div>
 <div id="app">
   <!-- ============ 左侧导航 ============ -->
   <aside class="sidebar">
@@ -23,6 +34,7 @@
       <button class="nav-item" data-tab="models"><span class="ico">🗃️</span>模型库</button>
       <button class="nav-item" data-tab="training"><span class="ico">📈</span>训练</button>
       <button class="nav-item" data-tab="chat"><span class="ico">💬</span>聊天</button>
+      <button class="nav-item" data-tab="terminal"><span class="ico">🖥️</span>终端</button>
       <button class="nav-item" data-tab="api"><span class="ico">🔗</span>API 服务</button>
       <button class="nav-item" data-tab="settings"><span class="ico">⚙️</span>设置</button>
     </nav>
@@ -63,7 +75,8 @@
         <label class="fld">配置(可多选,与「配置库」页同步)</label>
         <div class="qchips" id="homeChips"></div>
         <div class="q-summary" id="homeSummary">勾选配置后显示合计体积</div>
-        <div class="q-row"><span>TPQ API 端口</span><input id="homePortInput" type="number" value="8801" min="1024" max="65535"></div>
+        <div class="q-row"><span>TPQ API 端口</span><input id="homePortInput" type="number" value="8801" min="1024" max="65535">
+          <span>设备</span><select id="homeDeviceSelect"><option value="cuda">cuda</option><option value="cpu">cpu</option></select></div>
       </div>
       <div class="card-box">
         <h3>上次启动</h3>
@@ -277,6 +290,26 @@
     </div>
   </section>
 
+  <!-- ============ 终端 ============ -->
+  <section class="page" id="page-terminal">
+    <div class="page-header">
+      <h1>终端</h1>
+      <p>TPQ 进程输出与启动器日志(页面可见时每 3s 刷新)</p>
+      <div class="spacer"></div>
+      <button class="ghost sm" id="termRefreshBtn">刷新</button>
+    </div>
+    <div class="term-grid">
+      <div class="card-box term-box">
+        <h3>TPQ 进程输出</h3>
+        <pre class="term" id="termTpq">—</pre>
+      </div>
+      <div class="card-box term-box">
+        <h3>启动器日志</h3>
+        <pre class="term" id="termApp">—</pre>
+      </div>
+    </div>
+  </section>
+
   <!-- ============ API 服务 ============ -->
   <section class="page" id="page-api">
     <div class="page-header">
@@ -320,6 +353,15 @@
           <button class="primary sm" id="saveSettingsBtn">保存设置</button>
           <span class="hint" id="settingsHint"></span>
         </div>
+      </div>
+      <div class="card-box">
+        <h3 style="font-size:14px">运行环境(CUDA / CPU)</h3>
+        <div id="sysInfo" class="hint">检测中…</div>
+        <label>默认推理设备(default_device,同步到首页与配置库下拉)</label>
+        <select id="setDefaultDevice">
+          <option value="cuda">cuda(GPU 优先)</option>
+          <option value="cpu">cpu(纯 CPU)</option>
+        </select>
       </div>
       <div class="card-box">
         <h3 style="font-size:14px">社区与下载</h3>
