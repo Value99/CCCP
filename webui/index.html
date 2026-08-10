@@ -33,7 +33,7 @@
 <div class="titlebar" id="titlebar">
   <div class="tb-left">
     <span class="tb-logo"><svg class="ic"><use href="#i-layers"/></svg></span>
-    <span class="tb-title">CCCP 启动器 · TPQ-Final</span>
+    <span class="tb-title">CCCP 启动器</span>
   </div>
   <div class="tb-right">
     <button class="tb-btn" id="tbMin" title="最小化"><svg class="ic"><use href="#i-min"/></svg></button>
@@ -74,7 +74,7 @@
   <!-- ============ 首页(快速选择 + 一键启动)============ -->
   <section class="page active" id="page-home">
     <div class="hero">
-      <div class="hero-eyebrow">CCCP 启动器 · TPQ-Final</div>
+      <div class="hero-eyebrow">CCCP 启动器</div>
       <h1>选模型、勾配置、一键启动</h1>
       <p class="hero-sub">多选配置自动去重叠计费;启动就绪后到「聊天」页对话</p>
       <div class="hero-meta">
@@ -284,9 +284,9 @@
         <h3>扫描配置</h3>
         <div class="field-block">
           <span class="fb-label">模式</span>
-          <div class="radio-group">
-            <label class="radio"><input type="radio" name="tmode" value="cpu" checked> CPU 全量推理</label>
-            <label class="radio"><input type="radio" name="tmode" value="disk"> 硬盘(离线)推理</label>
+          <div class="seg-group">
+            <input type="radio" name="tmode" id="tmode-cpu" value="cpu" checked><label for="tmode-cpu">CPU 全量推理</label>
+            <input type="radio" name="tmode" id="tmode-disk" value="disk"><label for="tmode-disk">硬盘(离线)推理</label>
           </div>
         </div>
         <div class="field-block">

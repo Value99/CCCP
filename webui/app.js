@@ -383,8 +383,7 @@ async function loadSettings() {
   $("#setHfEndpoint").value = s.hf_endpoint || "";
   $("#setDlDir").value = s.model_download_dir || "";
   $("#setDefaultDevice").value = s.default_device || "cuda";
-  const th = s.theme_mode || "system";
-  $("#setTheme").value = th; applyTheme(th);
+  $("#setTheme").value = s.theme_mode || "system";
   $("#deviceSelect").value = s.default_device || "cuda";
   $("#homeDeviceSelect").value = s.default_device || "cuda";
   $("#aboutTpq").textContent = s.tpq_path || "未探测到";
@@ -406,6 +405,7 @@ $("#saveSettingsBtn").addEventListener("click", async () => {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
     $("#settingsHint").textContent = "已保存,重新扫描模型…";
+    applyTheme($("#setTheme").value);
     $("#aboutTpq").textContent = body.tpq_path || "自动探测";
     await loadModels();
     setTimeout(() => ($("#settingsHint").textContent = ""), 3000);

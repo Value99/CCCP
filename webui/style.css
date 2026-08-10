@@ -120,7 +120,7 @@ body {
   padding: 11px 13px; display: flex; flex-direction: column; gap: 7px;
 }
 .side-status .row { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--dim); }
-.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 7px currentColor; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: #94a3b8; box-shadow: 0 0 7px currentColor; }
 .dot.ready { background: var(--ok); }
 .dot.loading { background: var(--warn); }
 .side-status .ver { font-family: var(--mono); font-size: 11px; color: var(--dim); }
@@ -154,8 +154,11 @@ button { font: inherit; cursor: pointer; border-radius: 10px; border: 1px solid 
 
 input, select, textarea {
   background: var(--panel); color: var(--txt); border: 1px solid var(--line);
-  border-radius: 10px; padding: 8px 12px; font: inherit; outline: none;
+  border-radius: 10px; padding: 8px 30px 8px 12px; font: inherit; outline: none;
+  width: 100%; box-sizing: border-box;
 }
+textarea { padding: 8px 12px; }
+input[type="radio"], input[type="checkbox"], input[type="range"] { width: auto; padding: 0; }
 input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(229,72,77,.15); }
 select[multiple] { min-width: 200px; }
 .mono { font-family: var(--mono); font-size: 12.5px; white-space: pre-wrap; }
@@ -333,10 +336,11 @@ input[type="range"] { width: 100%; accent-color: var(--accent); padding: 0; }
 
 /* ================= v0.3 · 首页 / 社区 / 模型库 ================= */
 .hero {
-  position: relative; overflow: hidden; color: #fff;
+  position: relative; display: flex; flex-direction: column; overflow: hidden; color: #fff;
   background: linear-gradient(115deg, #e5484d 0%, #f76b70 52%, #f9898c 100%);
-  border-radius: 18px; padding: 34px 36px 30px;
+  border-radius: 18px; padding: 30px 36px 26px;
   box-shadow: 0 18px 40px -18px rgba(229,72,77,.55); margin-bottom: 18px;
+  display: flex; flex-direction: column;
 }
 .hero::before, .hero::after { content: ""; position: absolute; border-radius: 50%; background: rgba(255,255,255,.14); }
 .hero::before { width: 260px; height: 260px; right: -70px; top: -90px; }
@@ -449,3 +453,17 @@ use { pointer-events: none; }
 [data-theme="dark"] .session-item:hover, [data-theme="system"] .session-item:hover { background: var(--panel); }
 [data-theme="dark"] .qchip:hover, [data-theme="system"] .qchip:hover { border-color: var(--line); }
 [data-theme="dark"] .term, [data-theme="system"] .term { background: #0d0f12; }
+
+/* ================= v0.6.3 · 自定义分段选择器(替代原生 radio) ================= */
+.seg-group { display: flex; gap: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; width: 100%; }
+.seg-group input { display: none; }
+.seg-group label {
+  flex: 1; text-align: center; padding: 8px 12px; font-size: 13px; cursor: pointer;
+  color: var(--dim); background: var(--panel); border-right: 1px solid var(--line);
+  transition: .15s; user-select: none; display: flex; align-items: center; justify-content: center; gap: 6px;
+}
+.seg-group label:last-child { border-right: none; }
+.seg-group label:hover { background: var(--panel2); color: var(--txt); }
+.seg-group input:checked + label {
+  color: #fff; background: var(--accent); font-weight: 600;
+}
