@@ -92,6 +92,43 @@
 
 当可用 RAM 或显存不足时，启动器会逐步使用内存映射或磁盘卸载。功能仍可继续，但推理速度可能明显降低。
 
+## OpenAI 兼容 API
+
+模型启动后会提供完整的 OpenAI 兼容聊天 API 链路。现有 SDK、聊天前端和自动化工具无需重写，只需把 Base URL 改为：
+
+```text
+http://127.0.0.1:8801/v1
+```
+
+| 接口 | 能力 |
+| --- | --- |
+| `GET /v1/models` | 列出当前已经启动的模型 |
+| `GET /v1/models/{model_id}` | 获取模型标识与上下文信息 |
+| `POST /v1/chat/completions` | 同步响应与 SSE 流式生成 |
+
+兼容常用的 `messages` 角色、`temperature`、`top_p`、`max_tokens`、`stop`、存在惩罚、重复惩罚、思考强度、工具调用、结构化响应和流式 usage。具体能力仍取决于当前模型架构。
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8801/v1",
+    api_key="not-needed",
+)
+
+model = client.models.list().data[0].id
+stream = client.chat.completions.create(
+    model=model,
+    messages=[{"role": "user", "content": "你好"}],
+    stream=True,
+)
+
+for chunk in stream:
+    print(chunk.choices[0].delta.content or "", end="")
+```
+
+如果在启动器中启用了 API 鉴权，请把 `not-needed` 替换为启动器生成或设置的 Key。未启用鉴权时使用任意非空值即可。
+
 ## 生成任务专用专家配置
 
 1. 在训练页面选择已经识别的 CCCP 模型。

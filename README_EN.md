@@ -92,6 +92,43 @@ Sources:
 
 When available RAM or VRAM is insufficient, the launcher gradually falls back to mapped memory or disk offload. Inference can continue, but performance may drop substantially.
 
+## OpenAI-compatible API
+
+Once the model starts, CCCP exposes a complete OpenAI-compatible chat API path. Existing SDKs, chat frontends, and automation tools need no rewrite—change only the Base URL:
+
+```text
+http://127.0.0.1:8801/v1
+```
+
+| Endpoint | Capability |
+| --- | --- |
+| `GET /v1/models` | List the model currently being served |
+| `GET /v1/models/{model_id}` | Read model identity and context metadata |
+| `POST /v1/chat/completions` | Synchronous responses and SSE streaming |
+
+The API accepts common message roles, `temperature`, `top_p`, `max_tokens`, `stop`, presence and repetition penalties, reasoning controls, tool calls, structured response formats, and streamed usage. Exact capabilities still depend on the active model architecture.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8801/v1",
+    api_key="not-needed",
+)
+
+model = client.models.list().data[0].id
+stream = client.chat.completions.create(
+    model=model,
+    messages=[{"role": "user", "content": "Hello"}],
+    stream=True,
+)
+
+for chunk in stream:
+    print(chunk.choices[0].delta.content or "", end="")
+```
+
+If API authentication is enabled in the launcher, replace `not-needed` with the generated or configured key. When authentication is disabled, any non-empty value works.
+
 ## Build a task-specific expert profile
 
 1. Select a detected CCCP model on the Training page.
