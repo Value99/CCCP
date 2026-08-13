@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/cccp-banner.webp" alt="C.C.C.P. — фреймворк динамических экспертов" width="100%">
+  <img src="assets/cccp-banner.jpg" alt="C.C.C.P. — фреймворк динамических экспертов" width="100%">
 </p>
 
 <p align="center">
@@ -74,11 +74,11 @@
 ## Интерфейс запускатора
 
 <p align="center">
-  <img src="assets/launcher-home.webp" alt="Главная страница CCCP" width="82%">
+  <img src="assets/launcher-home.jpg" alt="Главная страница CCCP" width="82%">
 </p>
 
 <p align="center">
-  <img src="assets/launcher-training.webp" alt="Создание профиля экспертов CCCP" width="82%">
+  <img src="assets/launcher-training.jpg" alt="Создание профиля экспертов CCCP" width="82%">
 </p>
 
 ## Быстрый старт

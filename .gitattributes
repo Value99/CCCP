@@ -3,3 +3,5 @@
 *.json text eol=lf
 VERSION text eol=lf
 *.png binary
+*.jpg binary
+*.webp binary
