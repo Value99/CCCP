@@ -31,6 +31,18 @@
 | **More Smart** | Expert pre-selection | Real task corpora produce layer-by-layer expert heatmaps, allowing the most relevant experts to stay resident first. |
 | **More Rapid** | Smaller model + extensive optimization | Codebook caching, CPU-accelerated operators, and isolated backend environments are used. Actual throughput depends on the model, memory bandwidth, and hardware. |
 
+## CCCP quantization technology
+
+CCCP advances MoE quantization as a system-level design. Weight representation, expert routing, memory residency, and execution operators share one coordinated format:
+
+- **Projection-level vector quantization:** Gate, Up, and Down can use independent codebooks and precision layouts. The quantization granularity follows the internal structure of each expert and extends beyond one scalar bit width per layer.
+- **Compact-index direct execution:** p8–p16 indices remain compact on disk, in RAM, and in VRAM. Fused operators consume codebooks and packed indices directly, reducing the resident footprint of expanded expert matrices.
+- **Complete expert capacity:** storage savings come from a more efficient weight representation while preserving the expert count and per-token top-k activation count. Task profiles then narrow the active working set.
+- **Structure-aware precision allocation:** `cccp.json` can describe per-projection, per-layer, and per-expert layouts, assigning higher precision to sensitive components and compact representations to more redundant components.
+- **Quantization/runtime co-design:** CPU codebook caches, L2/L3-aware scheduling, CUDA/HIP fused operators, and multi-GPU parallelism execute directly around the CCCP format.
+
+In the public evaluation, CCCP-S reaches an effective width of approximately **2.31 bit/parameter**, a **6.92× theoretical compression ratio**, and an **85.54% weight-byte reduction** relative to the theoretical BF16 weights of a 284B-parameter model. At a similar size, it reduces Mean KLD by approximately **54.90%** and raises same-top by **9.2736 percentage points** over UD-IQ1_S. It is also smaller than MFQ EW-V2-S while improving both KLD and same-top. See “Standardized evaluation” below for the full protocol and results.
+
 ## Task expert profiles
 
 “Training” in the launcher creates expert configuration files while model weights remain unchanged. The workflow:
@@ -228,6 +240,10 @@ $release.launcher.sha256
 ```
 
 `latest.json` uses the fixed schema identifier `cccp-launcher-update-v1`. The launcher should validate `schema`, compare semantic versions, and verify the downloaded file with SHA-256.
+
+## Acknowledgements
+
+Thanks to GitHub users [tmzncty](https://github.com/tmzncty) and [Zenon-Chen](https://github.com/Zenon-Chen) for supporting the development and progress of CCCP.
 
 ## Links
 
