@@ -1,6 +1,10 @@
 # C.C.C.P.
 
 <p align="center">
+  <strong>简体中文</strong> · <a href="README_EN.md">English</a> · <a href="README_RU.md">Русский</a>
+</p>
+
+<p align="center">
   <img src="assets/cccp-banner.png" alt="C.C.C.P. 动态专家推理框架" width="100%">
 </p>
 
