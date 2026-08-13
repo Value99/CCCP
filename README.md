@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/cccp-banner.png" alt="C.C.C.P. 动态专家推理框架" width="100%">
+  <img src="assets/cccp-banner.webp" alt="C.C.C.P. 动态专家推理框架" width="100%">
 </p>
 
 <p align="center">
@@ -74,11 +74,11 @@
 ## 启动器界面
 
 <p align="center">
-  <img src="assets/launcher-home.png" alt="CCCP 启动器首页" width="82%">
+  <img src="assets/launcher-home.webp" alt="CCCP 启动器首页" width="82%">
 </p>
 
 <p align="center">
-  <img src="assets/launcher-training.png" alt="CCCP 专家配置训练页" width="82%">
+  <img src="assets/launcher-training.webp" alt="CCCP 专家配置训练页" width="82%">
 </p>
 
 ## 快速开始

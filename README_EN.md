@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/cccp-banner.png" alt="C.C.C.P. Dynamic Expert Inference Framework" width="100%">
+  <img src="assets/cccp-banner.webp" alt="C.C.C.P. Dynamic Expert Inference Framework" width="100%">
 </p>
 
 <p align="center">
@@ -74,11 +74,11 @@ Sources:
 ## Launcher interface
 
 <p align="center">
-  <img src="assets/launcher-home.png" alt="CCCP launcher home" width="82%">
+  <img src="assets/launcher-home.webp" alt="CCCP launcher home" width="82%">
 </p>
 
 <p align="center">
-  <img src="assets/launcher-training.png" alt="CCCP expert-profile training page" width="82%">
+  <img src="assets/launcher-training.webp" alt="CCCP expert-profile training page" width="82%">
 </p>
 
 ## Quick start
