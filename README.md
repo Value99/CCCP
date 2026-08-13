@@ -149,6 +149,43 @@ for chunk in stream:
 - 无需用户安装 Python；
 - 运行时、依赖与已编译/可自动编译的加速算子随发布包提供。
 
+## 路线图（TODO）
+
+- [x] 支持 DeepSeek-V4 / DSpark CCCP 模型；
+- [x] 支持 Kimi K3 CCCP，包括纯 CPU、单卡 GPU+RAM 和多卡张量并行路径；
+- [x] 支持 GLM-5.2 CCCP，包括 RAM 模式和多卡推理；
+- [x] 提供 Windows x64 离线启动器和 OpenAI 兼容 API；
+- [ ] 支持视觉输入，接入图片 URL、Base64 图片和多模态前处理；
+- [ ] 启动器界面增加 English / Русский，多语言文档和官网现已提供；
+- [ ] 支持 macOS 启动器、运行环境和原生加速后端。
+
+视觉权重是否存在不等于已经支持视觉推理；在图片前处理和端到端回归完成前，该能力保持未勾选。macOS 当前同样没有发布包，请勿把 Windows 包直接用于 macOS。
+
+## 已测试的平台
+
+| 平台/硬件 | 当前验证情况 | 结论 |
+| --- | --- | --- |
+| Windows 11 x64 · Core i9-13900H · 31.59 GiB RAM | 启动器、EXE、CPU 推理、OpenAI API、配置扫描、118.47 GiB DeepSeek-V4 模型磁盘映射回归；自动化测试 `93 passed` | **端到端通过**；该机器没有 NVIDIA/AMD GPU |
+| NVIDIA RTX 5090 | DeepSeek-V4 和 GLM-5.2 的 CUDA/RAM 路径实机回归 | **引擎实测通过** |
+| NVIDIA H20-3e（单卡与多卡） | DeepSeek-V4 TP1/TP4、GLM-5.2 TP2、Kimi K3 GPU+RAM/TP8 | **引擎实测通过** |
+| 双路 CPU 服务器（96 物理核） | DeepSeek-V4 与 Kimi K3 公共 CPU 后端、码本缓存和运行时映像 | **引擎实测通过** |
+| Windows CUDA 13.0 / `sm_120` | 无 NVIDIA GPU 构建机上的完整 NVCC 编译、链接和模块加载 | **编译链通过**，不等于该构建机 GPU 推理实测 |
+| Windows ROCm 7.2.1 / `gfx1151` | 无 AMD GPU 构建机上的 HIPIFY、设备代码生成、链接和模块加载 | **编译链通过**，AMD 硬件端到端验证仍待补充 |
+| macOS | 尚无运行环境或发布包 | **未支持 / 未测试** |
+
+测试结果只代表表中明确列出的硬件、模型和路径。速度会受模型版本、配置、上下文、RAM/显存带宽、SSD 和卸载比例影响。
+
+## 问题反馈
+
+如果启动、模型识别、算子编译、配置训练或 OpenAI API 运行有问题，欢迎提交 [GitHub Issue](https://github.com/Value99/CCCP/issues/new)。建议附上：
+
+- CCCP 启动器/引擎版本和模型名称；
+- 操作系统、CPU、GPU、RAM/显存和驱动版本；
+- 可复现步骤、预检结果和终端日志；
+- 是否使用全量加载、专家配置或磁盘卸载。
+
+提交前请删除 API Key、ModelScope Token、私人语料和其他敏感信息。
+
 ## 自动更新检测
 
 稳定版机器可读清单：

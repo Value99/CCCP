@@ -149,6 +149,43 @@ Corpora are stored locally by the application and can be reused after a restart 
 - users do not need to install Python;
 - the release package includes the runtime, dependencies, and precompiled or automatically compiled acceleration operators.
 
+## Roadmap (TODO)
+
+- [x] DeepSeek-V4 / DSpark CCCP support;
+- [x] Kimi K3 CCCP support, including CPU-only, single-GPU+RAM, and multi-GPU tensor-parallel paths;
+- [x] GLM-5.2 CCCP support, including RAM and multi-GPU inference;
+- [x] Windows x64 offline launcher and OpenAI-compatible API;
+- [ ] vision input with image URLs, Base64 images, and multimodal preprocessing;
+- [ ] English and Russian launcher UI; multilingual documentation and the website are already available;
+- [ ] macOS launcher, runtime, and native acceleration backend.
+
+The presence of vision weights does not mean that vision inference is already supported. This item stays unchecked until image preprocessing and end-to-end regression are complete. There is currently no macOS release package.
+
+## Tested platforms
+
+| Platform / hardware | Validation scope | Status |
+| --- | --- | --- |
+| Windows 11 x64 · Core i9-13900H · 31.59 GiB RAM | Launcher, EXE, CPU inference, OpenAI API, profile scanning, and mapped execution of a 118.47 GiB DeepSeek-V4 model; `93 passed` automated tests | **End-to-end passed**; this machine has no NVIDIA/AMD GPU |
+| NVIDIA RTX 5090 | Real CUDA/RAM runs with DeepSeek-V4 and GLM-5.2 | **Engine tested** |
+| NVIDIA H20-3e (single and multi-GPU) | DeepSeek-V4 TP1/TP4, GLM-5.2 TP2, and Kimi K3 GPU+RAM/TP8 | **Engine tested** |
+| Dual-socket CPU server (96 physical cores) | Shared CPU backend, codebook cache, and runtime images with DeepSeek-V4 and Kimi K3 | **Engine tested** |
+| Windows CUDA 13.0 / `sm_120` | Full NVCC compilation, linking, and module loading on a build machine without an NVIDIA GPU | **Toolchain passed**; not a GPU inference claim for that machine |
+| Windows ROCm 7.2.1 / `gfx1151` | HIPIFY, device-code generation, linking, and module loading on a build machine without an AMD GPU | **Toolchain passed**; AMD hardware end-to-end validation is still pending |
+| macOS | No runtime or release package yet | **Unsupported / untested** |
+
+Results apply only to the hardware, model, and execution path explicitly listed above. Performance also depends on model revision, expert profile, context length, RAM/VRAM bandwidth, SSD, and offload ratio.
+
+## Reporting problems
+
+If you encounter launcher, model-detection, operator-compilation, profile-training, or OpenAI API problems, please open a [GitHub Issue](https://github.com/Value99/CCCP/issues/new). Include:
+
+- CCCP launcher/engine version and model name;
+- operating system, CPU, GPU, RAM/VRAM, and driver version;
+- reproducible steps, preflight result, and terminal logs;
+- whether you used full loading, an expert profile, or disk offload.
+
+Remove API keys, ModelScope tokens, private corpora, and other sensitive information before posting.
+
 ## Automatic update check
 
 Stable-channel machine-readable manifest:
