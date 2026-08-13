@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/cccp-banner-native-crop.jpg" alt="C.C.C.P. Dynamic Expert Inference Framework" width="100%">
+  <img src="assets/cccp-banner-framed-v3.jpg" alt="C.C.C.P. Dynamic Expert Inference Framework" width="100%">
 </p>
 
 <p align="center">
