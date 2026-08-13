@@ -8,6 +8,14 @@
   <a href="README.md">简体中文</a> · <strong>English</strong> · <a href="README_RU.md">Русский</a>
 </p>
 
+## ⬇️ Download the complete Windows offline package (v0.9.0)
+
+### [👉 Open the GitHub Release download page](https://github.com/Value99/CCCP/releases/tag/v0.9.0)
+
+For a first installation, download the Offline Setup EXE, the `.parts.json` manifest, and all four `.zip.001`–`.zip.004` parts into one folder. Then run `CCCP-Launcher-0.9.0-Offline-Setup.exe`; it verifies, joins, extracts, and launches the application with visible progress. Do not download only the standalone launcher EXE for a first installation.
+
+The automatically generated `Source code (zip/tar.gz)` links contain only this public repository's documentation, version files, and images. They do not contain the launcher, inference-engine, or CCCP quantization/training source code.
+
 <p align="center">
   <img src="assets/cccp-banner-centered-final.jpg" alt="C.C.C.P. Dynamic Expert Inference Framework" width="100%">
 </p>

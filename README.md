@@ -1,4 +1,4 @@
-# C.C.C.P. 还在上传中 请稍后
+# C.C.C.P.
 
 <p align="center">
   <img src="assets/cccp-icon.png" alt="C.C.C.P. 项目图标" width="96">
@@ -7,6 +7,28 @@
 <p align="center">
   <strong>简体中文</strong> · <a href="README_EN.md">English</a> · <a href="README_RU.md">Русский</a>
 </p>
+
+## ⬇️ 下载 Windows 完整离线版（v0.9.0）
+
+> [!IMPORTANT]
+> **第一次使用请下载完整离线包，不要只下载单独的 `CCCP-Launcher.exe`。** 发行包已内置 Python、Miniconda、CPU/CUDA/AMD 推理环境及算子编译工具，无需另外安装依赖。
+
+### [👉 GitHub Release 下载页（推荐）](https://github.com/Value99/CCCP/releases/tag/v0.9.0)
+
+打开下载页后，将下面 **6 个文件**全部下载到同一个文件夹：
+
+1. `CCCP-Launcher-0.9.0-Offline-Setup.exe`
+2. `CCCP-Launcher-v0.9.0-offline.parts.json`
+3. `CCCP-Launcher-v0.9.0-win-x64-offline.zip.001`
+4. `CCCP-Launcher-v0.9.0-win-x64-offline.zip.002`
+5. `CCCP-Launcher-v0.9.0-win-x64-offline.zip.003`
+6. `CCCP-Launcher-v0.9.0-win-x64-offline.zip.004`
+
+然后双击 `CCCP-Launcher-0.9.0-Offline-Setup.exe`。安装器会自动校验、合并、解压并启动程序，全程显示进度。模型不包含在启动器发行包内，需要单独下载并放入解压目录的 `models` 文件夹。
+
+GitHub 访问较慢时，也可以从 [百度网盘下载完整 Windows 包](https://pan.baidu.com/s/14ichCAsXKZMUQInIwIfQcA?pwd=cccp)，提取码：`cccp`。
+
+> Release 页面底部的 `Source code (zip/tar.gz)` 是 GitHub 自动生成的公开资料快照，只包含 README、版本文件和图片，不包含启动器源码、推理引擎源码或 CCCP 量化/训练框架。普通用户请下载上面列出的离线安装器和 4 个分卷。
 
 <p align="center">
   <img src="assets/cccp-banner-centered-final.jpg" alt="C.C.C.P. 动态专家推理框架" width="100%">
@@ -132,8 +154,8 @@ CCCP 的高速路径会在生成前把所选专家完整加载到 RAM/显存，�
 
 ## 快速开始
 
-1. 从[百度网盘](https://pan.baidu.com/s/14ichCAsXKZMUQInIwIfQcA?pwd=cccp)下载完整 Windows 包，提取码：`cccp`。
-2. 完整解压到可读写目录，避免直接在压缩包内运行。
+1. 从上方 [GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.0) 下载全部 6 个离线安装文件；也可使用百度网盘完整包。
+2. GitHub 分卷版双击 `CCCP-Launcher-0.9.0-Offline-Setup.exe`；网盘整包则完整解压到可读写目录，避免直接在压缩包内运行。
 3. 将带有 `cccp.json` 的兼容模型放入程序同级 `models` 目录。
 4. 双击 `CCCP-Launcher.exe`。
 5. 选择模型和专家配置；初次使用也可直接选择全量加载。
