@@ -20,24 +20,23 @@
   <img alt="Device" src="https://img.shields.io/badge/default-CPU-3a2118">
 </p>
 
-> C.C.C.P. makes large MoE models easier to run on ordinary computers. It does not remove experts or modify the original model weights. Instead, it combines quantization, task-corpus route detection, expert-residency profiles, and optimized operators so that limited memory is assigned first to experts that the current workload actually uses.
+> C.C.C.P. brings large MoE models to ordinary computers while preserving the full expert set and original weights. Quantization, task-corpus route detection, expert-residency profiles, and optimized operators form one execution pipeline that assigns limited memory to the experts needed by the current workload.
 
 ## Core advantages
 
 | Direction | Capability | Practical benefit |
 | --- | --- | --- |
-| **More Useful** | One package, open and run | The launcher, isolated Python runtime, inference dependencies, and operators are bundled. Users do not need to install Python. |
+| **More Useful** | One package, open and run | The package bundles the launcher, isolated Python runtime, inference dependencies, and operators. |
 | **More Saving** | Quantization + expert detection | Dense and shared-expert storage is accounted for first, then dynamic experts are selected under the profile budget. Duplicate experts across combined profiles are counted only once. |
 | **More Smart** | Expert pre-selection | Real task corpora produce layer-by-layer expert heatmaps, allowing the most relevant experts to stay resident first. |
 | **More Rapid** | Smaller model + extensive optimization | Codebook caching, CPU-accelerated operators, and isolated backend environments are used. Actual throughput depends on the model, memory bandwidth, and hardware. |
 
-## This is not model training
+## Task expert profiles
 
-“Training” in the launcher creates expert configuration files only:
+“Training” in the launcher creates expert configuration files while model weights remain unchanged. The workflow:
 
-- it does not generate a new model;
-- it does not modify or prune model weights;
-- it does not change the number of experts activated per token; a task profile only limits the candidate experts that may participate in routing for that task;
+- uses the existing model and its complete expert weights;
+- preserves the number of experts activated per token while limiting the routing candidates for a task;
 - each profile records the model name, version, fingerprint, and per-layer expert IDs;
 - profiles can be exported, shared, combined, and deduplicated.
 
@@ -45,28 +44,28 @@ Long-context corpora are processed with pure prefill in `4096-token` blocks whil
 
 ## Why fewer task experts can work better
 
-“Fewer experts” means a **smaller candidate set participating in routing and residing in RAM/VRAM for one task**. It does not mean deleting experts from the model. All expert weights remain available; switching, combining, or disabling profiles can expose a different set or load the complete model.
+“Fewer experts” means a **smaller candidate set participating in routing and residing in RAM/VRAM for one task**. The complete model retains every expert weight; switching, combining, or disabling profiles exposes a different set or loads the complete model.
 
 A general MoE router must cover every domain. In focused workloads such as role play, coding, or translation, experts with close routing scores but little relevance to the current domain may still enter top-k, causing tone drift, inconsistent characters, or technical mistakes. CCCP first runs pure prefill over representative task data, records per-layer expert heat, and then concentrates the task's candidate pool on a verified collection:
 
-1. **Lower hardware threshold:** the fast path only needs the selected collection to be fully resident in RAM/VRAM, rather than reserving space for every dynamic expert.
+1. **Lower hardware threshold:** the fast path makes the selected collection fully resident in RAM/VRAM, reducing the space reserved for dynamic experts.
 2. **More focused routing:** unrelated experts are excluded from the current candidate pool, so top-k chooses among experts that better match the task.
 3. **Potentially more stable task behavior:** on data matching the scanned distribution, this can reduce characteristic errors caused by out-of-domain experts entering the route; some previously unstable or incorrect outputs may recover.
 4. **The full model remains intact:** profiles neither modify weights nor remove experts, and another profile can be selected or combined for a different domain.
 
-The project has produced fingerprint-matched preset collections for immersive role play, romantic interaction, and world building. Presets store the exact model name, version, and manifest fingerprint and only appear under a matching model; they are not universal patches that can be mixed with arbitrary models. Improvement within a task is not an unconditional quality guarantee. Cross-domain use should be rescanned or combined with an appropriate profile and validated on your own regression set.
+The project has produced fingerprint-matched preset collections for immersive role play, romantic interaction, and world building. Each preset is bound to an exact model name, version, and manifest fingerprint and appears under the matching model. Cross-domain workloads can be rescanned or combined with another profile, with final quality measured on the target regression set.
 
 ### Define a style with your own data
 
 Users can upload preferred character, writing-style, or business corpora. The launcher scans which existing experts are actually used by that content and includes them in a new candidate/residency profile. In subsequent inference, experts related to that data distribution participate more often, biasing behavior toward the target style within the model's existing capabilities.
 
-This is not fine-tuning: CCCP does not write the corpus into model weights or teach knowledge the model never had. It **selects a better combination from the model's existing experts**. Profiles can be named, described, exported, shared, and combined with other directions, so customization is not limited to bundled presets.
+CCCP uses routing configuration: the corpus drives expert detection while weights and model knowledge remain unchanged. The core operation **selects a better combination from the model's existing experts**. Profiles can be named, described, exported, shared, and combined, giving users room to extend beyond bundled presets.
 
-### Not a per-token disk-streaming demonstration
+### Resident-expert fast path
 
-The intended high-speed CCCP path loads the selected experts completely into RAM/VRAM before generation and builds codebook and execution caches. Normal decoding routes within this resident pool instead of fetching large expert weights from disk for every token. A smaller model and focused working set, together with CPU/CUDA/HIP fused operators, target sustained interactive inference rather than merely proving that a model can start.
+The CCCP fast path loads the selected experts completely into RAM/VRAM before generation and builds codebook and execution caches. Normal decoding stays inside this resident pool, with disk access concentrated in the loading stage. Model size, working-set focus, and CPU/CUDA/HIP fused operators together target sustained interactive inference.
 
-When the device truly lacks capacity, mapped memory or disk offload remains available as a functional fallback and the launcher displays an explicit risk warning. This is a capacity safeguard, not the recommended performance mode. For the intended fast path, the selected profile should fit fully in RAM/VRAM.
+When device capacity runs short, mapped memory or disk offload keeps the model available and the launcher displays an explicit performance warning. This path covers capacity constraints; the fast path works best when the selected profile fits fully in RAM/VRAM.
 
 ## Standardized evaluation
 
@@ -88,7 +87,7 @@ Using the theoretical BF16 weight bytes for the official `284B` parameter count 
 
 At nearly the same size, CCCP-S reduces Mean KLD by approximately `54.90%` and raises same-top by `9.2736` percentage points compared with UD-IQ1_S. Compared with MFQ EW-V2-S, it is `1.046 GiB` smaller, reduces Mean KLD by approximately `7.16%`, and raises same-top by `0.7933` percentage points.
 
-> Note: 6.92× and 85.54% are calculated against the theoretical BF16 bytes for 284B parameters. They are not the compression ratio of the official mixed-precision download package. The compared methods use different execution paths, so these results demonstrate size–fidelity efficiency rather than throughput.
+> Measurement basis: 6.92× and 85.54% use the theoretical BF16 bytes for 284B parameters. The official mixed-precision download package follows a separate storage convention. This table compares size–fidelity efficiency; throughput is measured per execution path.
 
 Sources:
 
@@ -109,7 +108,7 @@ Sources:
 ## Quick start
 
 1. Download the complete Windows package from [Baidu Netdisk](https://pan.baidu.com/s/14ichCAsXKZMUQInIwIfQcA?pwd=cccp), extraction code: `cccp`.
-2. Extract the complete package to a writable directory. Do not run it from inside the archive.
+2. Extract the complete package to a writable directory before launching it.
 3. Put a compatible model containing `cccp.json` in the `models` directory next to the application.
 4. Double-click `CCCP-Launcher.exe`.
 5. Select a model and an expert profile. A model can also be fully loaded when no profile is available.
@@ -171,7 +170,7 @@ Corpora are stored locally by the application and can be reused after a restart 
 - CPU is the default and most portable inference path;
 - isolated NVIDIA CUDA environments can be detected automatically;
 - compatible AMD ROCm/HIP environments can be detected automatically;
-- users do not need to install Python;
+- the package supplies its own Python runtime;
 - the release package includes the runtime, dependencies, and precompiled or automatically compiled acceleration operators.
 
 ## Roadmap (TODO)
@@ -184,19 +183,19 @@ Corpora are stored locally by the application and can be reused after a restart 
 - [ ] English and Russian launcher UI; multilingual documentation and the website are already available;
 - [ ] macOS launcher, runtime, and native acceleration backend.
 
-The presence of vision weights does not mean that vision inference is already supported. This item stays unchecked until image preprocessing and end-to-end regression are complete. There is currently no macOS release package.
+Vision input is scheduled for a later release and will open after image preprocessing and end-to-end regression are complete. The macOS runtime and release package are also on the roadmap; current packages target Windows x64.
 
 ## Tested platforms
 
 | Platform / hardware | Validation scope | Status |
 | --- | --- | --- |
-| Windows 11 x64 · Core i9-13900H · 31.59 GiB RAM | Launcher, EXE, CPU inference, OpenAI API, profile scanning, and mapped execution of a 118.47 GiB DeepSeek-V4 model; `93 passed` automated tests | **End-to-end passed**; this machine has no NVIDIA/AMD GPU |
+| Windows 11 x64 · Core i9-13900H · 31.59 GiB RAM | Launcher, EXE, CPU inference, OpenAI API, profile scanning, and mapped execution of a 118.47 GiB DeepSeek-V4 model; `93 passed` automated tests | **CPU end-to-end passed**; GPU paths are covered by separate hardware runs below |
 | NVIDIA RTX 5090 | Real CUDA/RAM runs with DeepSeek-V4 and GLM-5.2 | **Engine tested** |
 | NVIDIA H20-3e (single and multi-GPU) | DeepSeek-V4 TP1/TP4, GLM-5.2 TP2, and Kimi K3 GPU+RAM/TP8 | **Engine tested** |
 | Dual-socket CPU server (96 physical cores) | Shared CPU backend, codebook cache, and runtime images with DeepSeek-V4 and Kimi K3 | **Engine tested** |
-| Windows CUDA 13.0 / `sm_120` | Full NVCC compilation, linking, and module loading on a build machine without an NVIDIA GPU | **Toolchain passed**; not a GPU inference claim for that machine |
+| Windows CUDA 13.0 / `sm_120` | Full NVCC compilation, linking, and module loading | **Toolchain passed**; validation scope ends at module loading |
 | Windows ROCm 7.2.1 / `gfx1151` | HIPIFY, device-code generation, linking, and module loading on a build machine without an AMD GPU | **Toolchain passed**; AMD hardware end-to-end validation is still pending |
-| macOS | No runtime or release package yet | **Unsupported / untested** |
+| macOS | Runtime and release package are on the roadmap | **Planned** |
 
 Results apply only to the hardware, model, and execution path explicitly listed above. Performance also depends on model revision, expert profile, context length, RAM/VRAM bandwidth, SSD, and offload ratio.
 
