@@ -1,4 +1,4 @@
-# C.C.C.P.
+# C.C.C.P. 还在上传中 请稍后
 
 <p align="center">
   <strong>简体中文</strong> · <a href="README_EN.md">English</a> · <a href="README_RU.md">Русский</a>
