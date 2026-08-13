@@ -1,0 +1,34 @@
+{
+  "schema": "cccp-launcher-update-v1",
+  "channel": "stable",
+  "version": "0.9.0",
+  "released_at": "2026-08-13T15:55:41+08:00",
+  "title": "CCCP 启动器 0.9.0",
+  "summary": "动态专家配置、完整专家路由与离线推理环境的一体化桌面启动器。",
+  "download": {
+    "provider": "Baidu Netdisk",
+    "url": "https://pan.baidu.com/s/14ichCAsXKZMUQInIwIfQcA?pwd=cccp",
+    "extraction_code": "cccp"
+  },
+  "github": {
+    "repository": "https://github.com/Value99/CCCP.git",
+    "star_recommended": true
+  },
+  "launcher": {
+    "filename": "CCCP-Launcher.exe",
+    "size_bytes": 39134646,
+    "sha256": "DB4526C575573DF1AC58E7D10AB5FFAFF3015724B1D4EE4FC84E39884ADCCCA9"
+  },
+  "runtime": {
+    "python_required": false,
+    "dependencies_bundled": true,
+    "default_device": "cpu",
+    "platform": "Windows x64"
+  },
+  "release_notes": [
+    "修复中文目录在 JSON API 与旧版 PowerShell 客户端中的 UTF-8 路径回传问题。",
+    "支持模型目录专用专家配置、配置组合去重和无配置全量专家加载。",
+    "集成 CPU、NVIDIA CUDA 与 AMD ROCm/HIP 独立推理环境探测。",
+    "完善 token 路由扫描、专家热力图、终端进度与中文使用手册。"
+  ]
+}
