@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="520" viewBox="0 0 1200 520" role="img" aria-labelledby="title desc">
+  <title id="title">CCCP quality comparison near 77 GiB</title>
+  <desc id="desc">At approximately 77 GiB, CCCP-S has Mean KLD 0.291115 and same-top 83.0846 percent, compared with MFQ EW-V2-S at 0.313576 and 82.2913 percent, and UD-IQ1-S at 0.645514 and 73.8110 percent.</desc>
+  <defs>
+    <linearGradient id="paper" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f7e8c8"/>
+      <stop offset="1" stop-color="#e8c88f"/>
+    </linearGradient>
+    <linearGradient id="cccp" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#761816"/>
+      <stop offset="1" stop-color="#c33d27"/>
+    </linearGradient>
+    <pattern id="grain" width="8" height="8" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.7" fill="#6b2b20" opacity="0.12"/>
+    </pattern>
+  </defs>
+  <rect width="1200" height="520" rx="16" fill="url(#paper)"/>
+  <rect width="1200" height="520" rx="16" fill="url(#grain)"/>
+  <rect x="0" y="0" width="14" height="520" fill="#8f201b"/>
+  <text x="54" y="54" fill="#341713" font-family="Segoe UI,Arial,sans-serif" font-size="28" font-weight="700">QUALITY AT APPROXIMATELY 77 GiB</text>
+  <text x="54" y="82" fill="#744235" font-family="Segoe UI,Arial,sans-serif" font-size="15">WikiText-2 · 146,115 scored tokens · official runtime BF16 logits as reference</text>
+
+  <g font-family="Segoe UI,Arial,sans-serif">
+    <rect x="54" y="108" width="526" height="352" rx="8" fill="#fff3d7" stroke="#a46a37"/>
+    <text x="82" y="144" fill="#341713" font-size="19" font-weight="700">Mean KLD ↓</text>
+    <text x="82" y="167" fill="#744235" font-size="13">Lower is better</text>
+    <line x1="104" y1="395" x2="550" y2="395" stroke="#6c4938" stroke-width="1.5"/>
+    <line x1="104" y1="185" x2="104" y2="395" stroke="#6c4938" stroke-width="1.5"/>
+    <line x1="104" y1="335" x2="550" y2="335" stroke="#9c8068" opacity="0.35"/>
+    <line x1="104" y1="275" x2="550" y2="275" stroke="#9c8068" opacity="0.35"/>
+    <line x1="104" y1="215" x2="550" y2="215" stroke="#9c8068" opacity="0.35"/>
+    <text x="94" y="399" text-anchor="end" fill="#744235" font-size="12">0.0</text>
+    <text x="94" y="339" text-anchor="end" fill="#744235" font-size="12">0.2</text>
+    <text x="94" y="279" text-anchor="end" fill="#744235" font-size="12">0.4</text>
+    <text x="94" y="219" text-anchor="end" fill="#744235" font-size="12">0.6</text>
+
+    <rect x="132" y="307.7" width="92" height="87.3" rx="4" fill="url(#cccp)"/>
+    <rect x="278" y="300.9" width="92" height="94.1" rx="4" fill="#bd8a45"/>
+    <rect x="424" y="201.3" width="92" height="193.7" rx="4" fill="#4d3930"/>
+    <text x="178" y="297" text-anchor="middle" fill="#8f201b" font-size="14" font-weight="700">0.291115</text>
+    <text x="324" y="290" text-anchor="middle" fill="#6b492d" font-size="14" font-weight="700">0.313576</text>
+    <text x="470" y="190" text-anchor="middle" fill="#341713" font-size="14" font-weight="700">0.645514</text>
+    <text x="178" y="424" text-anchor="middle" fill="#341713" font-size="13" font-weight="700">CCCP-S</text>
+    <text x="324" y="424" text-anchor="middle" fill="#341713" font-size="13">MFQ EW-V2-S</text>
+    <text x="470" y="424" text-anchor="middle" fill="#341713" font-size="13">UD-IQ1_S</text>
+
+    <rect x="620" y="108" width="526" height="352" rx="8" fill="#fff3d7" stroke="#a46a37"/>
+    <text x="648" y="144" fill="#341713" font-size="19" font-weight="700">same-top ↑</text>
+    <text x="648" y="167" fill="#744235" font-size="13">Higher is better · percent</text>
+    <line x1="670" y1="395" x2="1116" y2="395" stroke="#6c4938" stroke-width="1.5"/>
+    <line x1="670" y1="185" x2="670" y2="395" stroke="#6c4938" stroke-width="1.5"/>
+    <line x1="670" y1="335" x2="1116" y2="335" stroke="#9c8068" opacity="0.35"/>
+    <line x1="670" y1="275" x2="1116" y2="275" stroke="#9c8068" opacity="0.35"/>
+    <line x1="670" y1="215" x2="1116" y2="215" stroke="#9c8068" opacity="0.35"/>
+    <text x="660" y="399" text-anchor="end" fill="#744235" font-size="12">70</text>
+    <text x="660" y="339" text-anchor="end" fill="#744235" font-size="12">75</text>
+    <text x="660" y="279" text-anchor="end" fill="#744235" font-size="12">80</text>
+    <text x="660" y="219" text-anchor="end" fill="#744235" font-size="12">85</text>
+
+    <rect x="698" y="238.0" width="92" height="157.0" rx="4" fill="url(#cccp)"/>
+    <rect x="844" y="247.5" width="92" height="147.5" rx="4" fill="#bd8a45"/>
+    <rect x="990" y="349.3" width="92" height="45.7" rx="4" fill="#4d3930"/>
+    <text x="744" y="226" text-anchor="middle" fill="#8f201b" font-size="14" font-weight="700">83.0846%</text>
+    <text x="890" y="235" text-anchor="middle" fill="#6b492d" font-size="14" font-weight="700">82.2913%</text>
+    <text x="1036" y="338" text-anchor="middle" fill="#341713" font-size="14" font-weight="700">73.8110%</text>
+    <text x="744" y="424" text-anchor="middle" fill="#341713" font-size="13" font-weight="700">CCCP-S</text>
+    <text x="890" y="424" text-anchor="middle" fill="#341713" font-size="13">MFQ EW-V2-S</text>
+    <text x="1036" y="424" text-anchor="middle" fill="#341713" font-size="13">UD-IQ1_S</text>
+  </g>
+  <text x="600" y="493" text-anchor="middle" fill="#744235" font-family="Segoe UI,Arial,sans-serif" font-size="13">Source: TyloQuant evaluation protocol · identical scored-token set</text>
+</svg>

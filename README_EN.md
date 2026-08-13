@@ -1,6 +1,10 @@
 # C.C.C.P.
 
 <p align="center">
+  <img src="assets/cccp-icon.png" alt="C.C.C.P. project icon" width="96">
+</p>
+
+<p align="center">
   <a href="README.md">简体中文</a> · <strong>English</strong> · <a href="README_RU.md">Русский</a>
 </p>
 
@@ -26,10 +30,11 @@
 
 | Direction | Capability | Practical benefit |
 | --- | --- | --- |
+| **CCCP Quant** | Projection VQ + packed direct execution | Gate, Up, and Down use independent codebooks and precision layouts, while fused operators compute directly from compact indices. Public evaluation reaches approximately 2.31 bit/parameter with strong size–fidelity efficiency. |
 | **More Useful** | One package, open and run | The package bundles the launcher, isolated Python runtime, inference dependencies, and operators. |
-| **More Saving** | Quantization + expert detection | Dense and shared-expert storage is accounted for first, then dynamic experts are selected under the profile budget. Duplicate experts across combined profiles are counted only once. |
+| **More Saving** | Quantization + task expert sets | Advanced quantization first reduces the complete model footprint, then task profiles define resident dynamic experts. Duplicate experts across combined profiles are counted once. |
 | **More Smart** | Expert pre-selection | Real task corpora produce layer-by-layer expert heatmaps, allowing the most relevant experts to stay resident first. |
-| **More Rapid** | Smaller model + extensive optimization | Codebook caching, CPU-accelerated operators, and isolated backend environments are used. Actual throughput depends on the model, memory bandwidth, and hardware. |
+| **More Rapid** | Resident experts + format/operator co-design | Decoding routes through experts resident in RAM/VRAM, supported by codebook caches and CPU/CUDA/HIP fused operators. |
 
 ## CCCP quantization technology
 
@@ -42,6 +47,14 @@ CCCP advances MoE quantization as a system-level design. Weight representation, 
 - **Quantization/runtime co-design:** CPU codebook caches, L2/L3-aware scheduling, CUDA/HIP fused operators, and multi-GPU parallelism execute directly around the CCCP format.
 
 In the public evaluation, CCCP-S reaches an effective width of approximately **2.31 bit/parameter**, a **6.92× theoretical compression ratio**, and an **85.54% weight-byte reduction** relative to the theoretical BF16 weights of a 284B-parameter model. At a similar size, it reduces Mean KLD by approximately **54.90%** and raises same-top by **9.2736 percentage points** over UD-IQ1_S. It is also smaller than MFQ EW-V2-S while improving both KLD and same-top. See “Standardized evaluation” below for the full protocol and results.
+
+<p align="center">
+  <img src="assets/cccp-compression-chart.svg" alt="CCCP-S compression efficiency against the theoretical BF16 weight baseline" width="100%">
+</p>
+
+<p align="center">
+  <img src="assets/cccp-quality-chart.svg" alt="KLD and same-top comparison between CCCP-S, MFQ, and UD near 77 GiB" width="100%">
+</p>
 
 ## Task expert profiles
 

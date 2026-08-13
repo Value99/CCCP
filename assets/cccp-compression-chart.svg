@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420" role="img" aria-labelledby="title desc">
+  <title id="title">CCCP compression efficiency</title>
+  <desc id="desc">Theoretical BF16 weights are 528.991 GiB and CCCP-S is 76.473 GiB, corresponding to 6.92 times compression, 85.54 percent fewer bytes, and about 2.31 bits per parameter.</desc>
+  <defs>
+    <linearGradient id="paper" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f7e8c8"/>
+      <stop offset="1" stop-color="#e8c88f"/>
+    </linearGradient>
+    <linearGradient id="red" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#7b1716"/>
+      <stop offset="1" stop-color="#c13b26"/>
+    </linearGradient>
+    <pattern id="grain" width="8" height="8" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.7" fill="#6b2b20" opacity="0.12"/>
+    </pattern>
+  </defs>
+  <rect width="1200" height="420" rx="16" fill="url(#paper)"/>
+  <rect width="1200" height="420" rx="16" fill="url(#grain)"/>
+  <rect x="0" y="0" width="14" height="420" fill="#8f201b"/>
+  <text x="54" y="54" fill="#341713" font-family="Segoe UI,Arial,sans-serif" font-size="28" font-weight="700">CCCP COMPRESSION EFFICIENCY</text>
+  <text x="54" y="82" fill="#744235" font-family="Segoe UI,Arial,sans-serif" font-size="15">DeepSeek-V4-Flash-0731 · theoretical 284B BF16 weight baseline</text>
+
+  <text x="54" y="135" fill="#341713" font-family="Segoe UI,Arial,sans-serif" font-size="16" font-weight="600">BF16 theoretical</text>
+  <rect x="230" y="111" width="900" height="34" rx="5" fill="#3b211b" opacity="0.88"/>
+  <text x="1112" y="134" text-anchor="end" fill="#fff1d0" font-family="Segoe UI,Arial,sans-serif" font-size="16" font-weight="700">528.991 GiB</text>
+
+  <text x="54" y="195" fill="#8f201b" font-family="Segoe UI,Arial,sans-serif" font-size="16" font-weight="700">CCCP-S</text>
+  <rect x="230" y="171" width="130.1" height="34" rx="5" fill="url(#red)"/>
+  <line x1="360.1" y1="171" x2="360.1" y2="205" stroke="#efbd55" stroke-width="3"/>
+  <text x="375" y="194" fill="#7b1716" font-family="Segoe UI,Arial,sans-serif" font-size="16" font-weight="700">76.473 GiB</text>
+
+  <line x1="230" y1="229" x2="1130" y2="229" stroke="#8b5b42" stroke-width="1" opacity="0.45"/>
+
+  <g font-family="Segoe UI,Arial,sans-serif">
+    <rect x="54" y="267" width="330" height="104" rx="8" fill="#fff3d7" stroke="#a46a37"/>
+    <text x="78" y="303" fill="#744235" font-size="14" font-weight="600">THEORETICAL COMPRESSION</text>
+    <text x="78" y="349" fill="#8f201b" font-size="36" font-weight="800">6.92×</text>
+
+    <rect x="435" y="267" width="330" height="104" rx="8" fill="#fff3d7" stroke="#a46a37"/>
+    <text x="459" y="303" fill="#744235" font-size="14" font-weight="600">WEIGHT-BYTE REDUCTION</text>
+    <text x="459" y="349" fill="#8f201b" font-size="36" font-weight="800">85.54%</text>
+
+    <rect x="816" y="267" width="330" height="104" rx="8" fill="#fff3d7" stroke="#a46a37"/>
+    <text x="840" y="303" fill="#744235" font-size="14" font-weight="600">EFFECTIVE WIDTH</text>
+    <text x="840" y="349" fill="#8f201b" font-size="36" font-weight="800">≈2.31 bit/param</text>
+  </g>
+</svg>

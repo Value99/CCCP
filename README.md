@@ -1,6 +1,10 @@
 # C.C.C.P. 还在上传中 请稍后
 
 <p align="center">
+  <img src="assets/cccp-icon.png" alt="C.C.C.P. 项目图标" width="96">
+</p>
+
+<p align="center">
   <strong>简体中文</strong> · <a href="README_EN.md">English</a> · <a href="README_RU.md">Русский</a>
 </p>
 
@@ -26,10 +30,11 @@
 
 | 方向 | 能力 | 实际作用 |
 | --- | --- | --- |
+| **CCCP Quant · 先进量化** | 投影级 VQ + packed 直算 | Gate、Up、Down 使用独立码本和精度布局，融合算子直接计算紧凑索引；公开评测达到约 2.31 bit/parameter，并保持优秀的体积—保真度。 |
 | **More Useful · 更加易用** | 一键整合包，打开就用 | 启动器、独立 Python 环境、推理依赖与算子随包提供，用户无需另装 Python。 |
-| **More Saving · 更节省** | 量化 + 专家探测 | 先扣除 Dense 与共享专家体积，再按配置预算选择动态专家；多配置组合时重复专家只计算一次。 |
+| **More Saving · 更节省** | 量化 + 任务专家集合 | 先进量化先降低完整模型体积，再按任务配置常驻动态专家；多配置组合时重复专家只计算一次。 |
 | **More Smart · 更智能** | 前置专家筛选 | 使用真实任务语料生成逐层专家热力图，让最匹配任务的专家优先常驻。 |
-| **More Rapid · 更迅速** | 更小模型 + 海量优化 | 使用码本缓存、CPU 加速算子和独立后端环境；具体吞吐取决于模型、内存带宽与硬件。 |
+| **More Rapid · 更迅速** | 常驻专家 + 格式/算子协同 | 生成阶段在 RAM/显存常驻专家中路由，配合码本缓存与 CPU/CUDA/HIP 融合算子持续推理。 |
 
 ## CCCP 量化技术
 
@@ -42,6 +47,14 @@ CCCP 的先进性来自一套专门面向 MoE 的系统级量化设计。权重�
 - **量化格式与算子协同**：CPU 码本缓存、L2/L3 友好调度、CUDA/HIP 融合算子和多卡并行直接围绕 CCCP 格式实现，量化后的模型可以进入高效执行路径。
 
 公开评测中，CCCP-S 的有效位宽约为 **2.31 bit/parameter**，相对 284B 参数 BF16 理论权重达到 **6.92× 压缩**、字节减少 **85.54%**。在近似体积对比中，它相对 UD-IQ1_S 将 Mean KLD 降低约 **54.90%**，same-top 提高 **9.2736 个百分点**；相对 MFQ EW-V2-S 体积更小，同时 KLD 和 same-top 均有改善。完整协议与数据见下方“标准化实验数据”。
+
+<p align="center">
+  <img src="assets/cccp-compression-chart.svg" alt="CCCP-S 相对 BF16 理论权重的压缩效率图" width="100%">
+</p>
+
+<p align="center">
+  <img src="assets/cccp-quality-chart.svg" alt="约 77 GiB 档位下 CCCP-S、MFQ 与 UD 的 KLD 和 same-top 对比图" width="100%">
+</p>
 
 ## 任务专家配置
 
