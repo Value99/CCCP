@@ -37,11 +37,36 @@
 
 - it does not generate a new model;
 - it does not modify or prune model weights;
-- it does not change the model's original top-k routing rules;
+- it does not change the number of experts activated per token; a task profile only limits the candidate experts that may participate in routing for that task;
 - each profile records the model name, version, fingerprint, and per-layer expert IDs;
 - profiles can be exported, shared, combined, and deduplicated.
 
 Long-context corpora are processed with pure prefill in `4096-token` blocks while expert hits are recorded throughout the complete context. For long-context workloads, start with a scan budget of roughly `500,000 tokens`, then adjust it based on the heatmap coverage curve and target profile size.
+
+## Why fewer task experts can work better
+
+“Fewer experts” means a **smaller candidate set participating in routing and residing in RAM/VRAM for one task**. It does not mean deleting experts from the model. All expert weights remain available; switching, combining, or disabling profiles can expose a different set or load the complete model.
+
+A general MoE router must cover every domain. In focused workloads such as role play, coding, or translation, experts with close routing scores but little relevance to the current domain may still enter top-k, causing tone drift, inconsistent characters, or technical mistakes. CCCP first runs pure prefill over representative task data, records per-layer expert heat, and then concentrates the task's candidate pool on a verified collection:
+
+1. **Lower hardware threshold:** the fast path only needs the selected collection to be fully resident in RAM/VRAM, rather than reserving space for every dynamic expert.
+2. **More focused routing:** unrelated experts are excluded from the current candidate pool, so top-k chooses among experts that better match the task.
+3. **Potentially more stable task behavior:** on data matching the scanned distribution, this can reduce characteristic errors caused by out-of-domain experts entering the route; some previously unstable or incorrect outputs may recover.
+4. **The full model remains intact:** profiles neither modify weights nor remove experts, and another profile can be selected or combined for a different domain.
+
+The project has produced fingerprint-matched preset collections for immersive role play, romantic interaction, and world building. Presets store the exact model name, version, and manifest fingerprint and only appear under a matching model; they are not universal patches that can be mixed with arbitrary models. Improvement within a task is not an unconditional quality guarantee. Cross-domain use should be rescanned or combined with an appropriate profile and validated on your own regression set.
+
+### Define a style with your own data
+
+Users can upload preferred character, writing-style, or business corpora. The launcher scans which existing experts are actually used by that content and includes them in a new candidate/residency profile. In subsequent inference, experts related to that data distribution participate more often, biasing behavior toward the target style within the model's existing capabilities.
+
+This is not fine-tuning: CCCP does not write the corpus into model weights or teach knowledge the model never had. It **selects a better combination from the model's existing experts**. Profiles can be named, described, exported, shared, and combined with other directions, so customization is not limited to bundled presets.
+
+### Not a per-token disk-streaming demonstration
+
+The intended high-speed CCCP path loads the selected experts completely into RAM/VRAM before generation and builds codebook and execution caches. Normal decoding routes within this resident pool instead of fetching large expert weights from disk for every token. A smaller model and focused working set, together with CPU/CUDA/HIP fused operators, target sustained interactive inference rather than merely proving that a model can start.
+
+When the device truly lacks capacity, mapped memory or disk offload remains available as a functional fallback and the launcher displays an explicit risk warning. This is a capacity safeguard, not the recommended performance mode. For the intended fast path, the selected profile should fit fully in RAM/VRAM.
 
 ## Standardized evaluation
 
