@@ -75,19 +75,6 @@ In the public evaluation, CCCP-S reaches an effective width of approximately **2
 
 Long-context corpora are processed with pure prefill in `4096-token` blocks while expert hits are recorded throughout the complete context. For long-context workloads, start with a scan budget of roughly `500,000 tokens`, then adjust it based on the heatmap coverage curve and target profile size.
 
-## Why fewer task experts can work better
-
-“Fewer experts” means a **smaller candidate set participating in routing and residing in RAM/VRAM for one task**. The complete model retains every expert weight; switching, combining, or disabling profiles exposes a different set or loads the complete model.
-
-A general MoE router must cover every domain. In focused workloads such as role play, coding, or translation, experts with close routing scores but little relevance to the current domain may still enter top-k, causing tone drift, inconsistent characters, or technical mistakes. CCCP first runs pure prefill over representative task data, records per-layer expert heat, and then concentrates the task's candidate pool on a verified collection:
-
-1. **Lower hardware threshold:** the fast path makes the selected collection fully resident in RAM/VRAM, reducing the space reserved for dynamic experts.
-2. **More focused routing:** unrelated experts are excluded from the current candidate pool, so top-k chooses among experts that better match the task.
-3. **Potentially more stable task behavior:** on data matching the scanned distribution, this can reduce characteristic errors caused by out-of-domain experts entering the route; some previously unstable or incorrect outputs may recover.
-4. **The full model remains intact:** profiles neither modify weights nor remove experts, and another profile can be selected or combined for a different domain.
-
-The project has produced fingerprint-matched preset collections for immersive role play, romantic interaction, and world building. Each preset is bound to an exact model name, version, and manifest fingerprint and appears under the matching model. Cross-domain workloads can be rescanned or combined with another profile, with final quality measured on the target regression set.
-
 ### Define a style with your own data
 
 Users can upload preferred character, writing-style, or business corpora. The launcher scans which existing experts are actually used by that content and includes them in a new candidate/residency profile. In subsequent inference, experts related to that data distribution participate more often, biasing behavior toward the target style within the model's existing capabilities.
