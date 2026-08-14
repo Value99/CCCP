@@ -26,7 +26,7 @@
 
 然后双击 `CCCP-Launcher-0.9.1-Offline-Setup.exe`。安装器会自动校验、合并、解压并启动程序，全程显示进度。模型不包含在启动器发行包内，需要单独下载并放入解压目录的 `models` 文件夹。
 
-当前 0.9.1 完整包以 GitHub Release 的安装器和 4 个分卷为准；不要使用旧版网盘包覆盖本版本。
+GitHub 访问较慢时，也可以从 [百度网盘下载完整 Windows 包](https://pan.baidu.com/s/14ichCAsXKZMUQInIwIfQcA?pwd=cccp)，提取码：`cccp`。
 
 > Release 页面底部的 `Source code (zip/tar.gz)` 是 GitHub 自动生成的公开资料快照，只包含 README、版本文件和图片，不包含启动器源码、推理引擎源码或 CCCP 量化/训练框架。普通用户请下载上面列出的离线安装器和 4 个分卷。
 
