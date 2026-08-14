@@ -75,7 +75,7 @@ CCCP 的先进性来自一套专门面向 MoE 的系统级量化设计。权重�
 </p>
 
 <p align="center">
-  <img src="assets/cccp-quality-chart.svg" alt="约 77 GiB 档位下 CCCP-S 与 UD 的 KLD 和 same-top 对比图" width="100%">
+  <img src="assets/cccp-quality-chart-v2.svg" alt="约 77 GiB 档位下 CCCP-S 与 UD 的 KLD 和 same-top 对比图" width="100%">
 </p>
 
 ## 任务专家配置

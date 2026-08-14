@@ -61,7 +61,7 @@ CCCP развивает квантование MoE как единую сист�
 </p>
 
 <p align="center">
-  <img src="assets/cccp-quality-chart.svg" alt="Сравнение KLD и same-top для CCCP-S и UD при размере около 77 GiB" width="100%">
+  <img src="assets/cccp-quality-chart-v2.svg" alt="Сравнение KLD и same-top для CCCP-S и UD при размере около 77 GiB" width="100%">
 </p>
 
 ## Профили экспертов задачи

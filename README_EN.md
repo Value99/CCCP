@@ -61,7 +61,7 @@ In the public evaluation, CCCP-S reaches an effective width of approximately **2
 </p>
 
 <p align="center">
-  <img src="assets/cccp-quality-chart.svg" alt="KLD and same-top comparison between CCCP-S and UD near 77 GiB" width="100%">
+  <img src="assets/cccp-quality-chart-v2.svg" alt="KLD and same-top comparison between CCCP-S and UD near 77 GiB" width="100%">
 </p>
 
 ## Task expert profiles
