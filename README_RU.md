@@ -8,11 +8,11 @@
   <a href="README.md">简体中文</a> · <a href="README_EN.md">English</a> · <strong>Русский</strong>
 </p>
 
-## ⬇️ Полный автономный пакет для Windows (v0.9.0)
+## ⬇️ Полный автономный пакет для Windows (v0.9.1)
 
-### [👉 Открыть страницу загрузки GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.0)
+### [👉 Открыть страницу загрузки GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.1)
 
-Для первой установки загрузите в одну папку Offline Setup EXE, файл `.parts.json` и все четыре части `.zip.001`–`.zip.004`. Затем запустите `CCCP-Launcher-0.9.0-Offline-Setup.exe`: установщик проверит, объединит и распакует файлы, покажет прогресс и запустит приложение. Для первой установки недостаточно скачать только отдельный EXE запуска.
+Для первой установки загрузите в одну папку Offline Setup EXE, файл `.parts.json` и все четыре части `.zip.001`–`.zip.004`. Затем запустите `CCCP-Launcher-0.9.1-Offline-Setup.exe`: установщик проверит, объединит и распакует файлы, покажет прогресс и запустит приложение. Для первой установки недостаточно скачать только отдельный EXE запуска.
 
 Автоматические ссылки `Source code (zip/tar.gz)` содержат только документацию, файлы версии и изображения этого публичного репозитория. Исходный код лаунчера, движка инференса и фреймворка квантования/обучения CCCP в них отсутствует.
 
@@ -26,7 +26,7 @@
 </p>
 
 <p align="center">
-  <img alt="Версия" src="https://img.shields.io/badge/release-v0.9.0-a52f25">
+  <img alt="Версия" src="https://img.shields.io/badge/release-v0.9.1-a52f25">
   <img alt="Платформа" src="https://img.shields.io/badge/platform-Windows%20x64-7a1e18">
   <img alt="Python" src="https://img.shields.io/badge/Python-%D0%BD%D0%B5%20%D1%82%D1%80%D0%B5%D0%B1%D1%83%D0%B5%D1%82%D1%81%D1%8F-c49543">
   <img alt="Устройство" src="https://img.shields.io/badge/default-CPU-3a2118">

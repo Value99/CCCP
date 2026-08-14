@@ -1,14 +1,14 @@
 {
   "schema": "cccp-launcher-update-v1",
   "channel": "stable",
-  "version": "0.9.0",
-  "released_at": "2026-08-13T15:55:41+08:00",
-  "title": "CCCP 启动器 0.9.0",
-  "summary": "动态专家配置、完整专家路由与离线推理环境的一体化桌面启动器。",
+  "version": "0.9.1",
+  "released_at": "2026-08-14T16:55:19+08:00",
+  "title": "CCCP 启动器 0.9.1",
+  "summary": "修复严格路由 Dense 层误判与组合 GU/Down Q4 解码，完成 GLM-5.2 通用回归。",
   "download": {
-    "provider": "Baidu Netdisk",
-    "url": "https://pan.baidu.com/s/14ichCAsXKZMUQInIwIfQcA?pwd=cccp",
-    "extraction_code": "cccp"
+    "provider": "GitHub Releases",
+    "url": "https://github.com/Value99/CCCP/releases/tag/v0.9.1",
+    "extraction_code": ""
   },
   "github": {
     "repository": "https://github.com/Value99/CCCP.git",
@@ -16,8 +16,8 @@
   },
   "launcher": {
     "filename": "CCCP-Launcher.exe",
-    "size_bytes": 39134646,
-    "sha256": "DB4526C575573DF1AC58E7D10AB5FFAFF3015724B1D4EE4FC84E39884ADCCCA9"
+    "size_bytes": 40762272,
+    "sha256": "55B22E983F1F22B52F56D31D233A391D55F98BBF5B689477F07F2444770C3888"
   },
   "runtime": {
     "python_required": false,
@@ -26,9 +26,9 @@
     "platform": "Windows x64"
   },
   "release_notes": [
-    "修复中文目录在 JSON API 与旧版 PowerShell 客户端中的 UTF-8 路径回传问题。",
-    "支持模型目录专用专家配置、配置组合去重和无配置全量专家加载。",
-    "集成 CPU、NVIDIA CUDA 与 AMD ROCm/HIP 独立推理环境探测。",
-    "完善 token 路由扫描、专家热力图、终端进度与中文使用手册。"
+    "修复 Dense 层 0–2 被严格路由误判为少于模型 top-k=8。",
+    "修复组合 Gate+Up/Down Q4 专家的单 token 解码布局分派。",
+    "达到 max_tokens 后不再多执行一次无用的完整模型 decode。",
+    "完成 333.524 GiB GLM-5.2 模型的 4096-token 扫描、配置保存、加载与 GUI 生成回归。"
   ]
 }

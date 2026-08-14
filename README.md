@@ -8,23 +8,23 @@
   <strong>简体中文</strong> · <a href="README_EN.md">English</a> · <a href="README_RU.md">Русский</a>
 </p>
 
-## ⬇️ 下载 Windows 完整离线版（v0.9.0）
+## ⬇️ 下载 Windows 完整离线版（v0.9.1）
 
 > [!IMPORTANT]
 > **第一次使用请下载完整离线包，不要只下载单独的 `CCCP-Launcher.exe`。** 发行包已内置 Python、Miniconda、CPU/CUDA/AMD 推理环境及算子编译工具，无需另外安装依赖。
 
-### [👉 GitHub Release 下载页（推荐）](https://github.com/Value99/CCCP/releases/tag/v0.9.0)
+### [👉 GitHub Release 下载页（推荐）](https://github.com/Value99/CCCP/releases/tag/v0.9.1)
 
 打开下载页后，将下面 **6 个文件**全部下载到同一个文件夹：
 
-1. `CCCP-Launcher-0.9.0-Offline-Setup.exe`
-2. `CCCP-Launcher-v0.9.0-offline.parts.json`
-3. `CCCP-Launcher-v0.9.0-win-x64-offline.zip.001`
-4. `CCCP-Launcher-v0.9.0-win-x64-offline.zip.002`
-5. `CCCP-Launcher-v0.9.0-win-x64-offline.zip.003`
-6. `CCCP-Launcher-v0.9.0-win-x64-offline.zip.004`
+1. `CCCP-Launcher-0.9.1-Offline-Setup.exe`
+2. `CCCP-Launcher-v0.9.1-offline.parts.json`
+3. `CCCP-Launcher-v0.9.1-win-x64-offline.zip.001`
+4. `CCCP-Launcher-v0.9.1-win-x64-offline.zip.002`
+5. `CCCP-Launcher-v0.9.1-win-x64-offline.zip.003`
+6. `CCCP-Launcher-v0.9.1-win-x64-offline.zip.004`
 
-然后双击 `CCCP-Launcher-0.9.0-Offline-Setup.exe`。安装器会自动校验、合并、解压并启动程序，全程显示进度。模型不包含在启动器发行包内，需要单独下载并放入解压目录的 `models` 文件夹。
+然后双击 `CCCP-Launcher-0.9.1-Offline-Setup.exe`。安装器会自动校验、合并、解压并启动程序，全程显示进度。模型不包含在启动器发行包内，需要单独下载并放入解压目录的 `models` 文件夹。
 
 GitHub 访问较慢时，也可以从 [百度网盘下载完整 Windows 包](https://pan.baidu.com/s/14ichCAsXKZMUQInIwIfQcA?pwd=cccp)，提取码：`cccp`。
 
@@ -40,7 +40,7 @@ GitHub 访问较慢时，也可以从 [百度网盘下载完整 Windows 包](htt
 </p>
 
 <p align="center">
-  <img alt="Release" src="https://img.shields.io/badge/release-v0.9.0-a52f25">
+  <img alt="Release" src="https://img.shields.io/badge/release-v0.9.1-a52f25">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20x64-7a1e18">
   <img alt="Python" src="https://img.shields.io/badge/Python-%E6%97%A0%E9%9C%80%E5%AE%89%E8%A3%85-c49543">
   <img alt="Device" src="https://img.shields.io/badge/default-CPU-3a2118">
@@ -140,8 +140,8 @@ CCCP 的高速路径会在生成前把所选专家完整加载到 RAM/显存，�
 
 ## 快速开始
 
-1. 从上方 [GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.0) 下载全部 6 个离线安装文件；也可使用百度网盘完整包。
-2. GitHub 分卷版双击 `CCCP-Launcher-0.9.0-Offline-Setup.exe`；网盘整包则完整解压到可读写目录，避免直接在压缩包内运行。
+1. 从上方 [GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.1) 下载全部 6 个离线安装文件；也可使用百度网盘完整包。
+2. GitHub 分卷版双击 `CCCP-Launcher-0.9.1-Offline-Setup.exe`；网盘整包则完整解压到可读写目录，避免直接在压缩包内运行。
 3. 将带有 `cccp.json` 的兼容模型放入程序同级 `models` 目录。
 4. 双击 `CCCP-Launcher.exe`。
 5. 选择模型和专家配置；初次使用也可直接选择全量加载。

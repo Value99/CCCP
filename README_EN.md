@@ -8,11 +8,11 @@
   <a href="README.md">简体中文</a> · <strong>English</strong> · <a href="README_RU.md">Русский</a>
 </p>
 
-## ⬇️ Download the complete Windows offline package (v0.9.0)
+## ⬇️ Download the complete Windows offline package (v0.9.1)
 
-### [👉 Open the GitHub Release download page](https://github.com/Value99/CCCP/releases/tag/v0.9.0)
+### [👉 Open the GitHub Release download page](https://github.com/Value99/CCCP/releases/tag/v0.9.1)
 
-For a first installation, download the Offline Setup EXE, the `.parts.json` manifest, and all four `.zip.001`–`.zip.004` parts into one folder. Then run `CCCP-Launcher-0.9.0-Offline-Setup.exe`; it verifies, joins, extracts, and launches the application with visible progress. Do not download only the standalone launcher EXE for a first installation.
+For a first installation, download the Offline Setup EXE, the `.parts.json` manifest, and all four `.zip.001`–`.zip.004` parts into one folder. Then run `CCCP-Launcher-0.9.1-Offline-Setup.exe`; it verifies, joins, extracts, and launches the application with visible progress. Do not download only the standalone launcher EXE for a first installation.
 
 The automatically generated `Source code (zip/tar.gz)` links contain only this public repository's documentation, version files, and images. They do not contain the launcher, inference-engine, or CCCP quantization/training source code.
 
@@ -26,7 +26,7 @@ The automatically generated `Source code (zip/tar.gz)` links contain only this p
 </p>
 
 <p align="center">
-  <img alt="Release" src="https://img.shields.io/badge/release-v0.9.0-a52f25">
+  <img alt="Release" src="https://img.shields.io/badge/release-v0.9.1-a52f25">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20x64-7a1e18">
   <img alt="Python" src="https://img.shields.io/badge/Python-not%20required-c49543">
   <img alt="Device" src="https://img.shields.io/badge/default-CPU-3a2118">
