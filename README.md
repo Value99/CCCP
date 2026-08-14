@@ -68,14 +68,14 @@ CCCP 的先进性来自一套专门面向 MoE 的系统级量化设计。权重�
 - **精度按结构分配**：逐投影、逐层和逐专家布局都可以写入 `cccp.json`，重要部分保留更高精度，重复性更强的部分使用更紧凑的表示。
 - **量化格式与算子协同**：CPU 码本缓存、L2/L3 友好调度、CUDA/HIP 融合算子和多卡并行直接围绕 CCCP 格式实现，量化后的模型可以进入高效执行路径。
 
-公开评测中，CCCP-S 的有效位宽约为 **2.31 bit/parameter**，相对 284B 参数 BF16 理论权重达到 **6.92× 压缩**、字节减少 **85.54%**。在近似体积对比中，它相对 UD-IQ1_S 将 Mean KLD 降低约 **54.90%**，same-top 提高 **9.2736 个百分点**；相对 MFQ EW-V2-S 体积更小，同时 KLD 和 same-top 均有改善。完整协议与数据见下方“标准化实验数据”。
+公开评测中，CCCP-S 的有效位宽约为 **2.31 bit/parameter**，相对 284B 参数 BF16 理论权重达到 **6.92× 压缩**、字节减少 **85.54%**。在近似体积对比中，它相对 UD-IQ1_S 将 Mean KLD 降低约 **54.90%**，same-top 提高 **9.2736 个百分点**。完整协议与数据见下方“标准化实验数据”。
 
 <p align="center">
   <img src="assets/cccp-compression-chart.svg" alt="CCCP-S 相对 BF16 理论权重的压缩效率图" width="100%">
 </p>
 
 <p align="center">
-  <img src="assets/cccp-quality-chart.svg" alt="约 77 GiB 档位下 CCCP-S、MFQ 与 UD 的 KLD 和 same-top 对比图" width="100%">
+  <img src="assets/cccp-quality-chart.svg" alt="约 77 GiB 档位下 CCCP-S 与 UD 的 KLD 和 same-top 对比图" width="100%">
 </p>
 
 ## 任务专家配置
@@ -108,7 +108,6 @@ CCCP 的高速路径会在生成前把所选专家完整加载到 RAM/显存，�
 | 方案 | 体积 (GiB) | Mean KLD ↓ | same-top ↑ | 执行方式 |
 | --- | ---: | ---: | ---: | --- |
 | **CCCP-S** | **76.473** | **0.291115** | **83.0846%** | full-resident TP1×6 |
-| MFQ EW-V2-S | 77.519 | 0.313576 | 82.2913% | streamed TP1×6, B4 |
 | UD-IQ1_S | 76.871 | 0.645514 | 73.8110% | llama.cpp |
 | UD-IQ3_XXS | 97.051 | 0.306343 | 82.0150% | llama.cpp |
 | UD-IQ4_NL | 127.277 | 0.180695 | 86.0750% | llama.cpp |
@@ -119,7 +118,7 @@ CCCP 的高速路径会在生成前把所选专家完整加载到 RAM/显存，�
 | ---: | ---: | ---: | ---: | ---: |
 | 528.991 GiB | 76.473 GiB | **6.92×** | **85.54%** | **约 2.31 bit/parameter** |
 
-同等体积附近，CCCP-S 相对 UD-IQ1_S 的 Mean KLD 降低约 `54.90%`，same-top 提高 `9.2736` 个百分点；相对 MFQ EW-V2-S 少 `1.046 GiB`，Mean KLD 降低约 `7.16%`，same-top 提高 `0.7933` 个百分点。
+同等体积附近，CCCP-S 相对 UD-IQ1_S 的 Mean KLD 降低约 `54.90%`，same-top 提高 `9.2736` 个百分点。
 
 > 口径：6.92× 与 85.54% 以 284B 参数的 BF16 理论字节数为基准；官方混合精度下载包采用另一套存储口径。表格用于比较“体积—保真度”效率，吞吐速度按各运行路径单独测试。
 

@@ -54,14 +54,14 @@ CCCP advances MoE quantization as a system-level design. Weight representation, 
 - **Structure-aware precision allocation:** `cccp.json` can describe per-projection, per-layer, and per-expert layouts, assigning higher precision to sensitive components and compact representations to more redundant components.
 - **Quantization/runtime co-design:** CPU codebook caches, L2/L3-aware scheduling, CUDA/HIP fused operators, and multi-GPU parallelism execute directly around the CCCP format.
 
-In the public evaluation, CCCP-S reaches an effective width of approximately **2.31 bit/parameter**, a **6.92× theoretical compression ratio**, and an **85.54% weight-byte reduction** relative to the theoretical BF16 weights of a 284B-parameter model. At a similar size, it reduces Mean KLD by approximately **54.90%** and raises same-top by **9.2736 percentage points** over UD-IQ1_S. It is also smaller than MFQ EW-V2-S while improving both KLD and same-top. See “Standardized evaluation” below for the full protocol and results.
+In the public evaluation, CCCP-S reaches an effective width of approximately **2.31 bit/parameter**, a **6.92× theoretical compression ratio**, and an **85.54% weight-byte reduction** relative to the theoretical BF16 weights of a 284B-parameter model. At a similar size, it reduces Mean KLD by approximately **54.90%** and raises same-top by **9.2736 percentage points** over UD-IQ1_S. See “Standardized evaluation” below for the full protocol and results.
 
 <p align="center">
   <img src="assets/cccp-compression-chart.svg" alt="CCCP-S compression efficiency against the theoretical BF16 weight baseline" width="100%">
 </p>
 
 <p align="center">
-  <img src="assets/cccp-quality-chart.svg" alt="KLD and same-top comparison between CCCP-S, MFQ, and UD near 77 GiB" width="100%">
+  <img src="assets/cccp-quality-chart.svg" alt="KLD and same-top comparison between CCCP-S and UD near 77 GiB" width="100%">
 </p>
 
 ## Task expert profiles
@@ -94,7 +94,6 @@ The evaluation uses DeepSeek-V4-Flash-0731 on WikiText-2 with a fixed `ctx=512`:
 | Method | Size (GiB) | Mean KLD ↓ | same-top ↑ | Execution |
 | --- | ---: | ---: | ---: | --- |
 | **CCCP-S** | **76.473** | **0.291115** | **83.0846%** | full-resident TP1×6 |
-| MFQ EW-V2-S | 77.519 | 0.313576 | 82.2913% | streamed TP1×6, B4 |
 | UD-IQ1_S | 76.871 | 0.645514 | 73.8110% | llama.cpp |
 | UD-IQ3_XXS | 97.051 | 0.306343 | 82.0150% | llama.cpp |
 | UD-IQ4_NL | 127.277 | 0.180695 | 86.0750% | llama.cpp |
@@ -105,7 +104,7 @@ Using the theoretical BF16 weight bytes for the official `284B` parameter count 
 | ---: | ---: | ---: | ---: | ---: |
 | 528.991 GiB | 76.473 GiB | **6.92×** | **85.54%** | **≈2.31 bit/parameter** |
 
-At nearly the same size, CCCP-S reduces Mean KLD by approximately `54.90%` and raises same-top by `9.2736` percentage points compared with UD-IQ1_S. Compared with MFQ EW-V2-S, it is `1.046 GiB` smaller, reduces Mean KLD by approximately `7.16%`, and raises same-top by `0.7933` percentage points.
+At nearly the same size, CCCP-S reduces Mean KLD by approximately `54.90%` and raises same-top by `9.2736` percentage points compared with UD-IQ1_S.
 
 > Measurement basis: 6.92× and 85.54% use the theoretical BF16 bytes for 284B parameters. The official mixed-precision download package follows a separate storage convention. This table compares size–fidelity efficiency; throughput is measured per execution path.
 
