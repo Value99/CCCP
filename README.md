@@ -127,10 +127,10 @@ CCCP 的高速路径会在生成前把所选专家完整加载到 RAM/显存，�
 
 > 口径：6.92× 与 85.54% 以 284B 参数的 BF16 理论字节数为基准；官方混合精度下载包采用另一套存储口径。表格用于比较“体积—保真度”效率，吞吐速度按各运行路径单独测试。
 
-数据与模型资料：
+CCCP 与模型资料：
 
-- [原始实验仓库](https://github.com/Tylogi/TyloQuant)
-- [实验协议与完整结果](https://github.com/Tylogi/TyloQuant/blob/master/README.zh-CN.md)
+- [CCCP 项目主页](https://github.com/Value99/CCCP)
+- [CCCP 体积与保真度说明](https://github.com/Value99/CCCP#标准化实验数据)
 - [DeepSeek-V4-Flash 官方模型卡](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash)
 
 ## 启动器界面

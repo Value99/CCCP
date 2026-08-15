@@ -117,8 +117,8 @@ At nearly the same size, CCCP-S reduces Mean KLD by approximately `54.90%` and r
 
 Sources:
 
-- [Original experiment repository](https://github.com/Tylogi/TyloQuant)
-- [Evaluation protocol and complete results](https://github.com/Tylogi/TyloQuant/blob/master/README.zh-CN.md)
+- [CCCP project page](https://github.com/Value99/CCCP)
+- [CCCP size and fidelity notes](https://github.com/Value99/CCCP#standardized-evaluation)
 - [Official DeepSeek-V4-Flash model card](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash)
 
 ## Launcher interface

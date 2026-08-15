@@ -117,8 +117,8 @@ CCCP использует настройку маршрутизации: кор�
 
 Источники:
 
-- [Исходный репозиторий эксперимента](https://github.com/Tylogi/TyloQuant)
-- [Протокол и полные результаты](https://github.com/Tylogi/TyloQuant/blob/master/README.zh-CN.md)
+- [Страница проекта CCCP](https://github.com/Value99/CCCP)
+- [Описание размера и точности CCCP](https://github.com/Value99/CCCP#стандартизированная-оценка)
 - [Официальная карточка DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash)
 
 ## Интерфейс запускатора
