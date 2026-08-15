@@ -1,13 +1,13 @@
 {
   "schema": "cccp-launcher-update-v1",
   "channel": "stable",
-  "version": "0.9.1",
-  "released_at": "2026-08-14T16:55:19+08:00",
-  "title": "CCCP 启动器 0.9.1",
-  "summary": "修复严格路由 Dense 层误判与组合 GU/Down Q4 解码，完成 GLM-5.2 通用回归。",
+  "version": "0.9.2",
+  "released_at": "2026-08-15T22:20:50+08:00",
+  "title": "CCCP 启动器 0.9.2",
+  "summary": "修复 Windows CUDA 异步批量传输崩溃，完善离线算子编译缓存、GPU 分级卸载和多模型推理链路。",
   "download": {
     "provider": "GitHub Releases",
-    "url": "https://github.com/Value99/CCCP/releases/tag/v0.9.1",
+    "url": "https://github.com/Value99/CCCP/releases/tag/v0.9.2",
     "extraction_code": ""
   },
   "github": {
@@ -16,8 +16,8 @@
   },
   "launcher": {
     "filename": "CCCP-Launcher.exe",
-    "size_bytes": 40762272,
-    "sha256": "55B22E983F1F22B52F56D31D233A391D55F98BBF5B689477F07F2444770C3888"
+    "size_bytes": 40778209,
+    "sha256": "696A72F3200BEAA023C53164F236BD2185DC30486D31F2288500681C0093EC10"
   },
   "runtime": {
     "python_required": false,
@@ -26,9 +26,10 @@
     "platform": "Windows x64"
   },
   "release_notes": [
-    "修复 Dense 层 0–2 被严格路由误判为少于模型 top-k=8。",
-    "修复组合 Gate+Up/Down Q4 专家的单 token 解码布局分派。",
-    "达到 max_tokens 后不再多执行一次无用的完整模型 decode。",
-    "完成 333.524 GiB GLM-5.2 模型的 4096-token 扫描、配置保存、加载与 GUI 生成回归。"
+    "修复 Windows/WDDM 原生批量 DMA 延迟触发 CUDA illegal memory access。",
+    "内置 CUDA/MSVC/Windows SDK/Ninja，按 SM75/86/89/90/120 自动编译并缓存融合算子。",
+    "GPU 容量按显存、主机内存、磁盘逐级降级，统一保留 1 GiB 显存安全余量。",
+    "关闭桌面应用会结束推理后端，并记忆主题与 CPU/NVIDIA/AMD 设备选择。",
+    "完成 DeepSeek-V4、GLM-5.2、Kimi K3 的配置驱动、训练扫描、KV 复用和 CPU/CUDA 回归。"
   ]
 }

@@ -8,13 +8,20 @@
   <a href="README.md">简体中文</a> · <a href="README_EN.md">English</a> · <strong>Русский</strong>
 </p>
 
-## ⬇️ Полный автономный пакет для Windows (v0.9.1)
+## ⬇️ Полный автономный пакет для Windows (v0.9.2)
 
-### [👉 Открыть страницу загрузки GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.1)
+### [👉 Открыть страницу загрузки GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.2)
 
-Для первой установки загрузите в одну папку Offline Setup EXE, файл `.parts.json` и все четыре части `.zip.001`–`.zip.004`. Затем запустите `CCCP-Launcher-0.9.1-Offline-Setup.exe`: установщик проверит, объединит и распакует файлы, покажет прогресс и запустит приложение. Для первой установки недостаточно скачать только отдельный EXE запуска.
+Для первой установки загрузите в одну папку Offline Setup EXE, файл `.parts.json` и все четыре части `.zip.001`–`.zip.004`. Затем запустите `CCCP-Launcher-0.9.2-Offline-Setup.exe`: установщик проверит, объединит и распакует файлы, покажет прогресс и запустит приложение. Для первой установки недостаточно скачать только отдельный EXE запуска.
 
-Автоматические ссылки `Source code (zip/tar.gz)` содержат только документацию, файлы версии и изображения этого публичного репозитория. Исходный код лаунчера, движка инференса и фреймворка квантования/обучения CCCP в них отсутствует.
+Автоматические ссылки `Source code (zip/tar.gz)` содержат только публичную документацию, изображения, метаданные версии и отдельный EXE обновления. Исходный код лаунчера, движка инференса и фреймворка квантования/обучения CCCP в них отсутствует.
+
+### Главное в версии 0.9.2
+
+- Исправлена отложенная ошибка CUDA illegal memory access из-за нативной пакетной DMA в Windows/WDDM. В Windows используется безопасная пакетная отправка слоя через скомпилированный модуль; Linux/TCC сохраняет нативный API.
+- В пакет включены CUDA, MSVC, Windows SDK и Ninja; слитые операторы автоматически собираются и кэшируются для SM75, SM86, SM89, SM90 и SM120.
+- Ёмкость понижается по цепочке VRAM → системная RAM → диск с единым резервом VRAM 1 GiB, без изменения числа экспертов и исходного top-k модели.
+- Закрытие приложения завершает backend инференса; тема и выбранное устройство сохраняются. Сборка прошла 270 автоматических проверок и тест на реальной NVIDIA GPU под Windows.
 
 <p align="center">
   <img src="assets/cccp-banner-centered-final.jpg" alt="C.C.C.P. — фреймворк динамических экспертов" width="100%">
@@ -26,7 +33,7 @@
 </p>
 
 <p align="center">
-  <img alt="Версия" src="https://img.shields.io/badge/release-v0.9.1-a52f25">
+  <img alt="Версия" src="https://img.shields.io/badge/release-v0.9.2-a52f25">
   <img alt="Платформа" src="https://img.shields.io/badge/platform-Windows%20x64-7a1e18">
   <img alt="Python" src="https://img.shields.io/badge/Python-%D0%BD%D0%B5%20%D1%82%D1%80%D0%B5%D0%B1%D1%83%D0%B5%D1%82%D1%81%D1%8F-c49543">
   <img alt="Устройство" src="https://img.shields.io/badge/default-CPU-3a2118">
@@ -126,8 +133,8 @@ CCCP использует настройку маршрутизации: кор�
 
 ## Быстрый старт
 
-1. Скачайте полный пакет Windows с [Baidu Netdisk](https://pan.baidu.com/s/14ichCAsXKZMUQInIwIfQcA?pwd=cccp), код извлечения: `cccp`.
-2. Полностью распакуйте архив в каталог с правом записи перед запуском программы.
+1. Скачайте Offline Setup, манифест частей и все четыре части из [GitHub Release v0.9.2](https://github.com/Value99/CCCP/releases/tag/v0.9.2).
+2. Запустите Offline Setup из каталога с правом записи и дождитесь проверки и распаковки.
 3. Поместите совместимую модель с файлом `cccp.json` в каталог `models` рядом с приложением.
 4. Дважды щёлкните `CCCP-Launcher.exe`.
 5. Выберите модель и профиль экспертов. Если профиля нет, можно выбрать полную загрузку модели.
@@ -208,7 +215,8 @@ for chunk in stream:
 
 | Платформа / оборудование | Объём проверки | Статус |
 | --- | --- | --- |
-| Windows 11 x64 · Core i9-13900H · 31,59 GiB RAM | Запускатор, EXE, CPU-инференс, OpenAI API, сканирование профилей и mapped-запуск модели DeepSeek-V4 размером 118,47 GiB; автоматические тесты `93 passed` | **Сквозная CPU-проверка пройдена**; GPU-пути приведены в отдельных аппаратных тестах ниже |
+| Windows 11 x64 · Core i9-13900H · 31,59 GiB RAM | Запускатор, EXE, CPU-инференс, OpenAI API, сканирование профилей и mapped-запуск модели DeepSeek-V4 размером 118,47 GiB; автоматические тесты `270 passed` | **Сквозная CPU-проверка пройдена**; GPU-пути приведены в отдельных аппаратных тестах ниже |
+| Windows 11 · NVIDIA RTX 3090 (лимит процесса 20 GiB) · CUDA 13 | DeepSeek-V4 в режиме ограниченной VRAM CUDA/RAM, прямая передача из locked RAM, strict LRU, fused decode и многотуровая генерация | **Аппаратный тест 0.9.2 пройден** |
 | NVIDIA RTX 5090 | Реальные CUDA/RAM-тесты DeepSeek-V4 и GLM-5.2 | **Движок протестирован** |
 | NVIDIA H20-3e (одна и несколько GPU) | DeepSeek-V4 TP1/TP4, GLM-5.2 TP2, Kimi K3 GPU+RAM/TP8 | **Движок протестирован** |
 | Двухсокетный CPU-сервер (96 физических ядер) | Общий CPU-бэкенд, кэш кодовых книг и runtime-образы для DeepSeek-V4 и Kimi K3 | **Движок протестирован** |
@@ -254,10 +262,10 @@ $release.launcher.sha256
 
 ## Ссылки
 
-- Скачать: [Baidu Netdisk · код cccp](https://pan.baidu.com/s/14ichCAsXKZMUQInIwIfQcA?pwd=cccp)
+- Скачать: [GitHub Release v0.9.2](https://github.com/Value99/CCCP/releases/tag/v0.9.2)
 - Сообщество: [Discord](https://discord.gg/eNnwmAUY4M)
 - Модели: [ModelScope · ValueFX](https://www.modelscope.cn/profile/ValueFX)
-- Исходный код: [GitHub · Value99/CCCP](https://github.com/Value99/CCCP)
+- Страница проекта: [GitHub · Value99/CCCP](https://github.com/Value99/CCCP)
 
 ---
 

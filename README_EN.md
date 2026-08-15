@@ -8,13 +8,20 @@
   <a href="README.md">简体中文</a> · <strong>English</strong> · <a href="README_RU.md">Русский</a>
 </p>
 
-## ⬇️ Download the complete Windows offline package (v0.9.1)
+## ⬇️ Download the complete Windows offline package (v0.9.2)
 
-### [👉 Open the GitHub Release download page](https://github.com/Value99/CCCP/releases/tag/v0.9.1)
+### [👉 Open the GitHub Release download page](https://github.com/Value99/CCCP/releases/tag/v0.9.2)
 
-For a first installation, download the Offline Setup EXE, the `.parts.json` manifest, and all four `.zip.001`–`.zip.004` parts into one folder. Then run `CCCP-Launcher-0.9.1-Offline-Setup.exe`; it verifies, joins, extracts, and launches the application with visible progress. Do not download only the standalone launcher EXE for a first installation.
+For a first installation, download the Offline Setup EXE, the `.parts.json` manifest, and all four `.zip.001`–`.zip.004` parts into one folder. Then run `CCCP-Launcher-0.9.2-Offline-Setup.exe`; it verifies, joins, extracts, and launches the application with visible progress. Do not download only the standalone launcher EXE for a first installation.
 
-The automatically generated `Source code (zip/tar.gz)` links contain only this public repository's documentation, version files, and images. They do not contain the launcher, inference-engine, or CCCP quantization/training source code.
+The automatically generated `Source code (zip/tar.gz)` links contain only public documentation, images, version metadata, and the standalone updater EXE. They do not contain the launcher, inference-engine, or CCCP quantization/training source code.
+
+### Highlights in 0.9.2
+
+- Fixes the delayed CUDA illegal-memory-access failure caused by native batch DMA on Windows/WDDM. Windows now uses safe compiled per-layer submission; Linux/TCC keeps the native batch API.
+- Bundles CUDA, MSVC, Windows SDK, and Ninja, with automatic cached fused-operator builds for SM75, SM86, SM89, SM90, and SM120.
+- Uses a VRAM → system RAM → disk capacity ladder with a unified 1 GiB VRAM reserve, without changing expert counts or the model's native top-k.
+- Closing the desktop app terminates the inference backend and device/theme choices persist. This build passed 270 automated checks and Windows NVIDIA hardware validation.
 
 <p align="center">
   <img src="assets/cccp-banner-centered-final.jpg" alt="C.C.C.P. Dynamic Expert Inference Framework" width="100%">
@@ -26,7 +33,7 @@ The automatically generated `Source code (zip/tar.gz)` links contain only this p
 </p>
 
 <p align="center">
-  <img alt="Release" src="https://img.shields.io/badge/release-v0.9.1-a52f25">
+  <img alt="Release" src="https://img.shields.io/badge/release-v0.9.2-a52f25">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20x64-7a1e18">
   <img alt="Python" src="https://img.shields.io/badge/Python-not%20required-c49543">
   <img alt="Device" src="https://img.shields.io/badge/default-CPU-3a2118">
@@ -126,8 +133,8 @@ Sources:
 
 ## Quick start
 
-1. Download the complete Windows package from [Baidu Netdisk](https://pan.baidu.com/s/14ichCAsXKZMUQInIwIfQcA?pwd=cccp), extraction code: `cccp`.
-2. Extract the complete package to a writable directory before launching it.
+1. Download the Offline Setup, parts manifest, and all four parts from [GitHub Release v0.9.2](https://github.com/Value99/CCCP/releases/tag/v0.9.2).
+2. Run the Offline Setup from a writable directory and wait for verification and extraction.
 3. Put a compatible model containing `cccp.json` in the `models` directory next to the application.
 4. Double-click `CCCP-Launcher.exe`.
 5. Select a model and an expert profile. A model can also be fully loaded when no profile is available.
@@ -208,7 +215,8 @@ Vision input is scheduled for a later release and will open after image preproce
 
 | Platform / hardware | Validation scope | Status |
 | --- | --- | --- |
-| Windows 11 x64 · Core i9-13900H · 31.59 GiB RAM | Launcher, EXE, CPU inference, OpenAI API, profile scanning, and mapped execution of a 118.47 GiB DeepSeek-V4 model; `93 passed` automated tests | **CPU end-to-end passed**; GPU paths are covered by separate hardware runs below |
+| Windows 11 x64 · Core i9-13900H · 31.59 GiB RAM | Launcher, EXE, CPU inference, OpenAI API, profile scanning, and mapped execution of a 118.47 GiB DeepSeek-V4 model; `270 passed` automated tests | **CPU end-to-end passed**; GPU paths are covered by separate hardware runs below |
+| Windows 11 · NVIDIA RTX 3090 (20 GiB process limit) · CUDA 13 | DeepSeek-V4 constrained-VRAM CUDA/RAM, direct pinned transfer, strict LRU, fused decode, and multi-turn generation | **0.9.2 hardware passed** |
 | NVIDIA RTX 5090 | Real CUDA/RAM runs with DeepSeek-V4 and GLM-5.2 | **Engine tested** |
 | NVIDIA H20-3e (single and multi-GPU) | DeepSeek-V4 TP1/TP4, GLM-5.2 TP2, and Kimi K3 GPU+RAM/TP8 | **Engine tested** |
 | Dual-socket CPU server (96 physical cores) | Shared CPU backend, codebook cache, and runtime images with DeepSeek-V4 and Kimi K3 | **Engine tested** |
@@ -254,10 +262,10 @@ Thanks to GitHub users [tmzncty](https://github.com/tmzncty) and [Zenon-Chen](ht
 
 ## Links
 
-- Download: [Baidu Netdisk · code cccp](https://pan.baidu.com/s/14ichCAsXKZMUQInIwIfQcA?pwd=cccp)
+- Download: [GitHub Release v0.9.2](https://github.com/Value99/CCCP/releases/tag/v0.9.2)
 - Community: [Discord](https://discord.gg/eNnwmAUY4M)
 - Models: [ModelScope · ValueFX](https://www.modelscope.cn/profile/ValueFX)
-- Source: [GitHub · Value99/CCCP](https://github.com/Value99/CCCP)
+- Project page: [GitHub · Value99/CCCP](https://github.com/Value99/CCCP)
 
 ---
 
