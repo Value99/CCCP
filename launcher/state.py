@@ -5,21 +5,18 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
 from typing import Any
 
 from .settings import DATA_DIR
+from .io_utils import atomic_write_text
 
 STATE_FILE = DATA_DIR / "state.json"
 
 
 def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 class AppState:
@@ -51,10 +48,12 @@ class AppState:
         self.save()
 
     # -- 发动记录 --
-    def record_launch(self, model: str, profiles: list[str], port: int) -> None:
+    def record_launch(
+        self, model: str, profiles: list[str], port: int, *, full_model: bool = False
+    ) -> None:
         self.data["last_launch"] = {
             "model": model, "profiles": list(profiles),
-            "port": port, "at": time.time(),
+            "port": port, "full_model": bool(full_model), "at": time.time(),
         }
         self.save()
 

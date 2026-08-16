@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "architecture": "glm",
+  "display_name": "GLM MoE（CCCP）",
+  "supports_parallel": true,
+  "tested_tp_min": 2,
+  "tested_tp_max": 8,
+  "defaults": {
+    "device": "cuda",
+    "max_ctx": 4096,
+    "max_new": 512,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "spec": 0,
+    "reasoning": "chat",
+    "host": "0.0.0.0",
+    "port": 8000,
+    "max_queue": 16
+  },
+  "environment": {
+    "CCCP_LATENT_KV": "1",
+    "CCCP_FLASHINFER_MLA": "1",
+    "CCCP_ATTENTION_GRAPH": "1",
+    "CCCP_VRAM_WATCH": "1",
+    "CCCP_CPU_THREADS": "auto",
+    "CCCP_CPU_NUMA": "auto",
+    "CCCP_CPU_VQ_INT8": "0",
+    "CCCP_RAM_RESERVE_GB": "2",
+    "CCCP_RESIDENT_RESERVE_GB": "2",
+    "CCCP_VRAM_RESERVE_GB": "1",
+    "CCCP_ROPE_INITIAL_CTX": "32768",
+    "CCCP_LATENT_KV_GRAPH_INITIAL": "32768"
+  },
+  "profiles": {
+    "ram": {
+      "description": "单卡计算；压缩专家常驻 RAM，按需进入显存缓存",
+      "tp": 1,
+      "environment": {
+        "CCCP_RAM_MIRROR": "0"
+      }
+    },
+    "parallel": {
+      "description": "多卡全显存专家并行；显存不足时引擎回退 RAM 模式",
+      "tp": 2,
+      "environment": {
+        "CCCP_RAM_MIRROR": "0"
+      }
+    }
+  }
+}

@@ -4,9 +4,10 @@ uvicorn[standard]>=0.29
 httpx>=0.27
 pydantic>=2.6
 PyYAML>=6.0
-# 模型下载(HuggingFace 源;ModelScope 可选 `pip install modelscope`)
+# 模型下载(ModelScope 默认，HuggingFace 备用；两者均随离线环境提供)
+modelscope>=1.38
 huggingface_hub>=0.24
-# 原生桌面窗口外壳(WebView2);缺失时降级为浏览器模式
+# 原生桌面窗口外壳(WebView2);启动器不会自动打开外部浏览器
 pywebview>=5.1
 # 开发/测试
 pytest>=8.0

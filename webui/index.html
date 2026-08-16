@@ -3,8 +3,32 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CCCP 启动器 · TPQ-Final</title>
-<link rel="stylesheet" href="style.css">
+<title>CCCP 启动器 · CCCP-Engine</title>
+<script>
+(() => {
+  let theme = "system";
+  try { theme = localStorage.getItem("theme") || "system"; } catch (_) {}
+  document.documentElement.dataset.theme = theme;
+  let pageLoaded = false, nativeReady = false, revealed = false;
+  const revealNativeWindow = () => {
+    if (!pageLoaded || !nativeReady || revealed) return;
+    revealed = true;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      document.documentElement.classList.add("app-painted");
+      window.pywebview?.api?.win_ready?.();
+    }));
+  };
+  window.addEventListener("pywebviewready", () => { nativeReady = true; revealNativeWindow(); }, { once: true });
+  window.addEventListener("load", () => { pageLoaded = true; revealNativeWindow(); }, { once: true });
+})();
+</script>
+<style>
+html,body{margin:0;background:#eee3cd}
+@media (prefers-color-scheme:dark){html[data-theme="system"],html[data-theme="system"] body{background:#1d0e0b}}
+html[data-theme="dark"],html[data-theme="dark"] body{background:#1d0e0b}
+</style>
+<link rel="icon" type="image/png" href="images/icon.png?v=0.9.3">
+<link rel="stylesheet" href="style.css?v=0.9.3">
 </head>
 <body>
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
@@ -20,21 +44,21 @@
   <symbol id="i-min" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/></symbol>
   <symbol id="i-max" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="14" height="14" rx="1.5"/></symbol>
   <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 14h10l1-14M10 11v6M14 11v6"/></symbol>
   <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></symbol>
   <symbol id="i-warn" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h0"/></symbol>
   <symbol id="i-cloud" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19a4.5 4.5 0 0 0 0-9 6 6 0 0 0-11.6 1.5A4 4 0 0 0 6 19z"/></symbol>
   <symbol id="i-download" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4z"/></symbol>
   <symbol id="i-folder" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
   <symbol id="i-database" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v6c0 1.7 4 3 9 3s9-1.3 9-3V5"/><path d="M3 11v6c0 1.7 4 3 9 3s9-1.3 9-3v-6"/></symbol>
   <symbol id="i-play" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4l14 8-14 8z"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="1"/></symbol>
   <symbol id="i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></symbol>
   <symbol id="i-discord" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 5a16 16 0 0 0-4-1l-.3.5a12 12 0 0 1 3.5 1.7 11 11 0 0 0-9.4 0A12 12 0 0 1 12.3 4.5L12 4a16 16 0 0 0-4 1C5 9 4 13 4 17a16 16 0 0 0 5 2l.6-1a10 10 0 0 1-2-1l.5-.4a11 11 0 0 0 9.8 0l.5.4a10 10 0 0 1-2 1l.6 1a16 16 0 0 0 5-2c0-4-1-8-3-12z"/><circle cx="9.5" cy="13" r="1"/><circle cx="14.5" cy="13" r="1"/></symbol>
 </svg>
 <div class="titlebar" id="titlebar">
-  <div class="tb-left">
-    <span class="tb-logo"><svg class="ic"><use href="#i-layers"/></svg></span>
-    <span class="tb-title">CCCP 启动器</span>
-  </div>
+  <div class="tb-drag" aria-hidden="true"></div>
   <div class="tb-right">
     <button class="tb-btn" id="tbMin" title="最小化"><svg class="ic"><use href="#i-min"/></svg></button>
     <button class="tb-btn" id="tbMax" title="最大化 / 还原"><svg class="ic"><use href="#i-max"/></svg></button>
@@ -45,7 +69,7 @@
   <!-- ============ 左侧导航 ============ -->
   <aside class="sidebar">
     <div class="side-brand">
-      <div class="logo-box"><svg class="ic"><use href="#i-layers"/></svg></div>
+      <div class="logo-box"><img src="images/icon.png?v=0.9.3" alt="CCCP"></div>
       <div>
         <div class="name">CCCP 启动器</div>
         <div class="sub">让人人都能运行顶级模型</div>
@@ -74,9 +98,9 @@
   <!-- ============ 首页(快速选择 + 一键启动)============ -->
   <section class="page active" id="page-home">
     <div class="hero">
-      <div class="hero-eyebrow">CCCP 启动器</div>
+      <div class="hero-eyebrow">CCCP 动态专家启动器</div>
       <h1>选模型、勾配置、一键启动</h1>
-      <p class="hero-sub">多选配置自动去重叠计费;启动就绪后到「聊天」页对话</p>
+      <p class="hero-sub">多选配置自动去重计费；启动后自动进入终端查看进度</p>
       <div class="hero-meta">
         <span class="state-pill hero-pill" id="homeStatusPill">未启动</span>
         <span class="hero-chip" id="homeSelChip">未选择模型 / 配置</span>
@@ -96,10 +120,10 @@
         <label class="fld">模型</label>
         <select id="homeModelSelect" style="width:100%"><option value="">— 未发现模型(「模型库」下载或「设置」添加目录)—</option></select>
         <label class="fld">配置(可多选,与「配置库」页同步)</label>
-        <div class="qchips" id="homeChips"></div>
+        <div class="qchips" id="homeChips"><div class="empty-placeholder compact"><span>正在加载配置…</span></div></div>
         <div class="q-summary" id="homeSummary">勾选配置后显示合计体积</div>
-        <div class="q-row"><span>TPQ API 端口</span><input id="homePortInput" type="number" value="8801" min="1024" max="65535">
-          <span>设备</span><select id="homeDeviceSelect"><option value="cuda">cuda</option><option value="cpu">cpu</option></select></div>
+        <div class="q-row"><span>CCCP API 端口</span><input id="homePortInput" type="number" value="8801" min="1024" max="65535">
+          <span>设备</span><select id="homeDeviceSelect"><option value="cpu">CPU</option><option value="cuda" disabled>NVIDIA CUDA</option><option value="amd" disabled>AMD ROCm/HIP</option></select></div>
       </div>
       <div class="card-box">
         <h3>上次启动</h3>
@@ -114,9 +138,9 @@
         <p class="hint">从社区下载他人分享的 profile;Discord 交流配置经验。</p>
         <div class="dock-row" style="margin-top:10px">
           <button class="primary sm" id="discordBtn"><svg class="ic"><use href="#i-discord"/></svg> Discord 社区</button>
-          <button class="ghost sm" id="goModelsBtn"><svg class="ic"><use href="#i-download"/></svg> 去下载模型</button>
+          <button class="ghost sm" id="goModelsBtn"><svg class="ic"><use href="#i-download"/></svg> ModelScope 模型</button>
         </div>
-        <div class="hint" id="communityCfgHint" style="margin-top:8px"></div>
+        <div class="hint" id="communityCfgHint"></div>
       </div>
     </div>
   </section>
@@ -125,57 +149,48 @@
   <section class="page" id="page-profiles">
     <div class="page-header">
       <h1>配置库</h1>
-      <p>专家组合详情与社区下载;多选自动去重叠,一键发动 TPQ-Final</p>
+      <p>选择模型，管理并组合它的专家配置</p>
     </div>
 
-    <div class="community-banner card-box">
-      <div class="cb-left">
-        <h3><svg class="ic"><use href="#i-cloud"/></svg> 社区配置下载</h3>
-        <p class="hint">粘贴 profile 文件 URL 直接安装;或「刷新社区列表」从索引挑选。</p>
+    <div class="card-box profile-model-picker">
+      <div>
+        <b>模型选择</b>
+        <span>选择模型后显示对应配置</span>
       </div>
-      <div class="cb-right">
-        <input id="communityUrlInput" placeholder="https://…/my-profile.yaml">
-        <button class="primary sm" id="communityInstallBtn">安装</button>
-        <button class="ghost sm" id="communityRefreshBtn">刷新社区列表</button>
-      </div>
-      <div id="communityList" class="community-list"></div>
+      <select id="modelSelect"><option value="">— 正在扫描本地模型 —</option></select>
     </div>
 
     <div class="stat-row">
       <div class="stat-card"><label>已选配置</label><div class="val"><b id="sumCount">0</b><span>个</span></div></div>
       <div class="stat-card"><label>合计专家</label><div class="val"><b id="sumExperts">0</b><span>去重后</span></div></div>
-      <div class="stat-card accent"><label>占用体积</label><div class="val"><b id="sumMem">0</b><span>GB</span></div></div>
-      <div class="stat-card save"><label>重叠节省</label><div class="val"><b id="sumOverlap">0</b><span>GB</span></div></div>
+      <div class="stat-card accent"><label>去重后配置体积</label><div class="val"><b id="sumMem">0</b><span>GiB</span></div></div>
+      <div class="stat-card save"><label>重复权重复用</label><div class="val"><b id="sumOverlap">0</b><span>GiB</span></div></div>
     </div>
 
-    <div class="drop-bar">
-      <label>drop 路由</label>
-      <span id="sumDrop" class="chips"></span>
-      <span id="perProfile" class="chips"></span>
-      <span class="note">体积为估算(未校准);多选时重叠专家只计一次</span>
+    <div class="drop-bar compact-summary">
+      <span class="note">卡片与上方汇总均显示配置总驻留；多选时固定权重和重复专家只计算一次。</span>
     </div>
 
-    <div class="cards" id="profileCards"></div>
+    <div class="cards" id="profileCards"><div class="empty-placeholder"><b>正在加载配置</b></div></div>
 
     <div class="dock">
       <div class="card-box">
         <div class="dock-row">
-          <select id="modelSelect" style="min-width:240px"><option value="">— 选择模型(先在「设置」加 model_roots)—</option></select>
           <select id="modeSelect">
-            <option value="auto">auto 自动</option>
-            <option value="ram">ram 内存驻留</option>
-            <option value="resident">resident 全显存</option>
-            <option value="mapped">mapped 弹性缓存</option>
-            <option value="parallel">parallel 多卡</option>
+            <option value="auto" selected>自动高速（全显存/内存优先，放不下逐级降级）</option>
+            <option value="mapped">强制硬盘映射（更省内存但更慢）</option>
           </select>
-          <select id="deviceSelect"><option value="cuda">cuda</option><option value="cpu">cpu</option></select>
-          <input id="portInput" type="number" value="8801" min="1024" max="65535" title="TPQ API 端口">
+          <select id="deviceSelect"><option value="cpu">CPU</option><option value="cuda" disabled>NVIDIA CUDA</option><option value="amd" disabled>AMD ROCm/HIP</option></select>
+          <input id="portInput" type="number" value="8801" min="1024" max="65535" title="CCCP API 端口">
         </div>
         <div class="dock-row">
-          <button class="primary big" id="launchBtn"><svg class="ic"><use href="#i-rocket"/></svg> 一键启动组合</button>
-          <button class="ghost" id="dryRunBtn">预检</button>
-          <button class="danger" id="stopBtn" disabled>停止</button>
-          <button class="ghost" id="importBtn">导入配置文件…</button>
+          <span class="hint">自动模式优先使用全显存或全内存，容量不足才降到弹性缓存和磁盘映射；强制硬盘会跳过高速驻留。专家数量始终不减少。</span>
+        </div>
+        <div class="dock-row">
+          <button class="primary launch-action" id="launchBtn"><svg class="ic"><use href="#i-rocket"/></svg> 一键启动组合</button>
+          <button class="ghost launch-action" id="dryRunBtn"><svg class="ic"><use href="#i-check"/></svg> 预检</button>
+          <button class="danger launch-action" id="stopBtn" disabled><svg class="ic"><use href="#i-x"/></svg> 停止</button>
+          <button class="ghost launch-action" id="importBtn"><svg class="ic"><use href="#i-folder"/></svg> 导入配置</button>
           <input type="file" id="importFile" accept=".yaml,.yml,.json" hidden>
           <span class="hint" id="launchHint"></span>
         </div>
@@ -197,25 +212,25 @@
         <h3><svg class="ic"><use href="#i-download"/></svg> 下载新模型</h3>
         <label class="fld">来源</label>
         <select id="dlSource">
-          <option value="hf">HuggingFace(经 hf_endpoint 镜像/官方)</option>
-          <option value="modelscope">ModelScope(需 pip install modelscope)</option>
+          <option value="modelscope" selected>ModelScope（默认，依赖已内置）</option>
+          <option value="hf">HuggingFace（经 hf_endpoint 镜像/官方）</option>
         </select>
         <label class="fld">仓库 ID</label>
-        <input id="dlRepo" placeholder="如 Qwen/Qwen2.5-7B-Instruct">
+        <input id="dlRepo" value="ValueFX/DeepSeek-V4-Flash-0731-CCCP-L" placeholder="如 ValueFX/DeepSeek-V4-Flash-0731-CCCP-L">
         <label class="fld">版本(revision,可空)</label>
         <input id="dlRevision" placeholder="main / tag / 分支">
         <label class="fld">下载到目录</label>
         <input id="dlTarget" placeholder="留空使用默认目录">
         <button class="primary" id="dlStartBtn" style="margin-top:12px;width:100%">开始下载</button>
-        <p class="hint">注:TPQ 启动要求 CCCP 归档(目录含 cccp.json);本页下载的通用权重需经 TPQ 工具链归档后方可被启动识别。</p>
+        <p class="hint">下载完成后会自动扫描模型与相邻配置；可启动仓库需包含 cccp.json。</p>
       </div>
       <div class="card-box">
         <h3>⏳ 下载任务</h3>
-        <div id="dlJobs" class="job-list"></div>
+        <div id="dlJobs" class="job-list"><div class="empty-placeholder compact"><span>正在读取下载任务…</span></div></div>
       </div>
       <div class="card-box span2">
         <h3><svg class="ic"><use href="#i-folder"/></svg> 本地模型(含 cccp.json,可直接启动)</h3>
-        <div id="localModels" class="model-list"></div>
+        <div id="localModels" class="model-list"><div class="empty-placeholder"><b>正在扫描本地模型</b></div></div>
       </div>
     </div>
   </section>
@@ -234,13 +249,15 @@
         </div>
         <div class="card-box">
           <span class="side-label">会话</span>
-          <div class="session-list" id="sessionList"></div>
+          <div class="session-list" id="sessionList"><div class="empty-placeholder compact"><span>正在读取会话…</span></div></div>
           <button class="ghost sm" id="newSessionBtn">＋ 新会话</button>
         </div>
         <div class="card-box">
           <span class="side-label">生成参数</span>
           <div class="param"><span>temperature</span><input id="tempInput" type="number" step="0.1" value="0.7" min="0" max="2"></div>
           <div class="param"><span>max_tokens</span><input id="maxTokInput" type="number" value="512" min="16" max="32768"></div>
+          <div class="param"><span>重复惩罚</span><input id="repPenaltyInput" type="number" step="0.05" value="1" min="0.1" max="2"></div>
+          <div class="param"><span>存在惩罚</span><input id="presencePenaltyInput" type="number" step="0.1" value="0" min="-2" max="2"></div>
         </div>
         <div class="card-box">
           <span class="side-label">上下文 profiles</span>
@@ -249,76 +266,114 @@
         </div>
       </aside>
       <div class="chat-main">
-        <div class="messages card-box" id="messages"></div>
-        <div class="composer">
-          <div class="card-box">
-            <textarea id="chatInput" rows="2" placeholder="输入消息… (Enter 发送 / Shift+Enter 换行)"></textarea>
-            <div class="composer-actions">
-              <button class="ghost sm" id="stopGenBtn" hidden>停止</button>
-              <button class="primary" id="sendBtn">发送</button>
+          <div class="messages card-box" id="messages"></div>
+          <div class="composer">
+            <div class="card-box">
+              <textarea id="chatInput" rows="1" placeholder="输入消息… (Enter 发送 / Shift+Enter 换行)"></textarea>
+              <div class="composer-bottom">
+                <div class="composer-actions">
+                  <div class="thinking-control">
+                  <button class="thinking-trigger" id="thinkingBtn" type="button" aria-haspopup="dialog" aria-expanded="false">思考 · 自动</button>
+                  <div class="thinking-popover" id="thinkingPopover" role="dialog" aria-label="思考强度" hidden>
+                    <div class="thinking-pop-head"><span>思考强度</span><b id="thinkingValue">自动识别</b></div>
+                    <input id="thinkingRange" type="range" min="0" max="5" step="1" value="0" aria-label="思考强度滑杆">
+                    <div class="thinking-scale" id="thinkingScale" aria-hidden="true"><span>自动</span><span>关</span><span>低</span><span>中</span><span>高</span><span>最大</span></div>
+                    <p id="thinkingHint">自动采用当前模型声明的默认思考能力；关闭时不生成思考内容。</p>
+                  </div>
+                </div>
+                  <button class="primary" id="sendBtn">发送</button>
+                </div>
+              </div>
             </div>
           </div>
         </div>
       </div>
-    </div>
   </section>
 
   <!-- ============ 训练 ============ -->
   <section class="page" id="page-training">
     <div class="page-header">
       <h1>训练</h1>
-      <p>语料经 CPU / 硬盘全量推理,统计激活专家偏好,可按目标体积反向规划</p>
+      <p>按 token 扫描完整角色对话，查看专家热力图并按覆盖率生成可分享配置</p>
     </div>
     <div class="train-grid">
       <div class="card-box">
-        <h3>语料</h3>
+        <h3>语料库 <span class="state-pill" id="corpusCount">0 个文件</span></h3>
         <div class="dock-row">
-          <button class="ghost" id="corpusBtn">上传语料…</button>
+          <button class="ghost" id="corpusBtn"><svg class="ic"><use href="#i-folder"/></svg> 上传语料</button>
           <input type="file" id="corpusFile" accept=".jsonl,.txt" multiple hidden>
         </div>
-        <div id="corpusList" class="file-list"></div>
-        <p class="hint">jsonl: {"prompt": "…"} / {"text": "…"} / {"messages": [...]};txt: 每行一条。</p>
+        <div class="corpus-guide">
+          <b>支持 UTF-8 JSONL / TXT</b>
+          <code>JSONL 推荐每行：{"messages":[{"role":"system","content":"角色设定…"},{"role":"user","content":"…"},{"role":"assistant","content":"…"}]}</code>
+          <code>也支持每行 {"prompt":"…"}、{"text":"…"} 或 {"content":"…"}，按单条 user 消息处理。</code>
+          <code>TXT：每个非空行作为一条样本；以 # 开头的行忽略。</code>
+          <span>上传后复制到应用目录 <b>data/corpus</b>，关闭启动器后仍可复用。勾选决定本次扫描使用哪些文件。</span>
+        </div>
+        <div id="corpusList" class="file-list"><div class="empty-placeholder"><b>正在读取语料</b></div></div>
       </div>
 
       <div class="card-box">
         <h3>扫描配置</h3>
         <div class="field-block">
-          <span class="fb-label">模式</span>
-          <div class="seg-group">
-            <input type="radio" name="tmode" id="tmode-cpu" value="cpu" checked><label for="tmode-cpu">CPU 全量推理</label>
-            <input type="radio" name="tmode" id="tmode-disk" value="disk"><label for="tmode-disk">硬盘(离线)推理</label>
+          <span class="fb-label">对应模型</span>
+          <select id="trainModelSelect"><option value="">— 请选择模型 —</option></select>
+          <span class="hint" id="trainModelLimit">选择模型后自动读取聊天模板、层数、专家数与上下文上限</span>
+        </div>
+        <div class="field-block">
+          <span class="fb-label">扫描加载策略</span>
+          <div class="seg-group training-mode">
+            <input type="radio" name="tmode" id="tmode-auto" value="auto" checked><label for="tmode-auto"><b>自动高速</b><small>优先全内存/全显存；放不下再逐级降级</small></label>
+            <input type="radio" name="tmode" id="tmode-disk" value="disk"><label for="tmode-disk"><b>强制硬盘</b><small>直接使用映射/磁盘，内存压力小但更慢</small></label>
           </div>
         </div>
         <div class="field-block">
-          <span class="fb-label">目标体积 GB(0=不限)</span>
-          <input id="targetGb" type="number" value="128" min="0" step="1">
-          <input id="targetGbRange" type="range" min="0" max="1024" value="128" style="margin-top:6px">
+          <span class="fb-label">扫描 token 总量</span>
+          <input id="tokenBudget" type="number" value="500000" min="4096" max="20000000" step="4096">
+          <span class="hint">包括 system、user 与语料中已有的 assistant 回答。建议正式配置至少扫描 500,000 token；较小数值可用于验证流程。系统会按可用内存自动选择最快安全批量。</span>
         </div>
-        <div class="field-block">
-          <span class="fb-label">采样上限</span>
-          <input id="sampleLimit" type="number" value="2000" min="10" step="100">
+        <div class="scan-method">
+          <b>纯 prefill 路由扫描</b>
+          <span>完整保留消息角色与长 system 上下文；已有回答直接 teacher-forcing，不额外生成内容。</span>
+          <span><strong>4096 token/块</strong> · 每层按专家聚合 token 后批量 GEMM · 换层释放动态专家 · 实时进度 · 结束后按热力图选择覆盖率</span>
         </div>
-        <div class="field-block">
-          <span class="fb-label">关联 profiles</span>
-          <select id="relatedProfiles" multiple size="4"></select>
-        </div>
-        <div class="hint">当前为估算模式(heuristic-fallback);TPQ 路由计数接口(I-3)就绪后自动切换 calibrated。</div>
-        <button class="primary" id="trainStartBtn" style="margin-top:16px"><svg class="ic"><use href="#i-chart"/></svg> 开始扫描</button>
+        <button class="primary" id="trainStartBtn"><svg class="ic"><use href="#i-chart"/></svg> 开始 token 扫描</button>
       </div>
 
       <div class="card-box">
-        <h3>任务</h3>
-        <div id="jobList" class="job-list"></div>
+        <h3>扫描与配置 <span class="state-pill" id="jobCount">0 个</span></h3>
+        <div id="jobList" class="job-list"><div class="empty-placeholder"><b>正在读取扫描任务</b></div></div>
         <div id="jobDetail" class="job-detail" hidden>
           <h4 id="jobDetailTitle"></h4>
           <div id="jobDetailMeta" class="mono dim"></div>
-          <div class="bars" id="topExperts"></div>
-          <div class="dock-row">
-            <button class="ghost sm" data-export="scores">下载 scores.json</button>
-            <button class="ghost sm" data-export="counts">下载 profile.json(counts)</button>
-            <button class="ghost sm" data-export="profile">下载 profile.yaml</button>
-            <button class="primary sm" id="registerBtn">注册为 trained profile</button>
-            <button class="danger sm" id="jobDeleteBtn">删除任务</button>
+          <div class="heatmap-section" id="heatmapSection" hidden>
+            <div class="heatmap-head"><b>专家热力图</b><span>纵向=层 · 横向=专家编号 · 每层独立归一化，越亮表示在本层越热</span></div>
+            <div class="heatmap-wrap"><canvas id="expertHeatmap" width="768" height="172"></canvas><div id="heatmapTip" class="heatmap-tip" hidden></div></div>
+            <div class="field-block coverage-field">
+              <div class="coverage-label"><span>路由覆盖率</span><b id="coverageValue">95.0%</b></div>
+              <input id="coverageRange" type="range" min="1" max="100" step="0.5" value="95">
+              <span class="hint">每层独立达到相同的真实命中覆盖率：分布均匀的层会保留更多专家，集中的层更少；无论覆盖率多低，每层都至少保留模型原生 top-k。低覆盖率可生成较小配置，但更依赖当前语料，回答质量风险更高；100% 表示本次语料中所有命中过的专家。</span>
+            </div>
+            <div class="coverage-stats">
+              <div><span>选中专家</span><b id="coverageExperts">—</b></div>
+              <div><span>动态专家</span><b id="coverageDynamic">—</b></div>
+              <div><span>固定权重</span><b id="coverageFixed">—</b></div>
+              <div><span>预计总驻留</span><b id="coverageTotal">—</b></div>
+            </div>
+            <div class="field-block final-profile-fields" hidden>
+              <span class="fb-label">配置名称</span>
+              <input id="finalProfileName" maxlength="80" placeholder="例如：爱情类角色扮演">
+              <span class="fb-label">配置介绍</span>
+              <textarea id="finalProfileDescription" maxlength="1000" rows="3" placeholder="说明适用场景、人物风格和语料方向；保存后可在配置库管理和分享。"></textarea>
+              <span class="hint">同一份热力图可以调整覆盖率并以不同名称多次保存，例如 32G 版、64G 版；每份配置独立保留，不需要重新扫描。</span>
+            </div>
+          </div>
+          <details class="expert-detail">
+            <summary>查看完整专家配置</summary>
+            <div id="jobExperts" class="expert-table"></div>
+          </details>
+          <div class="dock-row" id="profileSaveActions" hidden>
+            <button class="primary sm" id="registerBtn">保存配置</button>
           </div>
         </div>
       </div>
@@ -329,18 +384,24 @@
   <section class="page" id="page-terminal">
     <div class="page-header">
       <h1>终端</h1>
-      <p>TPQ 进程输出与启动器日志(页面可见时每 3s 刷新)</p>
+      <p>模型加载进度、CCCP 进程输出与启动器日志</p>
       <div class="spacer"></div>
       <button class="ghost sm" id="termRefreshBtn">刷新</button>
     </div>
-    <div class="term-grid">
-      <div class="card-box term-box">
-        <h3>TPQ 进程输出</h3>
-        <pre class="term" id="termTpq">—</pre>
+    <div class="terminal-stack">
+      <div class="card-box terminal-status" id="terminalStatus">
+        <div class="terminal-status-head">
+          <div><b id="termStage">尚未启动</b><span id="termDetail">请选择模型与配置后启动</span></div>
+          <strong id="termPercent">0%</strong>
+        </div>
+        <div class="load-progress" role="progressbar" aria-label="模型加载进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="termProgress">
+          <div id="termProgressBar" style="width:0%"></div>
+        </div>
+        <div class="terminal-meta" id="termMeta">等待启动任务</div>
       </div>
-      <div class="card-box term-box">
-        <h3>启动器日志</h3>
-        <pre class="term" id="termApp">—</pre>
+      <div class="card-box term-box terminal-unified">
+        <h3>实时运行日志</h3>
+        <pre class="term" id="termOutput">—</pre>
       </div>
     </div>
   </section>
@@ -358,15 +419,15 @@
         <h3>OpenAI 兼容服务 <span class="state-pill off" id="apiStatePill">未就绪</span></h3>
         <div class="kv"><span>Base URL</span><b id="apiBase">—</b></div>
         <div class="kv"><span>对话端点</span><b id="apiEndpoint">—</b></div>
-        <div class="kv"><span>鉴权(TPQ_API_KEY)</span><span class="state-pill off" id="apiAuthPill">未启用</span></div>
+        <div class="kv"><span>API 鉴权</span><span class="state-pill off" id="apiAuthPill">未启用</span></div>
         <div class="kv"><span>当前模型</span><b id="apiModel">—</b></div>
+        <div class="api-key-actions"><button class="ghost sm" id="apiCopyKeyBtn" hidden>复制 API Key</button></div>
         <pre id="apiCurl">curl 示例加载中…</pre>
       </div>
       <div class="card-box api-card">
         <h3>REST 端点(本启动器)</h3>
         <ul id="apiEndpoints"></ul>
-        <p class="hint">第三方直接调用 OpenAI 端点即可;管理端点以 /api/ 前缀。
-        TPQ-Final 集成契约见 docs/INTERFACE.md(I-0 落地,I-1~I-5 待 TPQ 开发)。</p>
+        <p class="hint">第三方可直接调用 OpenAI 兼容端点；启动器管理端点使用 /api/ 前缀。模型规格、专家体积、路由统计与加载状态会由接口实时返回。</p>
       </div>
     </div>
   </section>
@@ -375,13 +436,12 @@
   <section class="page" id="page-settings">
     <div class="page-header">
       <h1>设置</h1>
-      <p>TPQ-Final 集成与模型扫描配置</p>
+      <p>内置 CCCP Engine 与三套推理环境自动探测；这里只配置模型与使用偏好</p>
     </div>
     <div class="settings-grid">
       <div class="card-box">
-        <h3 style="font-size:14px">集成设置</h3>
-        <label>TPQ-Final 路径(tpq_path;留空自动探测 ../TPQ-Final)</label>
-        <input id="setTpqPath" type="text" placeholder="C:\Users\tylog\Desktop\5090\TPQ-Final">
+        <h3 style="font-size:14px">模型目录</h3>
+        <p class="hint">CCCP Engine、CPU、NVIDIA CUDA 和 AMD ROCm/HIP 环境均随发行目录内置并自动发现，无需也不允许手填运行路径。</p>
         <label>模型扫描根目录(model_roots,每行一个;扫描其中含 cccp.json 的子目录)</label>
         <textarea id="setModelRoots" placeholder="D:\models"></textarea>
         <div class="dock-row" style="margin-top:12px">
@@ -398,39 +458,83 @@
           <option value="dark">深色</option>
         </select>
       </div>
+      <div class="card-box api-key-settings">
+        <h3 style="font-size:14px">OpenAI API 鉴权</h3>
+        <label class="theme-check"><input type="checkbox" id="setApiAuthEnabled"><span class="theme-check-box" aria-hidden="true"><svg class="ic"><use href="#i-check"/></svg></span><span>启用 Bearer API Key</span></label>
+        <div class="api-key-row">
+          <input type="password" id="setApiKey" maxlength="512" autocomplete="new-password" placeholder="点击生成，或粘贴自定义 Key">
+          <button class="ghost sm" id="toggleApiKeyBtn" type="button">显示</button>
+        </div>
+        <div class="dock-row api-key-buttons">
+          <button class="ghost sm" id="generateApiKeyBtn" type="button">生成新 Key</button>
+          <button class="ghost sm" id="copyApiKeyBtn" type="button">复制</button>
+          <button class="primary sm" id="saveApiKeyBtn" type="button">保存鉴权</button>
+        </div>
+        <p class="hint api-key-note">仅保护 /v1 OpenAI 兼容接口；Key 保存在本机 data/settings.json，不会写入或导出专家配置。运行中更换 Key 前需先停止模型。</p>
+        <span class="hint" id="apiKeyHint"></span>
+      </div>
       <div class="card-box">
-        <h3 style="font-size:14px">运行环境(CUDA / CPU)</h3>
+        <h3 style="font-size:14px">运行环境（CPU / CUDA / AMD 探测）</h3>
         <div id="sysInfo" class="hint">检测中…</div>
         <label>默认推理设备(default_device,同步到首页与配置库下拉)</label>
         <select id="setDefaultDevice">
-          <option value="cuda">cuda(GPU 优先)</option>
-          <option value="cpu">cpu(纯 CPU)</option>
+          <option value="cpu">CPU（纯 CPU）</option>
+          <option value="cuda">NVIDIA CUDA（独立环境）</option>
+          <option value="amd">AMD ROCm/HIP（独立环境）</option>
         </select>
-      </div>
-      <div class="card-box">
-        <h3 style="font-size:14px">社区与下载</h3>
-        <label>Discord 社区链接(discord_url,首页/配置库展示)</label>
-        <input id="setDiscord" placeholder="https://discord.gg/…">
-        <label>社区配置索引 URL(community_index_url)</label>
-        <input id="setIndexUrl" placeholder="https://…/profiles.json">
-        <label>HuggingFace 端点(hf_endpoint,镜像或官方)</label>
-        <input id="setHfEndpoint" placeholder="https://hf-mirror.com">
-        <label>模型默认下载目录(model_download_dir)</label>
-        <input id="setDlDir" placeholder="D:\models">
+        <p class="hint">缓存与上下文按配置体积和设备余量计算；CPU 线程按物理核心和混合架构计算；CPU 使用最快的 Q4 执行映像；内存警戒线直接读取当前 RAM/VRAM。</p>
       </div>
       <div class="card-box">
         <h3 style="font-size:14px">关于</h3>
         <div class="about-kv"><span>版本</span><b id="aboutVer">—</b></div>
-        <div class="about-kv"><span>TPQ-Final</span><b id="aboutTpq">—</b></div>
-        <div class="about-kv"><span>接口契约</span><b>docs/INTERFACE.md</b></div>
-        <p class="hint">CCCP 启动器不修改 TPQ-Final 任何文件,仅通过子进程 / HTTP / 约定文件集成。
-        待 TPQ 侧开发的接口需求 I-1~I-5 见契约文档。</p>
+        <div class="about-kv"><span>CCCP-Engine</span><b id="aboutCccp">—</b></div>
+        <div class="about-kv"><span>接口</span><b>OpenAI 兼容 API</b></div>
+        <div class="dock-row update-settings-row">
+          <button class="ghost sm" id="checkUpdateBtn" type="button"><svg class="ic"><use href="#i-refresh"/></svg>检查更新</button>
+          <span class="hint" id="updateCheckHint">启动后会在后台自动检查，不影响程序使用。</span>
+        </div>
+        <p class="hint">引擎与运行环境由发行目录自动发现；模型可放在其他磁盘，通过“模型扫描根目录”添加。</p>
       </div>
     </div>
   </section>
 
   </main>
 </div>
-<script src="app.js"></script>
+<div class="update-overlay" id="profileEditOverlay" role="dialog" aria-modal="true" aria-labelledby="profileEditTitle" hidden>
+  <form class="update-dialog profile-edit-dialog" id="profileEditForm">
+    <div class="update-icon"><svg class="ic"><use href="#i-edit"/></svg></div>
+    <div class="update-copy">
+      <span class="update-source">专家配置</span>
+      <h2 id="profileEditTitle">编辑名称与说明</h2>
+      <label for="profileEditName">配置名称</label>
+      <input id="profileEditName" maxlength="80" required autocomplete="off">
+      <label for="profileEditDescription">配置说明</label>
+      <textarea id="profileEditDescription" maxlength="1000" rows="4" placeholder="说明这份配置适合的任务、角色或语料特点"></textarea>
+      <p class="hint">只修改配置资料，不会改变专家编号、模型指纹或权重文件。</p>
+    </div>
+    <div class="update-actions">
+      <button class="ghost" id="profileEditCancel" type="button">取消</button>
+      <button class="primary" id="profileEditSave" type="submit"><svg class="ic"><use href="#i-check"/></svg>保存</button>
+    </div>
+  </form>
+</div>
+<div class="update-overlay" id="updateOverlay" role="dialog" aria-modal="true" aria-labelledby="updateTitle" hidden>
+  <div class="update-dialog">
+    <div class="update-icon"><svg class="ic"><use href="#i-download"/></svg></div>
+    <div class="update-copy">
+      <span class="update-source" id="updateSource">检测到更新</span>
+      <h2 id="updateTitle">发现新版本</h2>
+      <p id="updateSummary"></p>
+      <ul id="updateNotes"></ul>
+      <p class="hint" id="updateVersions"></p>
+    </div>
+    <div class="update-actions">
+      <button class="ghost" id="updateLaterBtn" type="button">稍后提醒</button>
+      <button class="ghost" id="updateIgnoreBtn" type="button">本版本不升级</button>
+      <button class="primary" id="updateOpenBtn" type="button"><svg class="ic"><use href="#i-download"/></svg><span id="updateOpenText">前往下载</span></button>
+    </div>
+  </div>
+</div>
+<script src="app.js?v=0.9.3"></script>
 </body>
 </html>

@@ -9,7 +9,10 @@ _records: deque[str] = deque(maxlen=_CAPACITY)
 _attached = False
 
 # 前端轮询类 access 噪音过滤(只滤轮询行,保留真实业务日志)
-_NOISE = ('"/api/terminal', '"GET /api/health', '"GET /api/launch/status')
+_NOISE = (
+    '"/api/terminal', '"GET /api/health', '"GET /api/launch/status',
+    '/health "HTTP/1.1',
+)
 
 
 class _RingHandler(logging.Handler):

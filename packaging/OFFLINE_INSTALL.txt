@@ -1,0 +1,37 @@
+CCCP Launcher {version} 完整离线版
+================================
+
+下载要求
+--------
+请把本 Release 中下列文件放在同一个文件夹：
+
+1. CCCP-Launcher-{version}-Offline-Setup.exe
+2. CCCP-Launcher-v{version}-offline.parts.json
+3. 所有 CCCP-Launcher-v{version}-win-x64-offline.zip.001、.002……分卷
+
+首次使用
+--------
+双击 CCCP-Launcher-{version}-Offline-Setup.exe。
+
+安装器会显示进度，依次完成分卷 SHA-256 校验、合并和解压，随后自动启动
+CCCP-Launcher.exe。它不会安装 Python，不会联网下载依赖，也不会修改系统
+PATH；本质上只是把完整便携目录解压到当前文件夹。
+
+以后使用
+--------
+直接双击解压目录中的 CCCP-Launcher.exe，不会再次解压。
+
+包内包含
+--------
+CPU、NVIDIA CUDA、AMD ROCm/HIP 三套独立 Python/PyTorch 环境、Miniconda、
+CCCP-Engine、预编译 CPU 算子和首次 GPU/应急 CPU 编译工具链。
+
+包内不包含
+--------
+模型权重、特定模型配置和显卡驱动。模型请放到解压目录的 models 文件夹。
+显卡驱动仍由 Windows/显卡厂商提供。
+
+完整性
+--------
+SHA256SUMS.txt 列出安装器、清单和每个分卷的哈希。安装器也会在解压前自动
+校验分卷与完整 ZIP；任何一个分卷损坏都会停止，不会运行不完整环境。

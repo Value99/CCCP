@@ -1,0 +1,35 @@
+{
+  "schema": "cccp-launcher-update-v1",
+  "channel": "stable",
+  "version": "0.9.3",
+  "released_at": "2026-08-16T12:50:00+08:00",
+  "title": "CCCP 启动器 0.9.3",
+  "summary": "新增通用 Dense VQ 与 Qwen3.5 实模支持，完善 Kimi 组合投影融合执行器和 AMD TokenGraph 真实性门禁。",
+  "download": {
+    "provider": "GitHub Releases",
+    "url": "https://github.com/Value99/CCCP/releases/tag/v0.9.3",
+    "extraction_code": ""
+  },
+  "github": {
+    "repository": "https://github.com/Value99/CCCP.git",
+    "star_recommended": true
+  },
+  "launcher": {
+    "filename": "CCCP-Launcher.exe",
+    "size_bytes": 40782034,
+    "sha256": "BFA4795020E4FAF57DE2277E9165A1FCCE95AA2F72CA901F2618CDE703C4EDBB"
+  },
+  "runtime": {
+    "python_required": false,
+    "dependencies_bundled": true,
+    "default_device": "cpu",
+    "platform": "Windows x64"
+  },
+  "release_notes": [
+    "Qwen3.5 Dense VQ 由 cccp.json 通用识别，完整加载且不显示专家训练或专家配置。",
+    "H20 单卡 Qwen3.5 实模 Prefill 约 527 token/s、Decode 约 55.56 token/s。",
+    "Kimi 10/15 行组合投影统一进入 packed grouped 融合执行器；DSV4、Kimi、GLM 实模回归通过。",
+    "AMD 全显存推理必须显示 hip.tp1-token-graph 和有效 Graph 提交，旧执行器会被明确拒绝。",
+    "自动化回归 313 passed、11 skipped；CPU 功能通过，但本版不承诺达到目标吞吐。"
+  ]
+}

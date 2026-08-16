@@ -1,73 +1,30 @@
-# WINUI-EXE — TPQ-Final 启动器
+# CCCP 动态专家启动器
 
-面向 **TPQ-Final** 的桌面启动器:深色原生窗口(pywebview/WebView2,打包为单个 EXE),
-以"领域配置文件(Profile)"驱动 MoE 专家加载,提供聊天、配置、训练、API 服务四个选项卡。
+Windows x64 离线桌面启动器，用于加载 CCCP MoE 模型、专家配置以及清单声明的 Dense VQ 模型。它不会生成、裁剪或改写模型权重，也不会减少专家或修改模型原生 top-k。
 
-> 本仓库**不修改 TPQ-Final 的任何文件**,只通过子进程 CLI / OpenAI HTTP / 约定文件三种外部方式集成。
-> 集成契约与待 TPQ 侧开发的需求单见 [docs/INTERFACE.md](docs/INTERFACE.md)。
+## 使用
 
-## 功能概览
+1. 保持发行目录完整，将模型放入 `models`，或在设置中添加外部模型目录。
+2. 双击 `CCCP-Launcher.exe`。
+3. 在首页选择模型与配置，预检后启动。
+4. 模型加载、内存/磁盘卸载和错误信息在终端页查看。
 
-| 选项卡 | 功能 |
-|---|---|
-| 聊天 Chat | 选择 profile 组合 → 发动 TPQ-Final → SSE 流式对话 |
-| 配置 Profiles | 内置 角色扮演 / Python 代码 / 合同处理;显示专家数与占用体积;**多选组合按专家 key 去重实时重算**(重叠只计一次);内置 `drop` 占位专家自动路由到最相关专家;支持导入 YAML/JSON |
-| 训练 Training | 语料经 CPU / disk 全量推理统计激活专家偏好;支持设定目标体积反向推荐专家子集;TPQ 未提供路由统计前为启发式估算(UI 显著标注) |
-| API 服务 | OpenAI 兼容 `/v1/chat/completions` 代理 + profile / launch / training REST |
-| 外壳 | pywebview 原生深色窗口(WebView2),失败时自动降级为浏览器;PyInstaller onefile `dist/TPQ-WinUI.exe` |
+发行目录包含 CPU、NVIDIA CUDA、AMD ROCm/HIP 三套环境、Miniconda、CCCP-Engine 和离线算子编译工具，不需要另装 Python 或软件依赖。GPU 驱动由操作系统提供。
 
-## 快速开始
+## 主要功能
 
-```bash
-# Python >= 3.10,Windows Git Bash
-cd WINUI-EXE
-python -m venv .venv && . .venv/Scripts/activate
-pip install -r requirements.txt
+- 多份专家配置自动去重，重复专家只加载和计费一次。
+- Dense VQ 模型按 `cccp.json` 自动识别并直接加载完整模型；这类模型没有动态专家，界面不会要求选择配置，也不会开放专家训练。
+- 没有配置时支持全量专家加载；GPU 会区分 CUDA 最低工作集与全速建议显存，小显卡先自动降低上下文、缩小专家块并使用主机内存，仍低于硬需求时明确建议切换 CPU；主机内存不足才降级到磁盘映射。
+- 从角色对话语料执行 4096-token 分块 prefill，生成专家热力图和模型专用配置。
+- 聊天支持流式生成、停止、回退、思考强度、重复惩罚和存在惩罚。
+- 提供 OpenAI 兼容 API、本地 API Key和后台非阻塞更新检查。
+- 模型、配置、语料和训练结果均可在界面中管理。
 
-# 启动(默认自动探测 ../TPQ-Final;原生窗口,失败降级浏览器)
-python -m launcher.app --host 127.0.0.1 --port 8790
-```
+发行包不包含模型权重，也不内置任何特定模型配置。
 
-## 打包为桌面应用
+## 基础文档
 
-```bash
-bash scripts/build_app.sh    # 产出 dist/TPQ-WinUI.exe
-```
-
-## 验证
-
-```bash
-python -m pytest tests/ -q   # 单元测试(重叠算数/drop 路由/训练规划/导出 schema)
-bash scripts/smoke.sh        # 端到端冒烟(不加载真模型)
-```
-
-## 目录结构
-
-```
-WINUI-EXE/
-├── launcher/            # FastAPI 后端
-│   ├── app.py           # 入口 / CLI
-│   ├── profiles.py      # Profile 模型/注册表/重叠体积/drop 路由/导入
-│   ├── tpq_adapter.py   # 与 TPQ-Final 的唯一集成层(不改动对方代码)
-│   ├── chat.py          # OpenAI 兼容聊天代理(SSE 透传)
-│   ├── training.py      # 语料扫描引擎 + 目标体积规划 + 导出
-│   ├── state.py         # data/ 轻量持久化
-│   └── shell/           # pywebview 原生深色窗口外壳(降级浏览器)
-├── webui/               # 深色 SPA(原生 HTML/JS/CSS,无构建链)
-├── app_entry.py         # PyInstaller 冻结入口(解决相对导入)
-├── profiles/builtin/    # 内置领域配置文件(可被导入的同名 id 覆盖)
-├── docs/INTERFACE.md    # ⇄ TPQ-Final 接口契约(I-0 落地;I-1~I-5 待 TPQ 开发)
-├── tests/               # pytest 单元测试
-├── scripts/             # build_app / smoke
-└── packaging/           # PyInstaller spec
-```
-
-## Git 工作流
-
-- 分支:`main`(可发布基线)、`feat/<scope>` 功能分支、`fix/<scope>` 修复分支。
-- 提交:Conventional Commits(`feat:/fix:/docs:/chore:/refactor:/test:`),一个模块一个 commit。
-- 合并:功能分支 → `main` 用 `--no-ff` 并写合并要点;里程碑打 tag(`v0.1.0` …)。
-
-## 许可证
-
-与 TPQ-Final 保持一致;本仓库代码 MIT。
+- [中文使用手册](docs/中文使用手册.md)
+- [离线环境说明](docs/依赖与离线环境说明.md)
+- [AMD 显卡使用说明](docs/AMD核显兼容性说明.md)

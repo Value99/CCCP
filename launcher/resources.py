@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -14,7 +15,7 @@ def is_frozen() -> bool:
 
 
 def bundle_root() -> Path:
-    """只读资源根(webui/ 前端、profiles/builtin 等被打包的内容)。"""
+    """只读资源根（冻结版中主要包含 webui/ 和中文文档）。"""
     if is_frozen():
         return Path(sys._MEIPASS)  # type: ignore[attr-defined]
     return Path(__file__).resolve().parent.parent
@@ -31,10 +32,6 @@ def webui_static() -> Path:
     return bundle_root() / "webui"
 
 
-def builtin_profile_dir() -> Path:
-    return bundle_root() / "profiles" / "builtin"
-
-
 def data_dir() -> Path:
     d = runtime_root() / "data"
     d.mkdir(parents=True, exist_ok=True)
@@ -48,10 +45,61 @@ def user_profile_dir() -> Path:
     return d
 
 
-def detect_tpq_path() -> Path | None:
-    """WINUI-EXE(或 exe)的兄弟目录 TPQ-Final;冻结时也允许上一级(开发布局)。"""
-    for base in (runtime_root().parent, bundle_root().parent):
-        cand = base / "TPQ-Final"
-        if (cand / "tpq" / "__main__.py").exists():
-            return cand
+def operator_cache_dir() -> Path:
+    """跨发行目录复用的本机算子缓存。
+
+    GPU 算子与机器、运行时和显卡架构绑定，不应跟随某个解压目录。Windows
+    优先放入 LOCALAPPDATA，避免升级到新版本目录后再次编译；环境变量仅供
+    自动化测试和高级部署覆盖。
+    """
+    configured = os.environ.get("CCCP_OPERATOR_CACHE_DIR", "").strip()
+    if configured:
+        directory = Path(configured).expanduser().resolve()
+    elif os.name == "nt" and os.environ.get("LOCALAPPDATA", "").strip():
+        directory = (
+            Path(os.environ["LOCALAPPDATA"]) / "CCCP-Launcher" / "operator-cache"
+        ).resolve()
+    else:
+        directory = (data_dir() / "operator-cache").resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def detect_engine_path() -> Path | None:
+    """只发现发行目录内置的 CCCP Engine，不接受外部或旧布局。"""
+    resolved = (runtime_root() / "engine" / "CCCP-Engine").resolve()
+    if (resolved / "cccp" / "__main__.py").is_file():
+        return resolved
     return None
+
+
+def runtime_python_candidates(backend: str = "cpu") -> tuple[Path, ...]:
+    """Return versioned runtime candidates for one isolated inference backend."""
+    rr = runtime_root()
+    if backend == "cpu":
+        return (rr / "runtime" / "cpu" / "env" / "python.exe",)
+    if backend == "cuda":
+        return (rr / "runtime" / "cuda" / "env" / "python.exe",)
+    if backend == "amd":
+        return (rr / "runtime" / "amd" / "env" / "python.exe",)
+    return ()
+
+
+def detect_python_path(backend: str = "cpu") -> Path | None:
+    """发现隔离的 CPU/CUDA/AMD Miniconda 环境，不依赖系统 Python。"""
+    candidates = runtime_python_candidates(backend)
+    for cand in candidates:
+        if cand.is_file():
+            return cand.resolve()
+    return None
+
+
+def default_models_dir() -> Path:
+    """发行目录固定的默认模型目录。"""
+    directory = (runtime_root() / "models").resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def detect_model_roots() -> list[Path]:
+    return [default_models_dir()]

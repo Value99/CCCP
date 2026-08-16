@@ -1,2 +1,2 @@
-"""CCCP 启动器 · TPQ-Final(独立仓库,不修改 TPQ-Final)。"""
-__version__ = "0.7.3"
+"""CCCP Launcher：动态专家配置与 CCCP Engine 多环境桌面启动器。"""
+__version__ = "0.9.3"
