@@ -17,6 +17,12 @@ if str(ENGINE) not in sys.path:
     sys.path.insert(0, str(ENGINE))
 
 from cccp.qwen35_model import Qwen35DenseVQModel  # noqa: E402
+from cccp.cpuext import (  # noqa: E402
+    reset_resident_projection_profile,
+    reset_three_projection_phase_profile,
+    resident_projection_profile,
+    three_projection_phase_profile,
+)
 
 
 def main() -> int:
@@ -56,10 +62,14 @@ def main() -> int:
         prefill_seconds = time.perf_counter() - tick
         for index in range(2):
             logits = model.forward([248001 + index])
+        reset_resident_projection_profile()
+        reset_three_projection_phase_profile()
         tick = time.perf_counter()
         for index in range(args.decode_tokens):
             logits = model.forward([248003 + index % 64])
         decode_seconds = time.perf_counter() - tick
+        projection_profile = resident_projection_profile()
+        mlp_profile = three_projection_phase_profile()
         results.append({
             "threads": threads,
             "prefill_tokens_per_second": (
@@ -67,6 +77,8 @@ def main() -> int:
             ),
             "decode_tokens_per_second": args.decode_tokens / decode_seconds,
             "finite_logits": bool(torch.isfinite(logits).all()),
+            "resident_projection_profile": projection_profile,
+            "q4_swiglu_profile": mlp_profile,
         })
     print("[cccp-qwen35-cpu-sweep] " + json.dumps({
         "load_seconds": load_seconds,

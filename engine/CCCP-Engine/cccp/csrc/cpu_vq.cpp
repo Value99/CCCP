@@ -183,9 +183,14 @@ inline void bind_q4_row_shards(
   }
   const int64_t split = (rows + 1) / 2;
   auto* base = output.data_ptr<uint8_t>();
-  bind_to_numa_node(base, split * row_bytes, 0);
-  bind_to_numa_node(
-      base + split * row_bytes, (rows - split) * row_bytes, 1);
+  if (!bind_to_numa_node(base, split * row_bytes, 0, true)) {
+    bind_to_numa_node(base, split * row_bytes, 0);
+  }
+  auto* second = base + split * row_bytes;
+  const int64_t second_bytes = (rows - split) * row_bytes;
+  if (!bind_to_numa_node(second, second_bytes, 1, true)) {
+    bind_to_numa_node(second, second_bytes, 1);
+  }
 }
 
 // Return the contiguous output-row interval owned by this OpenMP thread.

@@ -22,7 +22,7 @@ _EXT = None
 _TRIED = False
 _ERR: str | None = None
 _SOURCE = "unavailable"
-_EXTENSION_NAME = "cccp_cpu_kernels_v194"
+_EXTENSION_NAME = "cccp_cpu_kernels_v195"
 _PACKED_MOE_WORKSPACE: tuple[torch.Tensor, torch.Tensor] | None = None
 _PACKED_THREE_WORKSPACE: tuple[torch.Tensor, ...] | None = None
 _PACKED_MOE_LOCK = threading.Lock()
@@ -208,7 +208,23 @@ def configure_cpu_threads() -> int:
     elif raw not in ("", "auto"):
         target = max(1, int(raw))
     else:
-        if physical >= 32 and logical >= 2 * physical:
+        numa_mode = os.environ.get("CCCP_CPU_NUMA", "auto").strip().lower()
+        compile_mode = os.environ.get(
+            "CCCP_CPU_COMPILE", "auto"
+        ).strip().lower()
+        q4_numa_sharded = bool(
+            sys.platform == "linux"
+            and numa_mode in {"auto", "local", "shard", "sharded"}
+            and compile_mode == "q4"
+        )
+        if physical >= 32 and logical >= 2 * physical and q4_numa_sharded:
+            # Q4 row images are explicitly migrated into one shard per NUMA
+            # node.  The measured 96-core dual-socket path needs one worker
+            # per physical core to consume both local memory controllers;
+            # SMT remains disabled.  This rule is format/topology based and
+            # does not alter hybrid P/E-core clients or non-sharded formats.
+            target = physical
+        elif physical >= 32 and logical >= 2 * physical:
             # Large homogeneous SMT/NUMA systems are commonly limited by
             # memory bandwidth and cross-node scheduling before every core is
             # useful.  Keep the measured low-latency candidate; do not infer

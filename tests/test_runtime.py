@@ -75,6 +75,7 @@ def test_cpu_thread_auto_keeps_large_smt_bandwidth_headroom(monkeypatch):
     import psutil
 
     monkeypatch.setenv("CCCP_CPU_THREADS", "auto")
+    monkeypatch.setenv("CCCP_CPU_COMPILE", "auto")
     monkeypatch.setattr(cpuext, "configure_windows_performance", lambda: False)
     monkeypatch.setattr(cpuext.os, "cpu_count", lambda: 192)
     monkeypatch.setattr(
@@ -95,6 +96,51 @@ def test_cpu_thread_auto_keeps_large_smt_bandwidth_headroom(monkeypatch):
 
     assert cpuext.configure_cpu_threads() == 72
     assert selected["threads"] == 72
+
+
+def test_cpu_thread_auto_uses_all_physical_cores_for_q4_numa_shards(
+    monkeypatch,
+):
+    selected: dict[str, int] = {}
+    import psutil
+
+    monkeypatch.setenv("CCCP_CPU_THREADS", "auto")
+    monkeypatch.setenv("CCCP_CPU_COMPILE", "q4")
+    monkeypatch.setenv("CCCP_CPU_NUMA", "auto")
+    monkeypatch.setattr(cpuext.sys, "platform", "linux")
+    monkeypatch.setattr(cpuext, "configure_windows_performance", lambda: False)
+    monkeypatch.setattr(cpuext.os, "cpu_count", lambda: 192)
+    monkeypatch.setattr(
+        psutil,
+        "cpu_count",
+        lambda logical=True: 192 if logical else 96,
+    )
+    monkeypatch.setattr(
+        cpuext.torch,
+        "set_num_threads",
+        lambda value: selected.__setitem__("threads", int(value)),
+    )
+    monkeypatch.setattr(
+        cpuext.torch,
+        "get_num_threads",
+        lambda: selected.get("threads", 1),
+    )
+
+    assert cpuext.configure_cpu_threads() == 96
+    assert selected["threads"] == 96
+
+
+def test_linux_q4_numa_shards_migrate_reused_allocator_pages():
+    source = (
+        ENGINE_ROOT / "cccp" / "csrc" / "cpu_vq.cpp"
+    ).read_text(encoding="utf-8")
+    helper = source.split("inline void bind_q4_row_shards", 1)[1].split(
+        "// Return the contiguous output-row interval", 1
+    )[0]
+
+    assert "split * row_bytes, 0, true" in helper
+    assert "second, second_bytes, 1, true" in helper
+    assert helper.count("bind_to_numa_node") == 4
 
 
 def test_shared_prefill_scheduler_defaults_to_4096(monkeypatch):

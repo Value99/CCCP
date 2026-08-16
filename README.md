@@ -2,6 +2,8 @@
 
 Windows x64 离线桌面启动器，用于加载 CCCP MoE 模型、专家配置以及清单声明的 Dense VQ 模型。它不会生成、裁剪或改写模型权重，也不会减少专家或修改模型原生 top-k。
 
+**下载最新版：** [CCCP 启动器 0.9.4（Windows x64 离线版）](https://github.com/Value99/CCCP/releases/tag/v0.9.4)；完整包已包含 Python、CPU/CUDA/AMD 推理环境与依赖。
+
 ## 使用
 
 1. 保持发行目录完整，将模型放入 `models`，或在设置中添加外部模型目录。
