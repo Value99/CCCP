@@ -271,6 +271,7 @@ class KimiK3CCCPModel:
         self._tp_moe_residual_hidden: dict[int, object] = {}
         self._tp_fixed_moe_prelude = None
         self._tp_attention_layer_graph = False
+        self._tp_attention_base_graph_layers: set[int] = set()
         self._tp_mlp_layer_graph = False
         self._tp_moe_owner_layer_graph = False
         self._tp_moe_all_rank_layer_graph = False
@@ -610,6 +611,18 @@ class KimiK3CCCPModel:
             allocate = getattr(self.pool, "allocate", None)
             if callable(allocate):
                 allocate()
+            # A full-resident Kimi archive writes hundreds of GiB into its
+            # fixed packed slabs.  Finish that one-time population before any
+            # Dense/Attention CUDA graph is captured.  Capturing KDA first and
+            # then issuing tens of thousands of expert writes can invalidate
+            # driver graph resources on large TP deployments even though the
+            # tensor addresses themselves are stable.  Expert execution graphs
+            # still wait until Router/Hidden fixed inputs are bound below.
+            if (
+                hasattr(self.pool, "preload")
+                and not getattr(self.pool, "host_mapped", False)
+            ):
+                self.pool.preload(capture_graphs=False)
             if len(self.devices) == 1:
                 placement = (
                     "单rank固定地址 Graph；Dense 流式落入 GPU，"
@@ -806,6 +819,19 @@ class KimiK3CCCPModel:
                         flush=True,
                     )
                 self._prepare_no_owner_moe_plans()
+                if self._tp_kda is not None:
+                    # Large TP4 Kimi builds create several thousand retained
+                    # parent graphs after the original KDA capture.  Recapture
+                    # every KDA layer once at the final lifecycle boundary so
+                    # none of their driver graph resources can be recycled by
+                    # the later MoE plans.  Output buffers are deliberately
+                    # retained by TensorParallelKDA.capture, preserving the
+                    # fixed addresses already composed into MLP parents.
+                    self._tp_kda.capture()
+                    print(
+                        "[cccp-kimi] 全部 KDA 固定图在父图后完成最终捕获",
+                        flush=True,
+                    )
             return
         resident_all = (
             extreme_resident_all
@@ -1950,20 +1976,31 @@ class KimiK3CCCPModel:
                 if layer == 0
                 else (layer - 1) // block + 1
             )
-            executor.compose_normalize_prelude(
-                layer,
-                hidden_source,
-                self._tp_block_residual,
-                active_rows,
-                self._tp_select(plan[0], target.devices),
-                self._tp_select(plan[1], target.devices),
-                self._tp_select(plan[2], target.devices),
-                self._tp_select(
-                    self._tp_residual_workspaces,
-                    target.devices,
-                ),
-                self.config.rms_eps,
-            )
+            # Layer zero has no residual rows and is followed by the only
+            # dense MLP.  Keep its already-captured KDA graph as the execution
+            # root and submit the RMSNorm into its fixed input separately.
+            # Composing this boundary into the much larger retained TP graph
+            # set can invalidate the first KDA launch after batched Prefill on
+            # CUDA, while every later Attention→MoE layer has a complete
+            # parent plan.  This is a single explicit boundary, not a runtime
+            # fallback or an alternate mathematical implementation.
+            if layer == 0 and layer in kda_layers and active_rows == 0:
+                self._tp_attention_base_graph_layers.add(layer)
+            else:
+                executor.compose_normalize_prelude(
+                    layer,
+                    hidden_source,
+                    self._tp_block_residual,
+                    active_rows,
+                    self._tp_select(plan[0], target.devices),
+                    self._tp_select(plan[1], target.devices),
+                    self._tp_select(plan[2], target.devices),
+                    self._tp_select(
+                        self._tp_residual_workspaces,
+                        target.devices,
+                    ),
+                    self.config.rms_eps,
+                )
             if layer < self.config.first_dense_layers:
                 hidden_source = self._tp_layer_output_hidden[layer]
             else:
@@ -1971,7 +2008,8 @@ class KimiK3CCCPModel:
         self._tp_attention_layer_graph = True
         print(
             "[cccp-kimi] 通用 Attention 前处理→Column/Row "
-            f"父图完成：{self.config.n_layers} 层",
+            f"父图完成：{self.config.n_layers - len(self._tp_attention_base_graph_layers)} 层；"
+            f"首层固定 KDA 边界={len(self._tp_attention_base_graph_layers)}",
             flush=True,
         )
 
@@ -4783,9 +4821,13 @@ class KimiK3CCCPModel:
                 if layer in kda_layers
                 else self._tp_mla
             )
+            layer_parent_graph = (
+                self._tp_attention_layer_graph
+                and layer not in self._tp_attention_base_graph_layers
+            )
             attention_input = attention_executor.input_hidden(layer)
             attention_plan = self._tp_attention_mix[layer]
-            if not self._tp_attention_layer_graph:
+            if not layer_parent_graph:
                 if residual.active_rows:
                     hidden.residual_mix_to(
                         residual,
@@ -4821,7 +4863,7 @@ class KimiK3CCCPModel:
                 "attention_prepare",
                 timing_started,
             )
-            if layer == trace_layer and not self._tp_attention_layer_graph:
+            if layer == trace_layer and not layer_parent_graph:
                 stage_trace["attention_input"] = (
                     attention_input.wait_on(trace_device).clone()
                 )
@@ -4859,7 +4901,7 @@ class KimiK3CCCPModel:
                 continue
             attention_source = (
                 hidden
-                if self._tp_attention_layer_graph
+                if layer_parent_graph
                 else attention_input
             )
             attention_profile = None
@@ -4897,7 +4939,7 @@ class KimiK3CCCPModel:
                 timing_started,
             )
             if layer == trace_layer:
-                if self._tp_attention_layer_graph:
+                if layer_parent_graph:
                     stage_trace["attention_input"] = (
                         attention_input.wait_on(trace_device).clone()
                     )

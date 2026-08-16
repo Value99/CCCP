@@ -16,6 +16,11 @@ from dataclasses import dataclass
 import torch
 
 from .model import GLMModel
+from .speculative import (
+    DraftAcceptancePolicy,
+    provider_attachment_available,
+    provider_for_architecture,
+)
 
 DEFAULT_EOS = [154820, 154827, 154829]
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
@@ -2657,13 +2662,41 @@ class Engine:
         media_slots: object = (),
         media_state: object = None,
     ) -> list[int]:
-        """MTP/DSpark 投机解码（贪心）。
-
-        DSV4 默认严格回退 generate(temp=0)；仅显式设置
-        CCCP_DSPARK_EXPERIMENTAL=1 才运行尚未数值等价的批量验证路径。
-        GLM 仍走 MTP layer 78。
-        """
-        if getattr(self, "arch", "glm") == "kimi_k3":
+        """Run the registered MTP/DSpark drafter with bounded verification."""
+        try:
+            provider_spec = provider_for_architecture(
+                getattr(self, "arch", "glm")
+            )
+        except ValueError:
+            provider_spec = None
+        if (
+            provider_spec is None
+            or not provider_attachment_available(provider_spec, self.model)
+        ):
+            self.spec_stats = {
+                "mode": "draft-provider-unavailable",
+                "rounds": 0,
+                "accepted": 0,
+                "drafted": 0,
+            }
+            print(
+                "[cccp-mtp] 模型配置未声明可用草稿附件，"
+                "自动使用主模型贪心解码",
+                flush=True,
+            )
+            return self.generate(
+                ids,
+                max_new=max_new,
+                temp=0.0,
+                callback=callback,
+                should_stop=should_stop,
+                media_digest=media_digest,
+                media_slots=media_slots,
+                media_state=media_state,
+            )
+        provider = provider_spec.provider
+        policy = provider_spec.policy
+        if provider == "kimi_prompt_lookup":
             if (
                 getattr(self.model, "device", torch.device("cpu")).type
                 == "cpu"
@@ -2676,6 +2709,7 @@ class Engine:
                     k=k,
                     callback=callback,
                     should_stop=should_stop,
+                    policy=policy,
                     media_digest=media_digest,
                     media_slots=media_slots,
                     media_state=media_state,
@@ -2690,48 +2724,33 @@ class Engine:
                 media_slots=media_slots,
                 media_state=media_state,
             )
-        if getattr(self, "arch", "glm") == "dsv4":
-            if not _env_enabled("CCCP_DSPARK_EXPERIMENTAL"):
+        if provider == "qwen35_mtp":
+            if not bool(getattr(self.model, "supports_mtp", False)):
                 self.spec_stats = {
-                    "mode": "strict_fallback",
+                    "mode": "mtp-unavailable",
                     "rounds": 0,
                     "accepted": 0,
                     "drafted": 0,
                 }
-                if not getattr(
-                    self, "_dspark_strict_notice_shown", False
-                ):
-                    print(
-                        "[cccp] DSpark 严格模式：批量验证尚未与 "
-                        "spec=0 数值等价，本次回退主模型贪心；"
-                        "设置 CCCP_DSPARK_EXPERIMENTAL=1 "
-                        "才启用实验路径",
-                        flush=True,
-                    )
-                    self._dspark_strict_notice_shown = True
-                generate_kwargs = {
-                    "max_new": max_new,
-                    "temp": 0.0,
-                    "callback": callback,
-                    "should_stop": should_stop,
-                    "media_digest": media_digest,
-                    "media_slots": media_slots,
-                    "media_state": media_state,
-                }
-                if kv_baseline_len is not None:
-                    generate_kwargs[
-                        "kv_baseline_len"
-                    ] = kv_baseline_len
-                return self.generate(ids, **generate_kwargs)
-            if not getattr(
-                self, "_dspark_experimental_notice_shown", False
-            ):
-                print(
-                    "[cccp] 警告：DSpark 实验模式不能保证与 "
-                    "spec=0 token 等价",
-                    flush=True,
+                return self.generate(
+                    ids,
+                    max_new=max_new,
+                    temp=0.0,
+                    callback=callback,
+                    should_stop=should_stop,
+                    media_digest=media_digest,
+                    media_slots=media_slots,
+                    media_state=media_state,
                 )
-                self._dspark_experimental_notice_shown = True
+            return self._generate_qwen35_mtp(
+                ids,
+                max_new=max_new,
+                k=k,
+                callback=callback,
+                should_stop=should_stop,
+                policy=policy,
+            )
+        if provider == "dsv4_dspark":
             self._kv_baseline = None
             self.last_kv_stats = None
             mc = getattr(self.model, "max_ctx", None)
@@ -2748,11 +2767,13 @@ class Engine:
                 k=k,
                 callback=callback,
                 should_stop=should_stop,
-                media_digest=media_digest,
-                media_slots=media_slots,
-                media_state=media_state,
+                policy=policy,
             )
-            print("[cccp] 该架构投机解码未接入，回退贪心逐 token", flush=True)
+        if provider != "glm_mtp":
+            print(
+                "[cccp-mtp] 当前架构未声明草稿能力，回退主模型贪心",
+                flush=True,
+            )
             return self.generate(
                 ids,
                 max_new=max_new,
@@ -2769,6 +2790,8 @@ class Engine:
             return []
         if max_new is not None and mc and len(ids) + max_new > mc:
             max_new = max(0, mc - len(ids))
+        from .mtp import MTPHead
+
         self.reset()           # GLM-MTP 路径不支持增量 prefill，每轮全量重建
         mtp = MTPHead(self.model)
         mtp.reset()
@@ -2781,7 +2804,12 @@ class Engine:
         h_main_last = h_all[-1:]
         next_pos = len(ids)          # 下一个 MTP 步的 RoPE 位置
         next_t1 = int(logits.argmax())
-        stats = {"rounds": 0, "accepted": 0, "drafted": 0}
+        stats = {
+            "mode": policy.mode,
+            "rounds": 0,
+            "accepted": 0,
+            "drafted": 0,
+        }
         stop_requested = False
         while (
             _generation_open(len(out), max_new, len(ids) + len(out), mc)
@@ -2819,7 +2847,10 @@ class Engine:
                     len(out), max_new, len(ids) + len(out), mc
                 ):
                     break
-                if int(lg2[i].argmax()) == drafts[i] and drafts[i] not in self.eos:
+                if (
+                    policy.accepts(lg2[i], drafts[i])
+                    and drafts[i] not in self.eos
+                ):
                     accepted += 1
                     out.append(drafts[i])
                     if callback:
@@ -2842,6 +2873,203 @@ class Engine:
             h_main_last = h2[accepted:accepted + 1]
             next_pos += 1 + accepted
         self.spec_stats = stats
+        return out
+
+    @torch.no_grad()
+    def _generate_qwen35_mtp(
+        self,
+        ids: list[int],
+        *,
+        max_new: int | None,
+        k: int,
+        callback=None,
+        should_stop: Callable[[], bool] | None = None,
+        policy: DraftAcceptancePolicy,
+    ) -> list[int]:
+        """Qwen3.5 MTP with main-model Top-3 block verification.
+
+        The main hybrid cache is snapshotted only around a verification
+        block.  A full hit keeps the already-computed state; a partial hit
+        restores the recurrent state and replays only the committed prefix.
+        """
+        overall_started = time.perf_counter()
+        model = self.model
+        mtp = model.mtp
+        max_ctx = getattr(model, "max_ctx", None)
+        if max_ctx and len(ids) >= max_ctx:
+            return []
+        if max_new is not None and max_ctx:
+            max_new = min(max_new, max(0, max_ctx - len(ids)))
+
+        # The Qwen drafter owns a shifted full-attention cache.  Rebuilding it
+        # together with the main prompt keeps the two state machines exact;
+        # later rounds reuse both caches without another prompt pass.
+        self.reset()
+        main_hidden_all = model.forward_hidden(ids)
+        logits = model.logits_of(main_hidden_all[-1:]).squeeze(0)
+        mtp.prefill(main_hidden_all, ids)
+        main_hidden_last = main_hidden_all[-1:]
+        next_token = int(logits.argmax().item())
+        if getattr(model, "device", torch.device("cpu")).type == "cuda":
+            torch.cuda.synchronize(model.device)
+        prefill_finished = time.perf_counter()
+        next_position = len(ids)
+        out: list[int] = []
+        stats = {
+            "mode": policy.mode,
+            "rounds": 0,
+            "drafted": 0,
+            "accepted": 0,
+            "replayed": 0,
+            "max_draft": policy.draft_count(k),
+            "prefill_ms": (prefill_finished - overall_started) * 1000.0,
+        }
+        stop_requested = False
+
+        while (
+            not stop_requested
+            and _generation_open(
+                len(out), max_new, len(ids) + len(out), max_ctx
+            )
+        ):
+            first = int(next_token)
+            if first in self.eos:
+                out.append(first)
+                if callback:
+                    callback(first, self.decode([first]))
+                model.forward_hidden([first])
+                break
+
+            out.append(first)
+            if callback:
+                callback(first, self.decode([first]))
+            stop_requested = should_stop is not None and should_stop()
+
+            room = policy.draft_count(k)
+            if max_new is not None:
+                room = min(room, max_new - len(out))
+            if max_ctx is not None:
+                room = min(room, max_ctx - len(ids) - len(out))
+            if stop_requested or room <= 0:
+                hidden = model.forward_hidden([first])
+                main_hidden_last = hidden[-1:]
+                break
+
+            mtp_base = mtp.cache_length
+            draft_hidden = main_hidden_last
+            draft_token = first
+            if hasattr(mtp, "draft_block"):
+                draft_hidden, drafts = mtp.draft_block(
+                    draft_hidden,
+                    draft_token,
+                    next_position,
+                    room,
+                )
+            else:
+                drafts = []
+                for offset in range(room):
+                    draft_hidden, draft_logits = mtp.step(
+                        draft_hidden,
+                        draft_token,
+                        next_position + offset,
+                    )
+                    draft_token = int(draft_logits.argmax().item())
+                    drafts.append(draft_token)
+            stats["drafted"] += len(drafts)
+
+            direct_commit = bool(
+                getattr(model, "supports_direct_verify_commit", False)
+            )
+            snapshot = (
+                None if direct_commit else model.snapshot_decode_state()
+            )
+            verify = getattr(model, "forward_hidden_verify", model.forward_hidden)
+            verified_hidden = verify([first] + drafts)
+            verified_logits = model.logits_of(verified_hidden)
+            accepted = policy.accepted_prefix(
+                verified_logits,
+                drafts,
+            )
+
+            # EOS is structural for Qwen.  It may be accepted, but no token
+            # after it can enter the committed prefix.
+            emit_accepted = accepted
+            eos_seen = False
+            for index in range(accepted):
+                draft = drafts[index]
+                out.append(draft)
+                if callback:
+                    callback(draft, self.decode([draft]))
+                if draft in self.eos:
+                    emit_accepted = index + 1
+                    eos_seen = True
+                    stop_requested = True
+                    break
+                if should_stop is not None and should_stop():
+                    emit_accepted = index + 1
+                    stop_requested = True
+                    break
+                if not _generation_open(
+                    len(out), max_new, len(ids) + len(out), max_ctx
+                ):
+                    emit_accepted = index + 1
+                    stop_requested = True
+                    break
+
+            stats["accepted"] += emit_accepted
+            committed = 1 + emit_accepted
+            full_block = emit_accepted == len(drafts) and not eos_seen
+            if full_block:
+                main_hidden_last = verified_hidden[-1:]
+                next_token = int(verified_logits[-1].argmax().item())
+            elif direct_commit:
+                model.commit_verified_prefix(committed)
+                main_hidden_last = verified_hidden[
+                    committed - 1:committed
+                ]
+                next_token = int(
+                    verified_logits[committed - 1].argmax().item()
+                )
+            else:
+                model.restore_decode_state(snapshot)
+                canonical = [first] + drafts[:emit_accepted]
+                replay_hidden = model.forward_hidden(canonical)
+                replay_logits = model.logits_of(replay_hidden[-1:]).squeeze(0)
+                main_hidden_last = replay_hidden[-1:]
+                next_token = int(replay_logits.argmax().item())
+                stats["replayed"] += len(canonical)
+            mtp.crop(min(mtp.cache_length, mtp_base + committed))
+            next_position += committed
+            stats["rounds"] += 1
+
+        if getattr(model, "device", torch.device("cpu")).type == "cuda":
+            torch.cuda.synchronize(model.device)
+        finished = time.perf_counter()
+        decode_tokens = max(0, len(out) - 1)
+        decode_seconds = max(0.0, finished - prefill_finished)
+        stats.update({
+            "decode_tokens": decode_tokens,
+            "decode_seconds": decode_seconds,
+            "decode_tokens_per_second": (
+                decode_tokens / decode_seconds if decode_seconds > 0.0 else 0.0
+            ),
+            "total_seconds": finished - overall_started,
+        })
+        self.spec_stats = stats
+        self._cache_ids = list(ids) + out
+        self._cache_media_digest = getattr(self, "_active_media_digest", None)
+        self._cache_media_slots = getattr(self, "_active_media_slots", ())
+        self._cache_via_spec = False
+        print(
+            "[cccp-mtp] architecture=qwen3.5-dense; "
+            f"mode={stats['mode']}; rounds={stats['rounds']}; "
+            f"accepted={stats['accepted']}/{stats['drafted']}; "
+            f"replayed={stats['replayed']}; "
+            f"prefill={stats['prefill_ms']:.1f}ms; "
+            f"decode={stats['decode_tokens_per_second']:.3f}tok/s "
+            f"({stats['decode_tokens']} tokens/{stats['decode_seconds']:.3f}s)",
+            flush=True,
+        )
         return out
 
     @staticmethod
@@ -2876,12 +3104,13 @@ class Engine:
         k: int,
         callback=None,
         should_stop: Callable[[], bool] | None = None,
+        policy: DraftAcceptancePolicy,
         media_digest: str | None = None,
         media_slots: object = (),
         media_state: object = None,
     ) -> list[int]:
-        """Lossless prompt-lookup decode using Kimi's CPU block verifier."""
-        maximum_draft = max(1, min(int(k), 15))
+        """Prompt-lookup drafts using Kimi's CPU block verifier."""
+        maximum_draft = policy.draft_count(k)
         max_ctx = getattr(self.model, "max_ctx", None)
         if max_ctx and len(ids) >= max_ctx:
             return []
@@ -2896,7 +3125,7 @@ class Engine:
         history = list(ids)
         out: list[int] = []
         stats = {
-            "mode": "kimi_prompt_lookup_block",
+            "mode": f"kimi-prompt-lookup-{policy.mode}",
             "rounds": 0,
             "block_rounds": 0,
             "fallback_rounds": 0,
@@ -2941,7 +3170,7 @@ class Engine:
             stats["drafted"] += len(drafts)
             accepted = 0
             for index, draft in enumerate(drafts):
-                if int(block_logits[index].argmax().item()) != draft:
+                if not policy.accepts(block_logits[index], draft):
                     break
                 if draft in self.eos:
                     stop = True
@@ -2975,12 +3204,13 @@ class Engine:
     def _generate_dspark(
         self,
         ids: list[int],
+        policy: DraftAcceptancePolicy,
         max_new: int | None = 128,
         k: int = 5,
         callback=None,
         should_stop: Callable[[], bool] | None = None,
     ) -> list[int]:
-        """DSV4 DSpark 块并行投机解码（贪心验收，输出与 generate(temp=0) 一致）。
+        """DSV4 DSpark block drafting with registered Top-N acceptance.
 
         每轮：1 次 DSpark 前向并行产出 block_size(=5) 个草稿 → 主模型 1 次批量
         前向验证 [t1, d1..dk] → 接受最长连续前缀（argmax 比对），首位不匹配的
@@ -2997,7 +3227,8 @@ class Engine:
                 "运行时+DSpark 余量",
             )
             dsp = self._dsp = DSparkHead(model)
-        k = min(k, dsp.block_size)
+        overall_started = time.perf_counter()
+        k = policy.draft_count(k, dsp.block_size)
         out: list[int] = []
         skip = self._kv_prefix_len(ids) if self._cache_via_spec else 0
         if skip:
@@ -3016,8 +3247,17 @@ class Engine:
             dsp.prefill_kv(mh[0])                # DSpark 环：positions 0..T-1
             t1 = int(logits_last[0].argmax())
             mh_last = mh[0, -1]                  # position p 的 main_hidden [3D]
+        if getattr(model, "device", torch.device("cpu")).type == "cuda":
+            torch.cuda.synchronize(model.device)
+        prefill_finished = time.perf_counter()
         p = len(ids) - 1                         # 最末已处理位置
-        stats = {"rounds": 0, "accepted": 0, "drafted": 0}
+        stats = {
+            "mode": policy.mode,
+            "rounds": 0,
+            "accepted": 0,
+            "drafted": 0,
+            "prefill_ms": (prefill_finished - overall_started) * 1000.0,
+        }
         mc = getattr(model, "max_ctx", None)
         stop_requested = False
         while (
@@ -3051,7 +3291,10 @@ class Engine:
                     len(out), max_new, len(ids) + len(out), mc
                 ):
                     break
-                if int(lg2[i].argmax()) == drafts[i] and drafts[i] not in self.eos:
+                if (
+                    policy.accepts(lg2[i], drafts[i])
+                    and drafts[i] not in self.eos
+                ):
                     accepted += 1
                     out.append(drafts[i])
                     if callback:
@@ -3062,7 +3305,7 @@ class Engine:
                 else:
                     break
             stats["accepted"] += accepted
-            stats["drafted"] += k
+            stats["drafted"] += max(0, draft_count)
             stats["rounds"] += 1
             next_t1 = int(lg2[accepted].argmax())
             keep = pos0 + 1 + accepted
@@ -3071,9 +3314,31 @@ class Engine:
             mh_last = mh2[accepted]
             p = keep - 1
             t1 = next_t1
+        if getattr(model, "device", torch.device("cpu")).type == "cuda":
+            torch.cuda.synchronize(model.device)
+        finished = time.perf_counter()
+        decode_tokens = max(0, len(out) - 1)
+        decode_seconds = max(0.0, finished - prefill_finished)
+        stats.update({
+            "decode_tokens": decode_tokens,
+            "decode_seconds": decode_seconds,
+            "decode_tokens_per_second": (
+                decode_tokens / decode_seconds if decode_seconds > 0.0 else 0.0
+            ),
+            "total_seconds": finished - overall_started,
+        })
         self.spec_stats = stats
         self._cache_ids = list(ids) + out
         self._cache_via_spec = True    # DSpark 环已覆盖 prompt+回复全部位置
+        print(
+            "[cccp-mtp] architecture=dsv4; provider=dspark; "
+            f"mode={stats['mode']}; rounds={stats['rounds']}; "
+            f"accepted={stats['accepted']}/{stats['drafted']}; "
+            f"prefill={stats['prefill_ms']:.1f}ms; "
+            f"decode={stats['decode_tokens_per_second']:.3f}tok/s "
+            f"({stats['decode_tokens']} tokens/{stats['decode_seconds']:.3f}s)",
+            flush=True,
+        )
         return out
 
 

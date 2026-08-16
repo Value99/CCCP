@@ -5,6 +5,15 @@
   "supports_parallel": true,
   "tested_tp_min": 2,
   "tested_tp_max": 8,
+  "speculative": {
+    "provider": "glm_mtp",
+    "max_draft": 5,
+    "accept_top_n": 3,
+    "attachment": {
+      "kind": "manifest-file",
+      "field": "mtp_file"
+    }
+  },
   "defaults": {
     "device": "cuda",
     "max_ctx": 4096,

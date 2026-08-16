@@ -35,15 +35,25 @@ def _run_turn(
     messages: list[ChatMessage],
     options: ChatOptions,
     ledger,
+    *,
+    speculative: bool,
+    draft_tokens: int,
 ):
     plan = adapter.prepare(engine, messages, options, ledger)
     started = time.perf_counter()
-    output_ids = engine.generate(
-        plan.input_ids,
-        max_new=options.max_new,
-        temp=options.temperature,
-        top_p=options.top_p,
-    )
+    if speculative:
+        output_ids = engine.generate_speculative(
+            plan.input_ids,
+            max_new=options.max_new,
+            k=draft_tokens,
+        )
+    else:
+        output_ids = engine.generate(
+            plan.input_ids,
+            max_new=options.max_new,
+            temp=options.temperature,
+            top_p=options.top_p,
+        )
     if engine.model.device.type == "cuda":
         torch.cuda.synchronize(engine.model.device)
     elapsed = time.perf_counter() - started
@@ -66,6 +76,7 @@ def _run_turn(
             "suffix_tokens": stats.suffix_tokens,
             "prefill_ms": stats.prefill_ms,
         },
+        "speculative": dict(engine.spec_stats or {}),
     }
 
 
@@ -75,6 +86,8 @@ def main() -> int:
     parser.add_argument("--device", choices=("cpu", "cuda"), required=True)
     parser.add_argument("--max-new", type=int, default=64)
     parser.add_argument("--torch-threads", type=int, default=1)
+    parser.add_argument("--speculative", action="store_true")
+    parser.add_argument("--draft-tokens", type=int, default=5)
     args = parser.parse_args()
 
     if args.device == "cpu":
@@ -88,14 +101,26 @@ def main() -> int:
     options = _options(args.max_new)
     messages = [ChatMessage(role="user", content="请用一句简短的中文介绍你自己。")]
     ledger, first, first_result = _run_turn(
-        engine, adapter, messages, options, None
+        engine,
+        adapter,
+        messages,
+        options,
+        None,
+        speculative=args.speculative,
+        draft_tokens=args.draft_tokens,
     )
     messages.extend([
         ChatMessage(role="assistant", content=first.content),
         ChatMessage(role="user", content="刚才我让你做什么？请简短回答。"),
     ])
     _, _, second_result = _run_turn(
-        engine, adapter, messages, options, ledger
+        engine,
+        adapter,
+        messages,
+        options,
+        ledger,
+        speculative=args.speculative,
+        draft_tokens=args.draft_tokens,
     )
     print("[cccp-qwen35-chat] " + json.dumps(
         {"turns": [first_result, second_result]},

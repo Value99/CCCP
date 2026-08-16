@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import inspect
+import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,14 +22,16 @@ if str(ENGINE) not in sys.path:
 from cccp.chat_adapters.base import ChatMessage, ChatOptions  # noqa: E402
 from cccp.chat_adapters.qwen35 import Qwen35ChatAdapter  # noqa: E402
 from cccp.dense_vq import (  # noqa: E402
+    DenseBF16SwiGLU,
     DenseVQArchive,
     DenseVQEmbedding,
     DenseVQLinear,
     DenseVQLinearGroup,
+    plan_dense_vq_gpu_execution,
 )
 from cccp.store import PackedVQWeight  # noqa: E402
 from cccp.presets import detect_architecture, resolve_preset  # noqa: E402
-from cccp.qwen35_model import _qwen35_gpu_image_plan  # noqa: E402
+from cccp.launch import _spec_value  # noqa: E402
 from cccp.chat_service import _decode_executor_name  # noqa: E402
 from launcher.cccp_adapter import (  # noqa: E402
     estimate_gpu_vram_plan,
@@ -118,6 +122,44 @@ def test_dense_preset_and_vram_plan_have_no_expert_arena(tmp_path):
     assert plan["architecture"] == "qwen3_5_dense"
     assert plan["minimum_expert_arena_gb"] == 0
     assert plan["preferred_expert_arena_gb"] == 0
+
+
+def test_qwen_mtp_default_is_backend_specific(tmp_path, monkeypatch):
+    manifest = _dense_model(tmp_path / "dense")
+    preset = resolve_preset(tmp_path / "dense", profile="resident", tp=1)
+    args = SimpleNamespace(spec=None, device="cuda")
+
+    monkeypatch.delenv("CCCP_RUNTIME_BACKEND", raising=False)
+    assert _spec_value(args, preset) == 0
+    manifest["config"]["mtp_layers"] = 1
+    (tmp_path / "dense" / "cccp.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    preset = resolve_preset(tmp_path / "dense", profile="resident", tp=1)
+    assert _spec_value(args, preset) == 4
+    args.device = "cpu"
+    assert _spec_value(args, preset) == 0
+    monkeypatch.setenv("CCCP_RUNTIME_BACKEND", "amd")
+    args.device = "cuda"
+    assert _spec_value(args, preset) == 0
+    args.spec = 2
+    assert _spec_value(args, preset) == 2
+
+
+def test_qwen_mtp_execution_and_residency_are_config_driven():
+    from cccp.speculative import provider_for_architecture
+
+    provider_for_architecture.cache_clear()
+    provider = provider_for_architecture("qwen3_5_dense")
+
+    assert provider.policy.top_n == 3
+    assert provider.policy.max_draft == 5
+    assert provider.residency_value("cpu") == "disabled"
+    assert provider.residency_value("nvidia_fp8") == "fp8"
+    assert provider.residency_value("nvidia_legacy") == "int8"
+    assert provider.residency_value("independent_of_lru") is True
+    assert provider.execution_value("draft") == "fixed-block-cuda-graph"
+    assert provider.execution_value("verify") == "fixed-block-cuda-graph"
 
 
 def test_dense_embedding_expands_only_selected_rows(tmp_path):
@@ -227,73 +269,65 @@ def test_dense_ui_has_no_expert_training_or_profile_language():
     assert "完整 Dense 模型" in script
 
 
-class _GpuPlanConfig:
-    layer_types = ["linear_attention"] * 48 + ["full_attention"] * 16
-    num_hidden_layers = 64
-    num_key_value_heads = 4
-    head_dim = 256
-
-
-def test_dense_gpu_image_plan_uses_bf16_only_when_complete_image_fits():
+def test_dense_gpu_plan_has_only_resident_and_compact_modes():
     gib = 1 << 30
     args = dict(
-        linear_bf16_bytes=48 * gib,
-        linear_int4_bytes=12 * gib,
-        packed_embedding_bytes=1 * gib,
-        fixed_file_bytes=2 * gib,
-        max_ctx=4096,
-        config=_GpuPlanConfig(),
+        resident_weight_bytes=27 * gib,
+        compact_weight_bytes=12 * gib,
+        fixed_bytes=2 * gib,
+        runtime_bytes=4 * gib,
+        resident_supported=True,
     )
-    compact, compact_details = _qwen35_gpu_image_plan(
-        free_bytes=48 * gib, **args
+    compact = plan_dense_vq_gpu_execution(
+        free_bytes=20 * gib, **args
     )
-    expanded, expanded_details = _qwen35_gpu_image_plan(
-        free_bytes=80 * gib, **args
+    resident = plan_dense_vq_gpu_execution(
+        free_bytes=40 * gib, **args
     )
 
-    assert compact == "int4"
-    assert expanded == "bf16"
-    assert compact_details["planned"] == compact_details["int4_planned"]
-    assert compact_details["bf16_planned"] == expanded_details["bf16_planned"]
-    assert expanded_details["kv"] == 256 * 1024 * 1024
-    assert expanded_details["runtime"] >= 4 * gib
+    assert compact.mode == "compact"
+    assert compact.required_bytes == 18 * gib
+    assert resident.mode == "resident"
+    assert resident.required_bytes == 33 * gib
 
 
-def test_dense_gpu_image_plan_prefers_native_fp8_when_supported_and_complete():
+def test_dense_gpu_plan_rejects_a_forced_unsupported_resident_mode():
     gib = 1 << 30
-    image, details = _qwen35_gpu_image_plan(
-        free_bytes=40 * gib,
-        linear_bf16_bytes=48 * gib,
-        linear_fp8_bytes=24 * gib,
-        linear_int4_bytes=12 * gib,
-        packed_embedding_bytes=1 * gib,
-        embedding_bf16_bytes=3 * gib,
-        fixed_file_bytes=2 * gib,
-        max_ctx=4096,
-        config=_GpuPlanConfig(),
-        fp8_supported=True,
-    )
-
-    assert image == "fp8"
-    assert details["fp8_planned"] < details["bf16_planned"]
-    assert details["planned"] == details["fp8_planned"]
+    with pytest.raises(RuntimeError, match="FP8 Tensor Cores"):
+        plan_dense_vq_gpu_execution(
+            free_bytes=40 * gib,
+            resident_weight_bytes=27 * gib,
+            compact_weight_bytes=12 * gib,
+            fixed_bytes=2 * gib,
+            runtime_bytes=4 * gib,
+            resident_supported=False,
+            forced_mode="resident",
+        )
 
 
-def test_dense_gpu_bf16_image_uses_vendor_linear_without_touching_routed_paths():
-    source = (ENGINE / "cccp" / "dense_vq.py").read_text(encoding="utf-8")
-    assert 'self.layout = "bf16"' in source
-    assert "F.linear(rows.to(torch.bfloat16), self.payload)" in source
-    assert "PackedExpertPool" not in source
+def test_dense_gpu_linear_exposes_only_resident_fp8_and_compact_vq():
+    source = inspect.getsource(DenseVQLinear)
+    assert "compile_gpu_fp8" in source
+    assert "compile_gpu_compact" in source
+    assert "dense_vq_gemv_grouped_fp8_codebook_fused" in source
+    assert "dense_vq_transient_fp8_gemm" in source
+    assert "dense_vq_compact_mma" not in source
+    assert "compact_codebook_lut_fp8" not in source
+    assert "dense_vq_gemv_packed" not in source
+    assert "compile_gpu_int4" not in source
+    assert "compile_gpu_bf16" not in source
+    assert "int4_g64" not in source
 
 
-def test_dense_gpu_image_probe_is_bounded_and_never_overcommits_bf16():
+def test_dense_gpu_mode_has_no_legacy_third_route():
     source = (ENGINE / "cccp" / "qwen35_model.py").read_text(
         encoding="utf-8"
     )
-    assert "CCCP_DENSE_VQ_GPU_IMAGE" in source
-    assert '{"", "auto", "fp8", "bf16", "int4"}' in source
-    assert "image exceeds" in source
-    assert "native NVIDIA" in source
+    assert "CCCP_DENSE_VQ_GPU_MODE" in source
+    assert "CCCP_DENSE_VQ_GPU_IMAGE" not in source
+    assert "linear_int4_bytes" not in source
+    assert "bf16_planned" not in source
+    assert "plan_dense_vq_gpu_execution" in source
 
 
 def test_qwen_gpu_fuses_both_decode_and_prefill_delta_entries():
@@ -348,6 +382,88 @@ def test_dense_cpu_q4_projection_group_matches_individual_linears():
     for result, reference in zip(actual, expected):
         torch.testing.assert_close(result, reference, rtol=0.0, atol=0.0)
 
+    batch = torch.randn(65, 32, dtype=torch.bfloat16)
+    expected_batch = tuple(linear(batch).clone() for linear in linears)
+    actual_batch = tuple(group.view(index)(batch) for index in range(2))
+    for result, reference in zip(actual_batch, expected_batch):
+        torch.testing.assert_close(result, reference, rtol=0.0, atol=0.0)
+
+
+def test_dense_cpu_bf16_swiglu_matches_public_mlp():
+    torch.manual_seed(350)
+
+    class MLP(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = torch.nn.Linear(64, 128, bias=False).to(
+                torch.bfloat16
+            )
+            self.up_proj = torch.nn.Linear(64, 128, bias=False).to(
+                torch.bfloat16
+            )
+            self.down_proj = torch.nn.Linear(128, 64, bias=False).to(
+                torch.bfloat16
+            )
+
+        def forward(self, value):
+            return self.down_proj(
+                torch.nn.functional.silu(self.gate_proj(value))
+                * self.up_proj(value)
+            )
+
+    reference = MLP().eval()
+    fused = DenseBF16SwiGLU(
+        reference,
+        reference.gate_proj,
+        reference.up_proj,
+        reference.down_proj,
+    )
+    value = torch.randn(1, 64, dtype=torch.bfloat16)
+    expected = reference(value)
+    actual = fused(value)
+    assert bool(torch.isfinite(actual).all())
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+
+def test_qwen_cpu_ordered_delta_batch_matches_reference():
+    from cccp.cpuext import qwen35_delta_recurrent_batch_cpu
+
+    torch.manual_seed(351)
+    tokens, heads, key_dim, value_dim = 5, 3, 8, 6
+    query = torch.randn(tokens, heads, key_dim)
+    key = torch.randn_like(query)
+    value = torch.randn(tokens, heads, value_dim)
+    gate = -torch.rand(tokens, heads)
+    beta = torch.sigmoid(torch.randn(tokens, heads))
+    initial = torch.randn(heads, key_dim, value_dim)
+    expected_state = initial.clone()
+    expected_rows = []
+    for token in range(tokens):
+        q = torch.nn.functional.normalize(
+            query[token], dim=-1, eps=1.0e-6
+        )
+        k = torch.nn.functional.normalize(
+            key[token], dim=-1, eps=1.0e-6
+        )
+        expected_state.mul_(gate[token].exp()[:, None, None])
+        prediction = torch.einsum("hkv,hk->hv", expected_state, k)
+        delta = (value[token] - prediction) * beta[token, :, None]
+        expected_state.add_(k[:, :, None] * delta[:, None, :])
+        expected_rows.append(
+            torch.einsum("hkv,hk->hv", expected_state, q)
+            / math.sqrt(key_dim)
+        )
+    expected = torch.stack(expected_rows)
+
+    actual = qwen35_delta_recurrent_batch_cpu(
+        query, key, value, gate, beta, initial
+    )
+    assert actual is not None
+    output, state = actual
+    torch.testing.assert_close(output, expected, rtol=2.0e-5, atol=2.0e-5)
+    torch.testing.assert_close(
+        state, expected_state, rtol=2.0e-5, atol=2.0e-5
+    )
+
 
 def test_qwen_cuda_disables_high_overhead_cudnn_sdpa_only_in_adapter():
     model_source = (ENGINE / "cccp" / "qwen35_model.py").read_text(
@@ -393,8 +509,14 @@ def test_decode_diagnostics_distinguish_hip_graph_and_dense(monkeypatch):
 
     dense = SimpleNamespace(model=SimpleNamespace(
         device=torch.device("cuda"),
-        packed_operator_name="dense_vq.int4-g64.compact",
+        packed_operator_name=(
+            "dense_vq.compact.decode-direct-dot."
+            "prefill-transient-fp8-gemm"
+        ),
     ))
     assert _decode_executor_name(
         dense, {"decode_graph_submissions": 0}
-    ) == "dense_vq.int4-g64.compact"
+    ) == (
+        "dense_vq.compact.decode-direct-dot."
+        "prefill-transient-fp8-gemm"
+    )

@@ -1,8 +1,17 @@
 {
   "schema": 1,
   "architecture": "dsv4",
-  "display_name": "DeepSeek-V4 / DSpark（CCCP）",
+  "display_name": "DeepSeek-V4（CCCP）",
   "supports_parallel": false,
+  "speculative": {
+    "provider": "dsv4_dspark",
+    "max_draft": 5,
+    "accept_top_n": 3,
+    "attachment": {
+      "kind": "manifest-file",
+      "field": "dspark_file"
+    }
+  },
   "defaults": {
     "device": "cuda",
     "max_ctx": 4096,
@@ -32,7 +41,7 @@
   },
   "profiles": {
     "ram": {
-      "description": "单卡计算；压缩专家常驻 RAM，DSpark 默认关闭以保证基础稳定性",
+      "description": "单卡计算；压缩专家常驻 RAM，按需进入显存缓存",
       "tp": 1,
       "environment": {
         "CCCP_RAM_MIRROR": "0"

@@ -755,22 +755,17 @@ if _EXT is not None:
             int(bits),
         )
 
-    def dense_vq_compile_int4_g64_fused(
-        payload: torch.Tensor,
-        codebook: torch.Tensor,
-        rows: int,
-        blocks: int,
-        bits: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compile Dense VQ into the common resident INT4-G64 format."""
-        result = _EXT.dense_vq_compile_int4_g64(
-            payload.contiguous().reshape(-1),
-            codebook.float().contiguous(),
-            int(rows),
-            int(blocks),
-            int(bits),
+    def dense_vq_gemv_grouped_fp8_codebook_fused(
+        x_rows: torch.Tensor,
+        metadata: torch.Tensor,
+        total_rows: int,
+    ) -> torch.Tensor:
+        """One GGUF-style direct-dot launch for shared-input VQ Decode."""
+        return _EXT.dense_vq_gemv_grouped_fp8_codebook(
+            x_rows.to(torch.bfloat16).contiguous(),
+            metadata.contiguous(),
+            int(total_rows),
         )
-        return result[0], result[1]
 
     def dense_vq_dequant_packed_fused(
         payload: torch.Tensor,
@@ -794,6 +789,39 @@ if _EXT is not None:
             row_ids.contiguous(),
         )
 
+    def dense_vq_expand_native8_fused(
+        payload: torch.Tensor,
+        quantized_codebook: torch.Tensor,
+        output: torch.Tensor,
+        rows: int,
+        blocks: int,
+        bits: int,
+        row_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Expand VQ into a reusable native E4M3/INT8 execution buffer.
+
+        The small codebook is quantized once by the caller. Conversion then
+        performs only index unpacking and aligned vector copies, so its cost is
+        bounded primarily by writing the one-byte execution image.
+        """
+        if row_ids is None:
+            row_ids = torch.empty(
+                0, dtype=torch.int64, device=payload.device
+            )
+        if quantized_codebook.dtype not in (torch.float8_e4m3fn, torch.int8):
+            raise ValueError("native8 codebook must be E4M3 or INT8")
+        if output.dtype != quantized_codebook.dtype:
+            raise ValueError("native8 output dtype must match its codebook")
+        return _EXT.dense_vq_expand_native8(
+            payload.contiguous().reshape(-1),
+            quantized_codebook.contiguous(),
+            output,
+            int(rows),
+            int(blocks),
+            int(bits),
+            row_ids.contiguous(),
+        )
+
     def dense_fp8_quantize_rows_fused(
         value: torch.Tensor,
         output: torch.Tensor,
@@ -802,9 +830,9 @@ if _EXT is not None:
         """Quantize CUDA activation rows into preallocated native E4M3.
 
         Preallocated buffers make this entry safe inside a whole-token CUDA
-        graph.  Weight scales belong to the generic Dense-VQ module; this
-        kernel computes only the per-activation-row scale required by native
-        row-wise ``torch._scaled_mm``.
+        graph.  A scalar scale selects the CUDA-12.8-compatible tensor-scaled
+        GEMM path; ``[rows,1]`` remains available to callers on runtimes with
+        native row-scaled GEMM support.
         """
         if (
             not value.is_cuda
@@ -817,7 +845,10 @@ if _EXT is not None:
             or not output.is_contiguous()
             or not scales.is_cuda
             or scales.dtype != torch.float32
-            or scales.shape != (value.shape[0], 1)
+            or scales.shape not in {
+                (1, 1),
+                (value.shape[0], 1),
+            }
             or not scales.is_contiguous()
         ):
             return None
@@ -956,6 +987,53 @@ if _EXT is not None:
             beta.contiguous(),
             state,
             output,
+        )
+
+    def qwen35_delta_recurrent_batch_checkpoint_fused(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        gate: torch.Tensor,
+        beta: torch.Tensor,
+        state: torch.Tensor,
+        output: torch.Tensor,
+        checkpoints: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Run an ordered block and retain the state after every token."""
+        expected = (
+            query.shape[0],
+            query.shape[1],
+            query.shape[2],
+            value.shape[2],
+        )
+        if (
+            not query.is_cuda
+            or query.dtype != torch.bfloat16
+            or query.ndim != 3
+            or key.shape != query.shape
+            or key.dtype != torch.bfloat16
+            or value.ndim != 3
+            or value.dtype != torch.bfloat16
+            or value.shape[:2] != query.shape[:2]
+            or state.dtype != torch.float32
+            or state.shape != expected[1:]
+            or gate.numel() != query.shape[0] * query.shape[1]
+            or beta.numel() != query.shape[0] * query.shape[1]
+            or output.shape != value.shape
+            or output.dtype != torch.bfloat16
+            or checkpoints.dtype != torch.float32
+            or checkpoints.shape != expected
+        ):
+            return None
+        return _EXT.qwen35_delta_recurrent_batch_checkpoint(
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            gate.contiguous(),
+            beta.contiguous(),
+            state,
+            output,
+            checkpoints,
         )
 
     def kda_recurrent_fused(
@@ -3095,6 +3173,32 @@ if _EXT is not None:
                 output_down,
             )
 
+    def projection_expand_native8_fused(
+        metadata: torch.Tensor,
+        output_gu: torch.Tensor,
+        output_down: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Expand packed projections into reusable E4M3/INT8 buffers."""
+        if (
+            not metadata.is_cuda
+            or metadata.dtype != torch.long
+            or metadata.ndim != 2
+            or metadata.shape[0] not in (10, 15)
+            or not output_gu.is_cuda
+            or output_gu.dtype not in (torch.float8_e4m3fn, torch.int8)
+            or output_gu.ndim != 3
+            or not output_down.is_cuda
+            or output_down.dtype != output_gu.dtype
+            or output_down.ndim not in (2, 3)
+        ):
+            return None
+        with torch.cuda.device(metadata.device):
+            return _EXT.vq_projection_expand_native8(
+                metadata.contiguous(),
+                output_gu,
+                output_down,
+            )
+
     def tp_moe_finalize_from_events_fused(
         routed_contributions: list[torch.Tensor],
         shared_contributions: list[torch.Tensor],
@@ -3588,7 +3692,7 @@ else:
     def dense_vq_gemv_packed_fused(*args, **kwargs):
         raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")
 
-    def dense_vq_compile_int4_g64_fused(*args, **kwargs):
+    def dense_vq_gemv_grouped_fp8_codebook_fused(*args, **kwargs):
         raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")
 
     def dense_vq_dequant_packed_fused(*args, **kwargs):
@@ -3615,6 +3719,9 @@ else:
     def qwen35_delta_recurrent_batch_fused(*args, **kwargs):
         return None
 
+    def qwen35_delta_recurrent_batch_checkpoint_fused(*args, **kwargs):
+        return None
+
     def gated_rmsnorm_fused(*args, **kwargs):
         return None
 
@@ -3622,6 +3729,9 @@ else:
         return None
 
     def projection_dequant_fused(*args, **kwargs):
+        return None
+
+    def projection_expand_native8_fused(*args, **kwargs):
         return None
 
     def packed_stage_topk_three_projection_fused(*args, **kwargs):

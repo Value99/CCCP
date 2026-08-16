@@ -1322,6 +1322,104 @@ class CpuResidentProjectionLayer {
   std::mutex mutex_;
 };
 
+class CpuBF16SwiGLULayer {
+ public:
+  CpuBF16SwiGLULayer(
+      torch::Tensor gate,
+      torch::Tensor up,
+      torch::Tensor down)
+      : gate_(std::move(gate)),
+        up_(std::move(up)),
+        down_(std::move(down)) {
+    TORCH_CHECK(
+        !gate_.is_cuda() && !up_.is_cuda() && !down_.is_cuda() &&
+            gate_.scalar_type() == at::kBFloat16 &&
+            up_.scalar_type() == at::kBFloat16 &&
+            down_.scalar_type() == at::kBFloat16 &&
+            gate_.dim() == 2 && up_.dim() == 2 && down_.dim() == 2 &&
+            gate_.is_contiguous() && up_.is_contiguous() &&
+            down_.is_contiguous() && gate_.sizes() == up_.sizes() &&
+            down_.size(1) == gate_.size(0) &&
+            down_.size(0) == gate_.size(1),
+        "resident BF16 SwiGLU projection shapes do not match");
+    hidden_ = gate_.size(1);
+    intermediate_ = gate_.size(0);
+    auto options = torch::TensorOptions()
+        .dtype(torch::kBFloat16).device(torch::kCPU);
+    input_ = torch::empty({hidden_}, options);
+    activation_ = torch::empty({intermediate_}, options);
+    output_ = torch::empty({hidden_}, options);
+  }
+
+  torch::Tensor forward(torch::Tensor value) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto row = value.contiguous().reshape({1, -1});
+    TORCH_CHECK(
+        !row.is_cuda() && row.size(1) == hidden_ &&
+            (row.scalar_type() == at::kFloat ||
+             row.scalar_type() == at::kBFloat16),
+        "resident BF16 SwiGLU requires one CPU FP32/BF16 row");
+    const bool copy_input = row.scalar_type() == at::kFloat;
+    const float* source_float =
+        copy_input ? row.data_ptr<float>() : nullptr;
+    const auto* source_bf16 = copy_input
+        ? nullptr : row.data_ptr<at::BFloat16>();
+    auto* input = input_.data_ptr<at::BFloat16>();
+    auto* activation = activation_.data_ptr<at::BFloat16>();
+    auto* output = output_.data_ptr<at::BFloat16>();
+    const auto* gate = gate_.data_ptr<at::BFloat16>();
+    const auto* up = up_.data_ptr<at::BFloat16>();
+    const auto* down = down_.data_ptr<at::BFloat16>();
+#pragma omp parallel
+    {
+      if (copy_input) {
+#pragma omp for schedule(static)
+        for (int64_t column = 0; column < hidden_; ++column) {
+          input[column] = at::BFloat16(source_float[column]);
+        }
+      } else {
+#pragma omp for schedule(static)
+        for (int64_t column = 0; column < hidden_; ++column) {
+          input[column] = source_bf16[column];
+        }
+      }
+#pragma omp for schedule(static)
+      for (int64_t row_index = 0;
+           row_index < intermediate_; ++row_index) {
+        // Match the public BF16 projection path: each projection is rounded
+        // to BF16 before activation and the activation is rounded again
+        // before the Down projection consumes it.
+        const float gate_value = static_cast<float>(at::BFloat16(
+            bf16_dense_row_dot(
+                input, gate + row_index * hidden_, hidden_)));
+        const float up_value = static_cast<float>(at::BFloat16(
+            bf16_dense_row_dot(
+                input, up + row_index * hidden_, hidden_)));
+        const float sigmoid = gate_value >= 0.0f
+            ? 1.0f / (1.0f + std::exp(-gate_value))
+            : std::exp(gate_value) / (1.0f + std::exp(gate_value));
+        activation[row_index] = at::BFloat16(
+            static_cast<float>(at::BFloat16(gate_value * sigmoid)) *
+            up_value);
+      }
+#pragma omp for schedule(static)
+      for (int64_t row_index = 0; row_index < hidden_; ++row_index) {
+        output[row_index] = at::BFloat16(bf16_dense_row_dot(
+            activation,
+            down + row_index * intermediate_,
+            intermediate_));
+      }
+    }
+    return output_.reshape({1, hidden_});
+  }
+
+ private:
+  torch::Tensor gate_, up_, down_, input_, activation_, output_;
+  int64_t hidden_ = 0;
+  int64_t intermediate_ = 0;
+  std::mutex mutex_;
+};
+
 inline void block_fp8_row_dot_many(
     const float* input_f,
     const at::BFloat16* input_b,
@@ -6142,6 +6240,11 @@ class CpuPackedThreeMixedLayer {
             input_q8, selected_, gate_payloads_, up_payloads_, hidden_,
             intermediate_, activation_limit, activation,
             situ_beta, situ_linear_beta, routed_activation);
+        // The NUMA-local evaluator partitions rows manually instead of using
+        // an OpenMP `for`, so it has no implicit end barrier.  Every routed
+        // activation must be complete before any thread starts quantizing a
+        // Q8 block for the Down projection.
+#pragma omp barrier
 #pragma omp for schedule(static)
         for (int64_t task = 0;
              task < route_top_k_ * (intermediate_ / 32); ++task) {
@@ -6707,6 +6810,10 @@ class CpuPackedThreeMixedLayer {
             q4_input, selected, gate_payloads, up_payloads, hidden_,
             intermediate_, activation_limit, activation,
             situ_beta, situ_linear_beta, gatep);
+        // See the fused-MoE path above.  Without this explicit boundary the
+        // hand-partitioned NUMA branch races Q8 activation quantization and
+        // can turn a finite one-token SwiGLU input into all-NaN output.
+#pragma omp barrier
 #pragma omp for schedule(static)
         for (int64_t task = 0;
              task < top_k * (intermediate_ / 32); ++task) {
@@ -8570,6 +8677,195 @@ torch::Tensor qwen35_delta_recurrent_cpu(
         output_b[value_base + v_lane] = at::BFloat16(result[v_lane]);
       } else {
         output_f[value_base + v_lane] = result[v_lane];
+      }
+    }
+  }
+  return output;
+}
+
+torch::Tensor qwen35_delta_recurrent_batch_cpu(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+    torch::Tensor gate,
+    torch::Tensor beta,
+    torch::Tensor state,
+    torch::Tensor output) {
+  TORCH_CHECK(
+      !query.is_cuda() && query.dim() == 3 && query.is_contiguous() &&
+          key.sizes() == query.sizes() && key.is_contiguous(),
+      "Qwen3.5 batched delta query/key must be contiguous CPU "
+      "[tokens,heads,key_dim]");
+  TORCH_CHECK(
+      query.scalar_type() == at::kFloat ||
+          query.scalar_type() == at::kBFloat16,
+      "Qwen3.5 batched delta query/key must be float32 or bfloat16");
+  TORCH_CHECK(
+      key.scalar_type() == query.scalar_type() &&
+          value.scalar_type() == query.scalar_type() &&
+          output.scalar_type() == query.scalar_type(),
+      "Qwen3.5 batched delta activation dtypes must match");
+  const int64_t tokens = query.size(0);
+  const int64_t heads = query.size(1);
+  const int64_t key_dim = query.size(2);
+  TORCH_CHECK(
+      value.dim() == 3 && value.size(0) == tokens &&
+          value.size(1) == heads && value.is_contiguous() &&
+          output.sizes() == value.sizes() && output.is_contiguous(),
+      "Qwen3.5 batched delta value/output shape mismatch");
+  const int64_t value_dim = value.size(2);
+  TORCH_CHECK(
+      tokens > 0 && heads > 0 && key_dim > 0 && value_dim > 0 &&
+          !state.is_cuda() && state.scalar_type() == at::kFloat &&
+          state.sizes() ==
+              torch::IntArrayRef({heads, key_dim, value_dim}) &&
+          state.is_contiguous(),
+      "Qwen3.5 batched delta state shape mismatch");
+  TORCH_CHECK(
+      !gate.is_cuda() && !beta.is_cuda() && gate.is_contiguous() &&
+          beta.is_contiguous() && gate.numel() == tokens * heads &&
+          beta.numel() == tokens * heads &&
+          (gate.scalar_type() == at::kFloat ||
+           gate.scalar_type() == at::kBFloat16) &&
+          (beta.scalar_type() == at::kFloat ||
+           beta.scalar_type() == at::kBFloat16),
+      "Qwen3.5 batched delta gate/beta shape or dtype mismatch");
+
+  const bool bf16 = query.scalar_type() == at::kBFloat16;
+  const auto* query_b = bf16 ? query.data_ptr<at::BFloat16>() : nullptr;
+  const auto* key_b = bf16 ? key.data_ptr<at::BFloat16>() : nullptr;
+  const auto* value_b = bf16 ? value.data_ptr<at::BFloat16>() : nullptr;
+  auto* output_b = bf16 ? output.data_ptr<at::BFloat16>() : nullptr;
+  const float* query_f = bf16 ? nullptr : query.data_ptr<float>();
+  const float* key_f = bf16 ? nullptr : key.data_ptr<float>();
+  const float* value_f = bf16 ? nullptr : value.data_ptr<float>();
+  float* output_f = bf16 ? nullptr : output.data_ptr<float>();
+  const bool gate_bf16 = gate.scalar_type() == at::kBFloat16;
+  const bool beta_bf16 = beta.scalar_type() == at::kBFloat16;
+  const auto* gate_b = gate_bf16
+      ? gate.data_ptr<at::BFloat16>() : nullptr;
+  const auto* beta_b = beta_bf16
+      ? beta.data_ptr<at::BFloat16>() : nullptr;
+  const float* gate_f = gate_bf16 ? nullptr : gate.data_ptr<float>();
+  const float* beta_f = beta_bf16 ? nullptr : beta.data_ptr<float>();
+  float* statep = state.data_ptr<float>();
+
+  // Normalization is shared by every value tile.  Materializing two compact
+  // FP32 [T,H,K] workspaces once avoids repeating the reductions in each
+  // value-column task while retaining the reference operation order.
+  auto normalized_query = torch::empty(
+      {tokens, heads, key_dim}, query.options().dtype(at::kFloat));
+  auto normalized_key = torch::empty(
+      {tokens, heads, key_dim}, query.options().dtype(at::kFloat));
+  auto decay = torch::empty(
+      {tokens, heads}, query.options().dtype(at::kFloat));
+  auto beta_values = torch::empty(
+      {tokens, heads}, query.options().dtype(at::kFloat));
+  float* query_norm = normalized_query.data_ptr<float>();
+  float* key_norm = normalized_key.data_ptr<float>();
+  float* decayp = decay.data_ptr<float>();
+  float* betap = beta_values.data_ptr<float>();
+
+#pragma omp parallel for schedule(static)
+  for (int64_t item = 0; item < tokens * heads; ++item) {
+    const int64_t base = item * key_dim;
+    float query_square = 0.0f;
+    float key_square = 0.0f;
+    for (int64_t lane = 0; lane < key_dim; ++lane) {
+      const float q = bf16
+          ? static_cast<float>(query_b[base + lane])
+          : query_f[base + lane];
+      const float k = bf16
+          ? static_cast<float>(key_b[base + lane])
+          : key_f[base + lane];
+      query_square += q * q;
+      key_square += k * k;
+    }
+    const float query_inverse =
+        1.0f / std::max(std::sqrt(query_square), 1.0e-6f);
+    const float key_inverse =
+        1.0f / std::max(std::sqrt(key_square), 1.0e-6f);
+    for (int64_t lane = 0; lane < key_dim; ++lane) {
+      query_norm[base + lane] =
+          (bf16 ? static_cast<float>(query_b[base + lane])
+                : query_f[base + lane]) * query_inverse;
+      key_norm[base + lane] =
+          (bf16 ? static_cast<float>(key_b[base + lane])
+                : key_f[base + lane]) * key_inverse;
+    }
+    decayp[item] = std::exp(
+        gate_bf16 ? static_cast<float>(gate_b[item]) : gate_f[item]);
+    betap[item] = beta_bf16
+        ? static_cast<float>(beta_b[item]) : beta_f[item];
+  }
+
+  // Qwen3.5-27B has 48 value heads of width 128.  A 64-column tile yields
+  // exactly 96 long-lived tasks on a dual 48-core host, while reading each
+  // normalized Q/K row only twice instead of eight times with 16 columns.
+  // Smaller/larger dense models derive their task count from the same shape.
+  constexpr int64_t kValueTile = 64;
+  const int64_t value_tiles =
+      (value_dim + kValueTile - 1) / kValueTile;
+  const float output_scale =
+      1.0f / std::sqrt(static_cast<float>(key_dim));
+
+  // Each task owns complete cache lines of the recurrent state's value
+  // dimension.  Tokens remain strictly sequential within a task, while
+  // heads and value tiles use the full physical-core pool.
+#pragma omp parallel for schedule(static)
+  for (int64_t task = 0; task < heads * value_tiles; ++task) {
+    const int64_t head = task / value_tiles;
+    const int64_t value_begin =
+        (task - head * value_tiles) * kValueTile;
+    const int64_t lanes =
+        std::min<int64_t>(kValueTile, value_dim - value_begin);
+    alignas(64) float prediction[kValueTile];
+    alignas(64) float delta[kValueTile];
+    alignas(64) float result[kValueTile];
+    for (int64_t token = 0; token < tokens; ++token) {
+      std::fill(prediction, prediction + lanes, 0.0f);
+      std::fill(result, result + lanes, 0.0f);
+      const int64_t scalar = token * heads + head;
+      const int64_t qk_base = scalar * key_dim;
+      const float token_decay = decayp[scalar];
+      float* state_head = statep + head * key_dim * value_dim;
+      for (int64_t k_lane = 0; k_lane < key_dim; ++k_lane) {
+        float* state_row =
+            state_head + k_lane * value_dim + value_begin;
+        const float key_value = key_norm[qk_base + k_lane];
+        for (int64_t lane = 0; lane < lanes; ++lane) {
+          const float current = state_row[lane] * token_decay;
+          state_row[lane] = current;
+          prediction[lane] += current * key_value;
+        }
+      }
+      const int64_t value_base = scalar * value_dim + value_begin;
+      const float token_beta = betap[scalar];
+      for (int64_t lane = 0; lane < lanes; ++lane) {
+        const float current = bf16
+            ? static_cast<float>(value_b[value_base + lane])
+            : value_f[value_base + lane];
+        delta[lane] = (current - prediction[lane]) * token_beta;
+      }
+      for (int64_t k_lane = 0; k_lane < key_dim; ++k_lane) {
+        float* state_row =
+            state_head + k_lane * value_dim + value_begin;
+        const float key_value = key_norm[qk_base + k_lane];
+        const float query_value = query_norm[qk_base + k_lane];
+        for (int64_t lane = 0; lane < lanes; ++lane) {
+          const float current =
+              state_row[lane] + key_value * delta[lane];
+          state_row[lane] = current;
+          result[lane] += current * query_value;
+        }
+      }
+      for (int64_t lane = 0; lane < lanes; ++lane) {
+        const float current = result[lane] * output_scale;
+        if (bf16) {
+          output_b[value_base + lane] = at::BFloat16(current);
+        } else {
+          output_f[value_base + lane] = current;
+        }
       }
     }
   }
@@ -11276,6 +11572,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       .def(
           "forward_grouped",
           &CpuResidentProjectionLayer::forward_grouped);
+  pybind11::class_<CpuBF16SwiGLULayer>(module, "CpuBF16SwiGLULayer")
+      .def(pybind11::init<
+          torch::Tensor,
+          torch::Tensor,
+          torch::Tensor>())
+      .def("forward", &CpuBF16SwiGLULayer::forward);
   pybind11::class_<CpuPackedThreeLayer>(
       module, "CpuPackedThreeLayer")
       .def(
@@ -11496,6 +11798,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       "qwen35_delta_recurrent",
       &qwen35_delta_recurrent_cpu,
       "CCCP fused Qwen3.5 gated-delta recurrence for CPU");
+  module.def(
+      "qwen35_delta_recurrent_batch",
+      &qwen35_delta_recurrent_batch_cpu,
+      "CCCP fused ordered Qwen3.5 gated-delta batch for CPU");
   module.def(
       "qwen35_conv1d_update",
       &qwen35_conv1d_update_cpu,

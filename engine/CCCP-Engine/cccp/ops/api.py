@@ -1192,16 +1192,29 @@ def attention_step(kind: str, device_type: str, **kwargs):
         query = kwargs.get("query")
         if not isinstance(query, torch.Tensor):
             query = kwargs.get("query_nope")
-        request = OperatorRequest(
-            operation=f"attention_step:{normalized_kind}",
-            device_type=normalized_device,
-            activation="none",
-            batch_size=(
+        if (
+            normalized_kind == "compressed_kv_decode"
+            and isinstance(query, torch.Tensor)
+            and query.ndim >= 3
+        ):
+            # The TP MLA executor stores query_nope as
+            # [local_heads, token_batch, head_dim].  The leading dimension is
+            # the number of heads, not the request batch.  Treating it as the
+            # batch made otherwise-valid Kimi TP captures (for example 24
+            # local heads and one token) miss the registered decode operator.
+            batch_size = int(query.shape[1])
+        else:
+            batch_size = (
                 int(query.shape[0])
                 if isinstance(query, torch.Tensor)
                 and query.ndim >= 3
                 else 1
-            ),
+            )
+        request = OperatorRequest(
+            operation=f"attention_step:{normalized_kind}",
+            device_type=normalized_device,
+            activation="none",
+            batch_size=batch_size,
         )
         implementation = REGISTRY.resolve(request).implementation
         _ATTENTION_IMPLEMENTATIONS[key] = implementation
@@ -1766,6 +1779,44 @@ def projection_dequant(
             f"gate_up[{describe(output_gu)}]; "
             f"down[{describe(output_down)}]"
         )
+    return output
+
+
+def projection_expand_native8(
+    metadata: torch.Tensor,
+    output_gu: torch.Tensor,
+    output_down: torch.Tensor,
+) -> torch.Tensor:
+    """Public packed-to-E4M3/INT8 projection expansion operation."""
+    _ensure_builtins()
+    if metadata.ndim != 2 or metadata.shape[0] not in (10, 15):
+        raise ValueError(
+            "native8 projection expansion requires [10,E] or [15,E] metadata"
+        )
+    dtype_name = (
+        "e4m3" if output_gu.dtype == torch.float8_e4m3fn else "int8"
+    )
+    request = OperatorRequest(
+        operation="projection_expand_native8",
+        device_type=metadata.device.type,
+        packed_formats=tuple(f"p{bits}" for bits in range(8, 17)),
+        code_dims=(4, 8, 16),
+        codebook_sizes=(
+            256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536
+        ),
+        activation="none",
+        top_k=1,
+        batch_size=int(output_gu.shape[0]) if output_gu.ndim == 3 else 1,
+        dtype=dtype_name,
+    )
+    output = REGISTRY.call(
+        request,
+        metadata=metadata,
+        output_gu=output_gu,
+        output_down=output_down,
+    )
+    if output is None:
+        raise RuntimeError("native8 projection expansion rejected input")
     return output
 
 

@@ -13,6 +13,10 @@ from .presets import (
     resolve_preset,
 )
 from .runtime_defaults import configure_cpu_operator_defaults
+from .speculative import (
+    provider_attachment_available_in_manifest,
+    provider_for_architecture,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -185,6 +189,39 @@ def _parser() -> argparse.ArgumentParser:
 def _value(args: argparse.Namespace, preset: Any, name: str) -> Any:
     value = getattr(args, name)
     return preset.defaults.get(name) if value is None else value
+
+
+def _spec_value(args: argparse.Namespace, preset: Any) -> int:
+    """Resolve an architecture-published draft count for this backend.
+
+    CPU and accelerator kernels have different break-even points.  Keep the
+    policy in the public architecture config and preserve an explicit
+    ``--spec`` as the highest-priority reproducibility override.
+    """
+    if args.spec is not None:
+        return int(args.spec)
+    backend = str(
+        os.environ.get("CCCP_RUNTIME_BACKEND")
+        or _value(args, preset, "device")
+    ).lower()
+    configured = preset.defaults.get("spec_by_device") or {}
+    if isinstance(configured, dict) and backend in configured:
+        drafts = int(configured[backend])
+    else:
+        drafts = int(preset.defaults.get("spec") or 0)
+    if drafts <= 0:
+        return 0
+    try:
+        provider = provider_for_architecture(preset.architecture)
+    except ValueError:
+        return 0
+    if not provider_attachment_available_in_manifest(
+        provider,
+        preset.manifest,
+        preset.model_dir,
+    ):
+        return 0
+    return min(drafts, int(provider.policy.max_draft))
 
 
 def _normalize_launch_request(args: argparse.Namespace) -> tuple[str, ...]:
@@ -385,7 +422,7 @@ def _apply_environment(
 def _summary(args: argparse.Namespace, preset: Any) -> None:
     device = _value(args, preset, "device")
     max_ctx = _value(args, preset, "max_ctx")
-    spec = _value(args, preset, "spec")
+    spec = _spec_value(args, preset)
     layout = preset.ep_layout or "-"
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "系统默认")
     print(
@@ -440,7 +477,7 @@ def _chat_argv(args: argparse.Namespace, preset: Any) -> list[str]:
         "--max-ctx",
         str(_value(args, preset, "max_ctx")),
         "--spec",
-        str(_value(args, preset, "spec")),
+        str(_spec_value(args, preset)),
         "--temp",
         str(_configured(args, preset, "temp", "temperature")),
         "--top-p",
@@ -481,7 +518,7 @@ def _serve_argv(args: argparse.Namespace, preset: Any) -> list[str]:
         "--max-ctx",
         str(_value(args, preset, "max_ctx")),
         "--spec",
-        str(_value(args, preset, "spec")),
+        str(_spec_value(args, preset)),
         "--host",
         str(_value(args, preset, "host")),
         "--port",

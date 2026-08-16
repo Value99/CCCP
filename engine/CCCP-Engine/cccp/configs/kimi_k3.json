@@ -5,6 +5,14 @@
   "supports_parallel": true,
   "tested_tp_min": 2,
   "tested_tp_max": 8,
+  "speculative": {
+    "provider": "kimi_prompt_lookup",
+    "max_draft": 5,
+    "accept_top_n": 3,
+    "attachment": {
+      "kind": "builtin"
+    }
+  },
   "defaults": {
     "device": "cuda",
     "max_ctx": 4096,
@@ -78,7 +86,7 @@
         "CCCP_TP_NO_OWNER": "1",
         "CCCP_TP_LAYER_GRAPH": "1",
         "CCCP_TP_MOE_PLAN": "1",
-        "CCCP_TP_DECODE_LAYER_PLAN": "1",
+        "CCCP_TP_DECODE_LAYER_PLAN": "0",
         "CCCP_ROUTED_WARPS": "8",
         "CCCP_MOE_ROUTE_DOWN_TP": "1"
       }
@@ -94,7 +102,7 @@
         "CCCP_TP_NO_OWNER": "1",
         "CCCP_TP_LAYER_GRAPH": "1",
         "CCCP_TP_MOE_PLAN": "1",
-        "CCCP_TP_DECODE_LAYER_PLAN": "1",
+        "CCCP_TP_DECODE_LAYER_PLAN": "0",
         "CCCP_ROUTED_WARPS": "8",
         "CCCP_MOE_ROUTE_DOWN_TP": "1"
       }
@@ -110,7 +118,7 @@
         "CCCP_TP_NO_OWNER": "1",
         "CCCP_TP_LAYER_GRAPH": "1",
         "CCCP_TP_MOE_PLAN": "1",
-        "CCCP_TP_DECODE_LAYER_PLAN": "1",
+        "CCCP_TP_DECODE_LAYER_PLAN": "0",
         "CCCP_TP_FUSED_MOE_FINALIZE": "1",
         "CCCP_TP_EVENT_BARRIER": "1",
         "CCCP_ROUTED_WARPS": "8",

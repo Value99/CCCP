@@ -31,7 +31,9 @@ from cccp.dsv4model import (  # noqa: E402
     _automatic_prefetch_policy,
     _compressor_decode_cccp,
     _compressor_prefill_cccp,
+    _indexer_candidate_capacity,
     _prefill_sliding_window,
+    _requires_flashmla_splitkv,
     _tp1_token_graph_bucket,
 )
 from cccp.dsv4cache import PagedKV  # noqa: E402
@@ -1050,6 +1052,39 @@ def test_kimi_ram_dense_cuda_prefill_uses_layer_major_rows():
     assert "release_host_rows_workspace" in block_source
 
 
+def test_kimi_full_resident_payload_precedes_runtime_graph_capture():
+    """Large TP expert writes must finish before KDA/Dense graph capture."""
+    from cccp.kimi_model import KimiK3CCCPModel
+
+    source = inspect.getsource(KimiK3CCCPModel.preload)
+    payload = source.index("self.pool.preload(capture_graphs=False)")
+    kda = source.index("self._prepare_tp_kda()")
+    runtime_graphs = source.index("self.pool.preload()", kda)
+    assert payload < kda < runtime_graphs
+    final_kda = source.rindex("self._tp_kda.capture()")
+    parent_plans = source.index("self._prepare_no_owner_moe_plans()")
+    assert runtime_graphs < parent_plans < final_kda
+
+    from cccp.ops.tensor_parallel import TensorParallelKDA
+
+    capture_source = inspect.getsource(TensorParallelKDA.capture)
+    assert "if layers is None" in capture_source
+    assert "state.output_replicas is None" in capture_source
+    assert "state.output_events is None" in capture_source
+
+    config = json.loads(
+        (
+            ENGINE_ROOT / "cccp" / "configs" / "kimi_k3.json"
+        ).read_text(encoding="utf-8")
+    )
+    for profile in ("parallel", "parallel_tp4", "parallel_tp8"):
+        assert (
+            config["profiles"][profile]["environment"]
+            ["CCCP_TP_DECODE_LAYER_PLAN"]
+            == "0"
+        )
+
+
 def test_small_vram_uses_fixed_slab_route_repartition_not_token_split():
     build_source = inspect.getsource(PackedHybridPool.build_gpu_arenas)
     route_source = inspect.getsource(
@@ -1187,6 +1222,32 @@ def test_dsv4_tp1_graph_buckets_and_hip_capture_policy_are_bounded():
     assert "spec[0] == requested_bucket" in source
     assert "AMD/HIP 按需单 bucket" in source
     assert "else '全 bucket 预捕获'" in source
+
+
+def test_dsv4_long_cuda_requires_flashmla_and_indexer_alignment():
+    assert _requires_flashmla_splitkv(
+        device_type="cuda", hip_runtime=False, max_ctx=2051
+    ) is False
+    assert _requires_flashmla_splitkv(
+        device_type="cuda", hip_runtime=False, max_ctx=2052
+    ) is True
+    assert _requires_flashmla_splitkv(
+        device_type="cuda", hip_runtime=True, max_ctx=4096
+    ) is False
+    assert _requires_flashmla_splitkv(
+        device_type="cpu", hip_runtime=False, max_ctx=4096
+    ) is False
+    assert _indexer_candidate_capacity(1) == 16
+    assert _indexer_candidate_capacity(1024) == 1024
+    assert _indexer_candidate_capacity(1092) == 1104
+    with pytest.raises(ValueError, match="positive"):
+        _indexer_candidate_capacity(0)
+
+    attention_source = inspect.getsource(
+        DSV4CCCPModel._tp_controlled_attention
+    )
+    assert "禁止退回 BF16 Indexer" in attention_source
+    assert "sparse_selected" not in attention_source
 
 
 def test_hip_full_resident_selects_tp1_before_pool_construction():
@@ -1485,6 +1546,23 @@ def test_grouped_packed_prefill_accepts_two_projection_metadata():
     assert "metadata.shape[0] not in (10, 15)" in fused_source
     assert "metadata_rows == 10 ? 0 : 5" in cuda_source
     assert "metadata_rows == 10 ? 5 : 10" in cuda_source
+
+
+def test_grouped_packed_prefill_decodes_heterogeneous_gate_up_layouts():
+    cuda_source = (
+        ENGINE_ROOT / "cccp" / "csrc" / "vq_gemv.cu"
+    ).read_text(encoding="utf-8")
+    kernel = cuda_source.split(
+        "__global__ void vq_projection_gate_up_grouped_kernel", 1
+    )[1].split(
+        "__global__ void vq_projection_down_grouped_kernel", 1
+    )[0]
+
+    assert "const bool same_layout" in kernel
+    assert "if (same_layout)" in kernel
+    assert "block < gate_meta.blocks" in kernel
+    assert "block < up_meta.blocks" in kernel
+    assert "gate_meta.blocks != up_meta.blocks" not in kernel
 
 
 def test_glm_tp2_final_reduce_uses_contribution_list_contract():
@@ -2726,3 +2804,59 @@ def test_block_major_weight_uses_logical_row_bounds():
         layout="block-major32",
     )
     assert weight.dequant_rows(0, 128).shape == (128, 128)
+
+
+def test_tensor_fp8_weight_preserves_scalar_scale_and_slices():
+    """公共 Tensor-FP8 执行映像保持一字节权重和标量反量化语义。"""
+    engine_root = Path(__file__).resolve().parents[1] / "engine" / "CCCP-Engine"
+    sys.path.insert(0, str(engine_root))
+    import torch
+    from cccp.kernels import BlockFP8Weight
+
+    values = torch.tensor(
+        [[1.0, -2.0, 3.0, -4.0], [5.0, -6.0, 7.0, -8.0]],
+        dtype=torch.float32,
+    ).to(torch.float8_e4m3fn)
+    weight = BlockFP8Weight(
+        values.view(torch.uint8),
+        torch.tensor([0.25], dtype=torch.float32),
+        cols=4,
+        rows=2,
+        layout="tensor-fp8",
+    )
+    expected = values.float() * 0.25
+    assert torch.equal(weight.dequant_rows(0, 2, torch.float32), expected)
+    assert torch.equal(
+        weight.row_view(1, 2).dequant_rows(0, 1, torch.float32),
+        expected[1:2],
+    )
+    assert torch.equal(
+        weight.column_slice(1, 3).dequant_rows(0, 2, torch.float32),
+        expected[:, 1:3],
+    )
+
+
+def test_compressed_kv_decode_registry_uses_token_axis(monkeypatch):
+    """TP MLA 的 leading axis 是本地 heads，不能误当请求 batch。"""
+    from cccp.ops import api as ops_api
+
+    key = ("compressed_kv_decode", "cuda")
+    ops_api._ATTENTION_IMPLEMENTATIONS.pop(key, None)
+    captured = {}
+
+    def resolve(request):
+        captured["request"] = request
+        return SimpleNamespace(implementation=lambda **kwargs: "resolved")
+
+    monkeypatch.setattr(ops_api.REGISTRY, "resolve", resolve)
+    try:
+        result = ops_api.attention_step(
+            "compressed_kv_decode",
+            "cuda",
+            query_nope=torch.empty((24, 1, 128)),
+        )
+    finally:
+        ops_api._ATTENTION_IMPLEMENTATIONS.pop(key, None)
+
+    assert result == "resolved"
+    assert captured["request"].batch_size == 1

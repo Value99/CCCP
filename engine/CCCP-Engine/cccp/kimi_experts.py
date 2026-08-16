@@ -573,6 +573,9 @@ class PackedExpertPool:
         self.prefill_rows_supported = True
         self.active = False
         self._allocated = False
+        self._payload_loaded = False
+        self._payload_loaded_count = 0
+        self._payload_load_seconds = 0.0
         self._arenas: list[torch.Tensor] = []
         # Full-resident experts are split by layer. Windows ROCm rejects very
         # large single allocations with hipErrorInvalidValue even when total
@@ -1481,8 +1484,27 @@ class PackedExpertPool:
             local_blocks,
         )
 
-    def preload(self, *, dense_resident: bool = False) -> None:
+    def preload(
+        self,
+        *,
+        dense_resident: bool = False,
+        capture_graphs: bool = True,
+    ) -> None:
         """Read each packed expert once and write it directly into its arena."""
+        if self._payload_loaded:
+            if capture_graphs and not self.active:
+                if os.environ.get(
+                    "CCCP_TP_GRAPH",
+                    os.environ.get("CCCP_KIMI_TP_GRAPH", "1"),
+                ) != "0":
+                    self._prepare_expert_graphs()
+                self.active = True
+                print(
+                    "[cccp-packed] packed 专家固定数据先于 Dense/Attention "
+                    "Graph 完成；运行图已在最终固定地址上捕获",
+                    flush=True,
+                )
+            return
         self.allocate(dense_resident=dense_resident)
         started = time.time()
         n_experts = int(self.store.cfg["n_experts"])
@@ -1895,27 +1917,30 @@ class PackedExpertPool:
                             device=device,
                         )
                     )
-            if os.environ.get(
+            if capture_graphs and os.environ.get(
                 "CCCP_TP_GRAPH",
                 os.environ.get("CCCP_KIMI_TP_GRAPH", "1"),
             ) != "0":
                 self._prepare_expert_graphs()
         self.store._cb_cache.clear()
         gc.collect()
-        self.active = True
+        self._payload_loaded = True
+        self._payload_loaded_count = loaded
+        self._payload_load_seconds = time.time() - started
+        self.active = bool(capture_graphs)
         if self.host_mapped:
             print(
                 f"[cccp-packed] packed 专家 UVA 映射完成：{loaded} 个，"
                 f"RAM={self.host_expert_bytes / 2**30:.2f}GiB，"
                 f"VRAM码本/工作区={self.gpu_storage_bytes / 2**30:.2f}GiB，"
-                f"{time.time() - started:.1f}s；运行期无逐层 H2D",
+                f"{self._payload_load_seconds:.1f}s；运行期无逐层 H2D",
                 flush=True,
             )
         else:
             print(
                 f"[cccp-packed] packed 专家全显存完成：{loaded} 个，"
                 f"{self.gpu_storage_bytes / 2**30:.2f}GiB，"
-                f"{time.time() - started:.1f}s，运行期专家 H2D=0",
+                f"{self._payload_load_seconds:.1f}s，运行期专家 H2D=0",
                 flush=True,
             )
 

@@ -178,24 +178,6 @@ def _prefill_sliding_window(
     return values, valid
 
 
-def _token_graph_indexer_keys(
-    indexer: IndexerState,
-    candidate_count: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """Return a fixed exact Indexer-key view for one TokenGraph bucket."""
-    if candidate_count < 0:
-        raise ValueError("candidate_count must be non-negative")
-    if candidate_count <= indexer.keys.page_items:
-        return indexer.keys.pages[0][:, :candidate_count]
-    key_indices = torch.arange(
-        candidate_count,
-        dtype=torch.long,
-        device=device,
-    ).view(1, -1)
-    return indexer.keys.gather_batched(key_indices)
-
-
 def _tp1_token_graph_bucket(
     position: int,
     *,
@@ -214,6 +196,28 @@ def _tp1_token_graph_bucket(
     if compressed_count <= 512:
         return "direct512"
     return "topk512"
+
+
+def _requires_flashmla_splitkv(
+    *,
+    device_type: str,
+    hip_runtime: bool,
+    max_ctx: int,
+) -> bool:
+    """Whether this runtime can enter DSV4's sparse Top-K bucket."""
+    return (
+        str(device_type) == "cuda"
+        and not bool(hip_runtime)
+        and int(max_ctx) > 2051
+    )
+
+
+def _indexer_candidate_capacity(candidate_count: int) -> int:
+    """Pad the FP8 Indexer matrix width to the scaled-GEMM alignment."""
+    count = int(candidate_count)
+    if count <= 0:
+        raise ValueError("candidate_count must be positive")
+    return (count + 15) // 16 * 16
 
 
 def _dense_bf16_group(name: str) -> str | None:
@@ -1379,6 +1383,7 @@ class DSV4CCCPModel:
         self._w: dict[str, object] = {}
         self._layers: dict[int, dict] = {}
         self._dense_bf16 = _parse_dense_bf16()
+        self._native_tensor_fp8_weights = 0
         self._hc_decode_workspaces: dict[
             tuple[torch.device, int],
             tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -1524,9 +1529,35 @@ class DSV4CCCPModel:
                                         wt.cols, wt.gs,
                                         half=os.environ.get("CCCP_INT4_HALF", "0") == "1")
                 else:
-                    wt = wt.to(
-                        self.device, dtype=torch.bfloat16
-                    ) if use_bf16 else wt.to(self.device)
+                    native_fp8_mode = os.environ.get(
+                        "CCCP_GPU_FP8_EXECUTION", "off"
+                    ).strip().lower()
+                    native_fp8_requested = native_fp8_mode not in (
+                        "", "0", "false", "off", "none"
+                    )
+                    # Grouped O-LoRA consumes independent input rows.  Its
+                    # existing BF16 grouped operator is already a single
+                    # launch, whereas splitting it into scalar scaled-MM
+                    # calls would regress.  Keep that capability on BF16
+                    # until the public grouped tensor-FP8 row kernel exists.
+                    grouped_o_projection = ".attn.wo_a" in name
+                    if (
+                        use_bf16
+                        and native_fp8_requested
+                        and isinstance(wt, BlockFP8Weight)
+                        and not grouped_o_projection
+                    ):
+                        compact = wt.to(self.device)
+                        compiled = compact.compile_gpu_tensor_fp8()
+                        if compiled.layout == "tensor-fp8":
+                            wt = compiled
+                            self._native_tensor_fp8_weights += 1
+                        else:
+                            wt = wt.to(self.device, dtype=torch.bfloat16)
+                    else:
+                        wt = wt.to(
+                            self.device, dtype=torch.bfloat16
+                        ) if use_bf16 else wt.to(self.device)
             self._w[name] = wt
         return wt
 
@@ -1632,18 +1663,27 @@ class DSV4CCCPModel:
         hot_dtype = compute_dtype(device)
         sparse_splitkv = False
         sparse_features: tuple[str, ...] = ()
-        splitkv_mode = os.environ.get("CCCP_SPARSE_SPLITKV", "auto").lower()
-        if (
-            device.type == "cuda"
-            and B == 1
-            and int(hd) == 512
-            and splitkv_mode not in ("0", "off", "false")
-            and (splitkv_mode in ("1", "on", "true", "force") or self.max_ctx > 4096)
-        ):
+        requires_sparse_splitkv = _requires_flashmla_splitkv(
+            device_type=device.type,
+            hip_runtime=torch.version.hip is not None,
+            max_ctx=self.max_ctx,
+        )
+        if requires_sparse_splitkv:
+            if B != 1 or int(hd) != 512:
+                raise RuntimeError(
+                    "DSV4 长上下文 CUDA 路线仅支持 batch=1、head_dim=512；"
+                    "禁止退回 BF16 全量 Attention"
+                )
             from .flashmla_sparse import available as flashmla_available
             from .ops.paged_sparse import cuda_architecture_features
 
-            sparse_splitkv, _ = flashmla_available(device)
+            sparse_splitkv, unavailable_reason = flashmla_available(device)
+            if not sparse_splitkv:
+                raise RuntimeError(
+                    "DSV4 长上下文 CUDA 必须使用 FlashMLA sparse SplitKV，"
+                    "但后端不可用；禁止退回 sparse=bf16-exact："
+                    f"{unavailable_reason or 'unknown reason'}"
+                )
             sparse_features = cuda_architecture_features(device)
         if sparse_splitkv:
             from .flashmla_sparse import FlashMLASparseRunner
@@ -1703,6 +1743,16 @@ class DSV4CCCPModel:
                     )
                     if sparse_splitkv:
                         candidate_count = (self.max_ctx + ratio - 1) // ratio
+                        # FP8 scaled GEMM requires both matrix extents to be
+                        # multiples of 16.  ``max_ctx`` is user controlled and
+                        # therefore its ratio-4 candidate count is commonly
+                        # unaligned (for example 4368 -> 1092).  Keep the
+                        # logical cache bound exact, but pad only the fixed
+                        # Indexer execution image.  The controlled reducer
+                        # masks every row beyond the live position to -inf.
+                        candidate_capacity = _indexer_candidate_capacity(
+                            candidate_count
+                        )
                         indexer_fp8 = IndexerFP8PagedCache.allocate(
                             max_items=candidate_count,
                             head_dim=int(c.get("index_head_dim", 128)),
@@ -1723,12 +1773,12 @@ class DSV4CCCPModel:
                         )
                         st["indexer_mm"] = torch.empty(
                             int(c.get("index_n_heads", 64)),
-                            candidate_count,
+                            candidate_capacity,
                             dtype=torch.bfloat16,
                             device=device,
                         )
                         st["indexer_logits"] = torch.empty(
-                            1, 1, candidate_count,
+                            1, 1, candidate_capacity,
                             dtype=torch.float32,
                             device=device,
                         )
@@ -2022,6 +2072,13 @@ class DSV4CCCPModel:
         names = self.store.dense_names()
         for name in names:
             self.w(name)
+        if self._native_tensor_fp8_weights:
+            print(
+                "[cccp] 公共 Tensor Core FP8 执行映像："
+                f"{self._native_tensor_fp8_weights} 个固定投影；"
+                "源检查点未修改，未保留 BF16 副本",
+                flush=True,
+            )
         # Keep every routing mask at a fixed address before any Attention,
         # FFN or packed-expert graph is built.  Hash-routed layers do not
         # enter the static FFN capture, so lazily moving their first mask
@@ -5022,10 +5079,6 @@ class DSV4CCCPModel:
         """
         from . import dsv4 as _d
         from .dsv4 import hc_post, rope_apply
-        from .dsv4indexer import (
-            hadamard_rotate,
-            indexer_scores,
-        )
         from .fusedext import (
             dsv4_attn_decode_controlled_fused,
             dsv4_kv_commit_controlled_fused,
@@ -5161,12 +5214,17 @@ class DSV4CCCPModel:
             ):
                 raise RuntimeError("controlled indexer compressor was rejected")
 
-        sparse_selected = False
+        use_flashmla = ratio == 4 and selected_topk
         selected = None
-        if ratio == 4 and selected_topk:
-            indexer = state["indexer"]
+        if use_flashmla:
             nested = weights["indexer"]
-            candidate_count = (self.max_ctx + 3) // 4
+            indexer_fp8 = state.get("indexer_fp8")
+            if indexer_fp8 is None or "sparse_runner" not in state:
+                raise RuntimeError(
+                    "DSV4 topk512 缺少 FP8 Indexer/FlashMLA 状态；"
+                    "禁止退回 BF16 全量 Attention"
+                )
+            candidate_count = int(state["indexer_logits"].shape[-1])
             index_query = _linear(qr, nested["wq_b"]).view(
                 1, 1, cfg.index_n_heads, cfg.index_head_dim
             )
@@ -5176,81 +5234,44 @@ class DSV4CCCPModel:
                     * cfg.index_n_heads ** -0.5
                 )
             ).float().contiguous()
-            indexer_fp8 = state.get("indexer_fp8")
-            if indexer_fp8 is not None:
-                scores = paged_indexer_logits(
-                    index_query.to(torch.bfloat16),
-                    indexer_fp8.values[:candidate_count],
-                    indexer_fp8.scales[:candidate_count],
-                    index_weights,
-                    context["control_cos"],
-                    context["control_sin"],
-                    control.values,
-                    compression_ratio=4,
-                    page_layout="contiguous-logical-pages",
-                    cache_format="indexer-e4m3-row-scale",
-                    query_fp8=state["indexer_query_fp8"],
-                    query_scales=state["indexer_query_scales"],
-                    mm_workspace=state["indexer_mm"],
-                    output=state["indexer_logits"],
-                    architecture_features=tuple(
-                        state.get("sparse_features", ())
-                    ),
+            scores = paged_indexer_logits(
+                index_query.to(torch.bfloat16),
+                indexer_fp8.values[:candidate_count],
+                indexer_fp8.scales[:candidate_count],
+                index_weights,
+                context["control_cos"],
+                context["control_sin"],
+                control.values,
+                compression_ratio=4,
+                page_layout="contiguous-logical-pages",
+                cache_format="indexer-e4m3-row-scale",
+                query_fp8=state["indexer_query_fp8"],
+                query_scales=state["indexer_query_scales"],
+                mm_workspace=state["indexer_mm"],
+                output=state["indexer_logits"],
+                architecture_features=tuple(
+                    state.get("sparse_features", ())
+                ),
+            )
+            if scores is None:
+                raise RuntimeError(
+                    "DSV4 FP8 Indexer 算子不可用；禁止退回 BF16 Indexer"
                 )
-                topk_result = (
-                    persistent_topk_exact(
-                        scores,
-                        int(cfg.index_topk),
-                        values=state["indexer_topk_values"],
-                        indices=state["indexer_topk_indices"],
-                        architecture_features=tuple(
-                            state.get("sparse_features", ())
-                        ),
-                    )
-                    if scores is not None
-                    else None
+            topk_result = persistent_topk_exact(
+                scores,
+                int(cfg.index_topk),
+                values=state["indexer_topk_values"],
+                indices=state["indexer_topk_indices"],
+                architecture_features=tuple(
+                    state.get("sparse_features", ())
+                ),
+            )
+            if topk_result is None:
+                raise RuntimeError(
+                    "DSV4 固定工作区 Top-K 算子不可用；禁止退回 torch.topk"
                 )
-                if topk_result is not None:
-                    selected = topk_result[1]
-                    compressed_values = None
-                    sparse_selected = True
-            if not sparse_selected:
-                index_query[..., cfg.index_head_dim - cfg.qk_rope_head_dim:] = (
-                    rope_apply(
-                        index_query[..., cfg.index_head_dim - cfg.qk_rope_head_dim:],
-                        context["control_cos"].view(1, 1, 1, -1),
-                        context["control_sin"].view(1, 1, 1, -1),
-                    )
-                )
-                index_query = hadamard_rotate(
-                    index_query.to(compute_dtype(source.device))
-                )
-                keys = _token_graph_indexer_keys(
-                    indexer,
-                    candidate_count,
-                    source.device,
-                )
-                scores = indexer_scores(index_query, keys, index_weights)
-                valid_count = torch.div(
-                    control.position + 1,
-                    4,
-                    rounding_mode="floor",
-                ).clamp_max(candidate_count)
-                candidates = torch.arange(
-                    candidate_count,
-                    dtype=torch.long,
-                    device=source.device,
-                )
-                scores.masked_fill_(
-                    candidates.view(1, 1, -1) >= valid_count.view(1, 1, 1),
-                    float("-inf"),
-                )
-                selected = scores.topk(
-                    int(cfg.index_topk), dim=-1, sorted=False
-                ).indices.long()
-                compressed_values = state["compressed"].gather_batched(
-                    selected
-                )[:, 0]
+            selected = topk_result[1]
+            compressed_values = None
         elif ratio:
             max_items = (self.max_ctx + ratio - 1) // ratio
             ratio_width = (
@@ -5297,7 +5318,7 @@ class DSV4CCCPModel:
         ):
             raise RuntimeError("controlled window KV commit was rejected")
         attended = None
-        if sparse_selected and selected is not None:
+        if use_flashmla and selected is not None:
             from .fusedext import sparse_attention_inverse_rope_fused
 
             state["flashmla_query"].copy_(query)
@@ -5317,14 +5338,27 @@ class DSV4CCCPModel:
                     state.get("sparse_features", ())
                 ),
             )
-            if sparse_output is not None:
-                restored = sparse_attention_inverse_rope_fused(
-                    sparse_output,
-                    context["control_cos"],
-                    context["control_sin"],
+            if sparse_output is None:
+                raise RuntimeError(
+                    "FlashMLA sparse SplitKV 执行失败；"
+                    "禁止退回 BF16 全量 Attention"
                 )
-                if restored is not None:
-                    attended = restored[:, 0]
+            restored = sparse_attention_inverse_rope_fused(
+                sparse_output,
+                context["control_cos"],
+                context["control_sin"],
+            )
+            if restored is None:
+                raise RuntimeError(
+                    "FlashMLA 逆 RoPE 融合算子不可用；"
+                    "禁止退回 BF16 全量 Attention"
+                )
+            attended = restored[:, 0]
+        if use_flashmla and attended is None:
+            raise RuntimeError(
+                "DSV4 topk512 未执行 FlashMLA sparse SplitKV；"
+                "禁止退回 BF16 全量 Attention"
+            )
         if attended is None:
             if compressed_values is None:
                 assert selected is not None
@@ -5706,6 +5740,16 @@ class DSV4CCCPModel:
             self._tp1_graph_dependencies = dependencies
             self.tp_dataflow = "tp1-full-token-graph"
             self.tp_collectives_per_layer = 0
+            uses_sparse_bucket = "topk512" in self._tp1_token_graphs
+            has_flashmla = any(
+                "sparse_runner" in context["state"]
+                for context in self._tp_attention_contexts[0]
+            )
+            if uses_sparse_bucket and not has_flashmla:
+                raise RuntimeError(
+                    "DSV4 topk512 只允许 FlashMLA sparse SplitKV；"
+                    "禁止记录或执行 sparse=bf16-exact"
+                )
             self.tp_token_graph_info = {
                 "layers": layer_count,
                 "main_launches_per_token": 1,
@@ -5719,11 +5763,8 @@ class DSV4CCCPModel:
                 "sparse_topk": int(self.cfg["index_topk"]),
                 "sparse_attention": (
                     "flashmla-model1-fp8-splitkv"
-                    if any(
-                        "sparse_runner" in context["state"]
-                        for context in self._tp_attention_contexts[0]
-                    )
-                    else "bf16-exact"
+                    if uses_sparse_bucket
+                    else "not-required-direct"
                 ),
             }
             print(

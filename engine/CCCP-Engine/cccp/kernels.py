@@ -391,6 +391,8 @@ class BlockFP8Weight:
         "rows",
         "layout",
         "_decode_outputs",
+        "_fp8_decode_input",
+        "_fp8_decode_scale",
     )
 
     def __init__(
@@ -411,9 +413,14 @@ class BlockFP8Weight:
         self.block = block
         if layout is None:
             layout = "row-major" if q.ndim == 2 else "block-major32"
-        if layout not in ("row-major", "block-major32", "q4_0"):
+        if layout not in (
+            "row-major",
+            "block-major32",
+            "q4_0",
+            "tensor-fp8",
+        ):
             raise ValueError(f"unsupported block FP8 layout {layout!r}")
-        if layout == "row-major" and q.ndim != 2:
+        if layout in ("row-major", "tensor-fp8") and q.ndim != 2:
             raise ValueError("row-major block FP8 requires a rank-2 tensor")
         if layout == "block-major32" and q.ndim != 5:
             raise ValueError(
@@ -430,6 +437,20 @@ class BlockFP8Weight:
         self.layout = layout
         self.rows = int(q.shape[0]) if rows is None else int(rows)
         self._decode_outputs = {}
+        self._fp8_decode_input = None
+        self._fp8_decode_scale = None
+        if layout == "tensor-fp8":
+            if s.numel() != 1:
+                raise ValueError("tensor-fp8 requires one FP32 weight scale")
+            if q.is_cuda:
+                self._fp8_decode_input = torch.empty(
+                    (1, self.cols),
+                    dtype=torch.float8_e4m3fn,
+                    device=q.device,
+                )
+                self._fp8_decode_scale = torch.empty(
+                    (1, 1), dtype=torch.float32, device=q.device
+                )
 
     @property
     def shape(self) -> torch.Size:
@@ -489,9 +510,129 @@ class BlockFP8Weight:
             layout=self.layout,
         )
 
+    @staticmethod
+    def native_tensor_fp8_available(device: torch.device | str) -> bool:
+        """Whether vendor tensor-scaled E4M3 GEMM is available.
+
+        The decision is capability based and shared by every architecture.
+        NVIDIA Ada/Hopper/Blackwell use the CUDA 13 scaled-MM path; ROCm and
+        older NVIDIA devices keep their existing compact/BF16 executor.
+        """
+        target = torch.device(device)
+        if (
+            target.type != "cuda"
+            or torch.version.hip is not None
+            or not hasattr(torch, "_scaled_mm")
+            or not hasattr(torch, "float8_e4m3fn")
+        ):
+            return False
+        try:
+            major, minor = torch.cuda.get_device_capability(target)
+        except (RuntimeError, TypeError, ValueError):
+            return False
+        return (int(major), int(minor)) >= (8, 9)
+
+    def compile_gpu_tensor_fp8(self):
+        """Replace block scales with one native Tensor Core FP8 image.
+
+        The source E4M3 bytes are re-normalized in bounded row chunks and the
+        returned object owns only one byte per weight plus a scalar scale.
+        No BF16 copy is retained.  This is a generic execution-image compile,
+        not a model conversion and it never changes checkpoint files.
+        """
+        if self.layout == "tensor-fp8":
+            return self
+        if (
+            self.layout != "row-major"
+            or not self.q.is_cuda
+            or self.block != 128
+            or not self.native_tensor_fp8_available(self.q.device)
+        ):
+            return self
+        weight_scale = self.s.amax().clamp_min(1.0e-12).reshape(1)
+        compiled = torch.empty_like(self.q)
+        # Bound the temporary BF16 image to roughly 64 MiB.  The source and
+        # destination stay compact and are never simultaneously expanded in
+        # their entirety.
+        chunk_rows = max(
+            self.block,
+            ((64 * 2**20) // max(self.cols * 2, 1) // self.block)
+            * self.block,
+        )
+        chunk_rows = min(self.rows, chunk_rows)
+        for start in range(0, self.rows, chunk_rows):
+            stop = min(self.rows, start + chunk_rows)
+            first_block = start // self.block
+            last_block = (stop + self.block - 1) // self.block
+            row_scales = self.s[first_block:last_block].repeat_interleave(
+                self.block, dim=0
+            )[: stop - start]
+            scales = row_scales.repeat_interleave(
+                self.block, dim=1
+            )[:, : self.cols]
+            normalized = (
+                self.q[start:stop]
+                .view(torch.float8_e4m3fn)
+                .to(torch.bfloat16)
+                * (scales / weight_scale).to(torch.bfloat16)
+            )
+            compiled[start:stop].copy_(
+                normalized.clamp(-448.0, 448.0)
+                .to(torch.float8_e4m3fn)
+                .view(torch.uint8)
+            )
+        return BlockFP8Weight(
+            compiled,
+            weight_scale,
+            self.cols,
+            self.block,
+            rows=self.rows,
+            layout="tensor-fp8",
+        )
+
+    def _tensor_fp8_matmul(
+        self,
+        x: torch.Tensor,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.layout != "tensor-fp8" or not x.is_cuda:
+            raise ValueError("native tensor FP8 requires a CUDA execution image")
+        from .fusedext import dense_fp8_quantize_rows_fused
+
+        source = x.to(torch.bfloat16).contiguous()
+        if source.shape[0] == 1:
+            quantized = self._fp8_decode_input
+            activation_scale = self._fp8_decode_scale
+        else:
+            quantized = torch.empty_like(
+                source, dtype=torch.float8_e4m3fn
+            )
+            activation_scale = torch.empty(
+                (1, 1), dtype=torch.float32, device=source.device
+            )
+        if quantized is None or activation_scale is None:
+            raise RuntimeError("native tensor FP8 workspace is unavailable")
+        fused = dense_fp8_quantize_rows_fused(
+            source, quantized, activation_scale
+        )
+        if fused is None:
+            raise RuntimeError("native tensor FP8 activation kernel unavailable")
+        result = torch._scaled_mm(
+            fused,
+            self.q.view(torch.float8_e4m3fn).t(),
+            scale_a=activation_scale,
+            scale_b=self.s.reshape(1, 1),
+            out_dtype=torch.bfloat16,
+            use_fast_accum=True,
+        )
+        if output is not None:
+            output.copy_(result)
+            return output
+        return result
+
     def to_row_major(self):
         """Restore compact row-major bytes without dequantizing weights."""
-        if self.layout == "row-major":
+        if self.layout in ("row-major", "tensor-fp8"):
             return self
         if self.layout == "q4_0":
             return self
@@ -687,7 +828,7 @@ class BlockFP8Weight:
         """
         if start < 0 or stop < start or stop > self.shape[0]:
             raise IndexError((start, stop))
-        if start % self.block:
+        if start % self.block and self.layout != "tensor-fp8":
             raise ValueError("BlockFP8 row slice start must be block-aligned")
         scale_start = start // self.block
         scale_stop = (stop + self.block - 1) // self.block
@@ -700,6 +841,17 @@ class BlockFP8Weight:
                 self.block,
                 rows=stop - start,
                 layout="q4_0",
+            )
+        if self.layout == "tensor-fp8":
+            return BlockFP8Weight(
+                self.q[start:stop].clone(
+                    memory_format=torch.contiguous_format
+                ),
+                self.s.clone(memory_format=torch.contiguous_format),
+                self.cols,
+                self.block,
+                rows=stop - start,
+                layout="tensor-fp8",
             )
         q = (
             self.q[start:stop].clone(memory_format=torch.contiguous_format)
@@ -729,7 +881,7 @@ class BlockFP8Weight:
         """
         if start < 0 or stop < start or stop > self.shape[0]:
             raise IndexError((start, stop))
-        if start % self.block:
+        if start % self.block and self.layout != "tensor-fp8":
             raise ValueError("BlockFP8 row view start must be block-aligned")
         scale_start = start // self.block
         scale_stop = (stop + self.block - 1) // self.block
@@ -742,6 +894,15 @@ class BlockFP8Weight:
                 self.block,
                 rows=stop - start,
                 layout="q4_0",
+            )
+        if self.layout == "tensor-fp8":
+            return BlockFP8Weight(
+                self.q[start:stop],
+                self.s,
+                self.cols,
+                self.block,
+                rows=stop - start,
+                layout="tensor-fp8",
             )
         q = (
             self.q[start:stop]
@@ -776,6 +937,17 @@ class BlockFP8Weight:
                 self.block,
                 rows=self.rows,
                 layout="q4_0",
+            )
+        if self.layout == "tensor-fp8":
+            return BlockFP8Weight(
+                self.q[:, start:stop].clone(
+                    memory_format=torch.contiguous_format
+                ),
+                self.s.clone(memory_format=torch.contiguous_format),
+                stop - start,
+                self.block,
+                rows=self.rows,
+                layout="tensor-fp8",
             )
         if start % self.block:
             raise ValueError(
@@ -836,6 +1008,13 @@ class BlockFP8Weight:
             values = torch.cat((low, high), dim=-1).float()
             values.mul_(scale)
             return values.reshape(r1 - r0, self.cols).to(dtype or torch.float32)
+        if self.layout == "tensor-fp8":
+            return (
+                self.q[r0:r1]
+                .view(torch.float8_e4m3fn)
+                .to(dtype)
+                * self.s.reshape(1, 1).to(dtype)
+            )
         first_block = r0 // self.block
         last_block = (r1 + self.block - 1) // self.block
         scale_rows = self.s[first_block:last_block].repeat_interleave(
@@ -874,6 +1053,8 @@ class BlockFP8Weight:
         chunk: int | None = None,
     ) -> torch.Tensor:
         rows = self.rows
+        if self.layout == "tensor-fp8" and x.is_cuda:
+            return self._tensor_fp8_matmul(x)
         if self.layout == "q4_0" and not x.is_cuda:
             from .cpuext import q4_0_dequant_cpu, q4_0_gemv_cpu
 
@@ -942,6 +1123,8 @@ class BlockFP8Weight:
         x: torch.Tensor,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.layout == "tensor-fp8" and x.is_cuda:
+            return self._tensor_fp8_matmul(x, output=output)
         if (
             self.layout == "q4_0"
             and not x.is_cuda
@@ -1147,6 +1330,12 @@ class ProjectionGroup:
         output: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         """Apply weight ``i`` only to matching input row ``i``."""
+        if any(
+            isinstance(weight, BlockFP8Weight)
+            and weight.layout == "tensor-fp8"
+            for weight in self.weights
+        ):
+            return None
         if (
             x.dim() != 2
             or x.shape != (len(self.weights), self.cols)
@@ -1256,6 +1445,22 @@ class ProjectionGroup:
         output: torch.Tensor | None = None,
         output_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
+        if (
+            x.is_cuda
+            and all(
+                isinstance(weight, BlockFP8Weight)
+                and weight.layout == "tensor-fp8"
+                for weight in self.weights
+            )
+        ):
+            parts = tuple(
+                weight._tensor_fp8_matmul(x) for weight in self.weights
+            )
+            result = torch.cat(parts, dim=-1)
+            if output is not None:
+                output.copy_(result)
+                return output
+            return result
         if (
             not torch.is_grad_enabled()
             and not x.is_cuda

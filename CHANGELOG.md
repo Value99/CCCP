@@ -2,15 +2,15 @@
 
 本项目遵循语义化版本；源码变更通过 Git 提交维护，离线发行目录以版本号命名。
 
-## [0.9.3] - 2026-08-16
+## [0.9.3] - 2026-08-17
 
 - 新增清单驱动的通用 Dense VQ 架构适配。Qwen3.5 27B CCCP Dense 模型可由 `cccp.json` 自动识别并复用同一加载、设备选择、上下文、KV 与 OpenAI 兼容 API 链路；没有按模型目录名增加专用分支。
 - Dense 模型不显示专家配置选择，也不会进入语料路由扫描；训练页明确说明该架构没有动态专家、无需生成专家配置，首页直接加载完整模型。
-- NVIDIA Dense VQ 路径新增原生 FP8 分组投影、静态 KV 缓存、融合递归状态更新与 CUDA Graph；H20 单卡实模验证 Prefill 约 527 token/s、Decode 约 55.56 token/s，输出有限且多轮可读。
+- NVIDIA Dense VQ 路径新增原生 FP8 分组投影、静态 KV 缓存、融合递归状态更新与 CUDA Graph；Qwen3.5 的 MTP 默认按架构配置启用 Top-3 验证，H20 单卡实模有效 Decode 93.21 token/s、完整请求 82.39 token/s，输出有限且多轮可读。
 - CPU Dense VQ 路径统一使用预生成 Q4 执行映像、码本缓存和 NUMA 感知线程规划；不会把逻辑核心数直接当作最优线程数，也不会混淆 P 核与能效核。
 - Kimi 组合 Gate/Up/Down packed 元数据同时支持 10 行与 15 行布局；当 NVIDIA 反量化分组工作区不足或 AMD 不适合私有 grouped-mm 时，改用精确 packed grouped 融合执行器，不回退逐 token/专家 GEMV。
 - AMD 全显存 Decode 增加硬性执行器门禁：终端必须显示 `hip.tp1-token-graph` 且 Graph 提交计数增长；检测到旧的 CUDA 名称、参考执行器或未注册的 grouped Prefill 会直接报错，避免用 CPU/兼容路径伪装 GPU 加速。
-- 完成 Qwen3.5、DeepSeek-V4、Kimi K3 与 GLM-5.2 实模回归；自动化测试为 313 passed、11 skipped。CPU 性能目标未达到的实测数据记录在独立测试报告中，不作为发行性能承诺。
+- 完成 Qwen3.5、DeepSeek-V4、Kimi K3 与 GLM-5.2 实模回归；自动化测试为 322 passed、11 skipped。CPU 性能目标未达到的实测数据记录在独立测试报告中，不作为发行性能承诺。
 
 ## [0.9.2] - 2026-08-15
 

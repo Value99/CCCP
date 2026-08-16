@@ -22,7 +22,7 @@ _EXT = None
 _TRIED = False
 _ERR: str | None = None
 _SOURCE = "unavailable"
-_EXTENSION_NAME = "cccp_cpu_kernels_v193"
+_EXTENSION_NAME = "cccp_cpu_kernels_v194"
 _PACKED_MOE_WORKSPACE: tuple[torch.Tensor, torch.Tensor] | None = None
 _PACKED_THREE_WORKSPACE: tuple[torch.Tensor, ...] | None = None
 _PACKED_MOE_LOCK = threading.Lock()
@@ -1786,6 +1786,32 @@ def make_resident_projection_cpu(weights: tuple[object, ...]):
     )
 
 
+def make_bf16_swiglu_cpu(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    down: torch.Tensor,
+):
+    """Build one exact BF16 Gate/Up/SwiGLU/Down CPU executor."""
+    if any(
+        value.is_cuda
+        or value.dtype != torch.bfloat16
+        or value.ndim != 2
+        or not value.is_contiguous()
+        for value in (gate, up, down)
+    ):
+        return None
+    if (
+        gate.shape != up.shape
+        or int(down.shape[1]) != int(gate.shape[0])
+        or int(down.shape[0]) != int(gate.shape[1])
+    ):
+        return None
+    extension = _build()
+    if extension is None:
+        return None
+    return extension.CpuBF16SwiGLULayer(gate, up, down)
+
+
 def reset_resident_projection_profile() -> None:
     extension = _build()
     if extension is not None:
@@ -1822,20 +1848,47 @@ def make_packed_three_layer_cpu(
     up = tuple(bundle[1] for bundle in experts)
     down = tuple(bundle[2] for bundle in experts)
 
+    def layout_of(weight) -> str:
+        return str(getattr(weight, "layout", "row-major"))
+
+    def payload_of(weight) -> torch.Tensor:
+        return getattr(weight, "raw", getattr(weight, "q", None))
+
+    q4_shape_codebook = torch.zeros((1, 32), dtype=torch.float32)
+
+    def codebook_of(weight) -> torch.Tensor:
+        if layout_of(weight) == "q4_0":
+            # Q4 execution images no longer need their source VQ codebook.
+            # The mixed executor derives the logical width from blocks*dim,
+            # so retain one shared shape-only codebook with dim=32.
+            return q4_shape_codebook
+        codebook = getattr(weight, "cb", None)
+        if codebook is not None and codebook.numel():
+            return codebook.float().contiguous()
+        return getattr(weight, "s").float().contiguous()
+
+    def blocks_of(weight) -> int:
+        if layout_of(weight) == "q4_0":
+            return int(weight.cols) // 32
+        return int(getattr(weight, "blocks"))
+
+    def bits_of(weight) -> int:
+        return 8 if layout_of(weight) == "q4_0" else int(weight.bits)
+
     def common(weights):
         first = weights[0]
         signature = (
             int(first.rows),
-            int(first.blocks),
-            int(first.bits),
-            str(getattr(first, "layout", "row-major")),
+            blocks_of(first),
+            bits_of(first),
+            layout_of(first),
         )
         if any(
             (
                 int(weight.rows),
-                int(weight.blocks),
-                int(weight.bits),
-                str(getattr(weight, "layout", "row-major")),
+                blocks_of(weight),
+                bits_of(weight),
+                layout_of(weight),
             )
             != signature
             for weight in weights[1:]
@@ -1853,9 +1906,9 @@ def make_packed_three_layer_cpu(
         Compare the retained tensor address so every multi-codebook layer
         enters the generic mixed executor prepared below.
         """
-        first = weights[0].cb
+        first = codebook_of(weights[0])
         return all(
-            weight.cb.data_ptr() == first.data_ptr()
+            codebook_of(weight).data_ptr() == first.data_ptr()
             for weight in weights[1:]
         )
 
@@ -1884,11 +1937,11 @@ def make_packed_three_layer_cpu(
     ):
         def metadata(weights):
             return (
-                [weight.raw for weight in weights],
-                [weight.cb.float().contiguous() for weight in weights],
+                [payload_of(weight) for weight in weights],
+                [codebook_of(weight) for weight in weights],
                 [int(weight.rows) for weight in weights],
-                [int(weight.blocks) for weight in weights],
-                [int(weight.bits) for weight in weights],
+                [blocks_of(weight) for weight in weights],
+                [bits_of(weight) for weight in weights],
                 [
                     {
                         "row-major": 0,
@@ -1896,7 +1949,7 @@ def make_packed_three_layer_cpu(
                         "row-tile-8": 2,
                         "u16-row-tile-8": 2,
                         "q4_0": 3,
-                    }[getattr(weight, "layout", "row-major")]
+                    }[layout_of(weight)]
                     for weight in weights
                 ],
             )
@@ -1907,14 +1960,14 @@ def make_packed_three_layer_cpu(
             *metadata(down),
         )
     return extension.CpuPackedThreeLayer(
-        [weight.raw for weight in gate],
-        [weight.cb.float().contiguous() for weight in gate],
+        [payload_of(weight) for weight in gate],
+        [codebook_of(weight) for weight in gate],
         *gate_spec[:3],
-        [weight.raw for weight in up],
-        [weight.cb.float().contiguous() for weight in up],
+        [payload_of(weight) for weight in up],
+        [codebook_of(weight) for weight in up],
         *up_spec[:3],
-        [weight.raw for weight in down],
-        [weight.cb.float().contiguous() for weight in down],
+        [payload_of(weight) for weight in down],
+        [codebook_of(weight) for weight in down],
         *down_spec[:3],
     )
 
@@ -2359,6 +2412,43 @@ def qwen35_delta_recurrent_cpu(
         return None
     output = torch.empty_like(value)
     result = extension.qwen35_delta_recurrent(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        gate.contiguous(),
+        beta.contiguous(),
+        state,
+        output,
+    )
+    return result, state
+
+
+def qwen35_delta_recurrent_batch_cpu(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Run an ordered Qwen3.5 delta batch in one native CPU call."""
+    if (
+        query.is_cuda
+        or query.ndim != 3
+        or query.dtype not in (torch.float32, torch.bfloat16)
+        or key.shape != query.shape
+        or value.ndim != 3
+        or value.shape[:2] != query.shape[:2]
+        or state.dtype != torch.float32
+    ):
+        return None
+    extension = _build()
+    if extension is None or not hasattr(
+        extension, "qwen35_delta_recurrent_batch"
+    ):
+        return None
+    output = torch.empty_like(value)
+    result = extension.qwen35_delta_recurrent_batch(
         query.contiguous(),
         key.contiguous(),
         value.contiguous(),

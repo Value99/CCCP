@@ -735,6 +735,7 @@ __global__ void qwen35_delta_recurrent_batch_kernel(
     const __nv_bfloat16* __restrict__ beta_b,
     float* __restrict__ state,
     __nv_bfloat16* __restrict__ output,
+    float* __restrict__ checkpoints,
     const int tokens,
     const int heads,
     const int key_dim,
@@ -802,6 +803,17 @@ __global__ void qwen35_delta_recurrent_batch_kernel(
             }
             output[value_offset] = __float2bfloat16_rn(
                 result * rsqrtf((float)key_dim));
+        }
+        if (checkpoints != nullptr && item < value_dim) {
+            const long checkpoint_head =
+                ((long)token * heads + head) * key_dim * value_dim;
+            for (int row = 0; row < key_dim; ++row) {
+                const long state_offset =
+                    state_head + (long)row * value_dim + item;
+                checkpoints[
+                    checkpoint_head + (long)row * value_dim + item
+                ] = state[state_offset];
+            }
         }
         __syncthreads();
     }
@@ -888,6 +900,101 @@ torch::Tensor qwen35_delta_recurrent_batch(
             state.data_ptr<float>(),
             reinterpret_cast<__nv_bfloat16*>(
                 output.data_ptr<at::BFloat16>()),
+            nullptr,
+            tokens,
+            heads,
+            key_dim,
+            value_dim);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+torch::Tensor qwen35_delta_recurrent_batch_checkpoint(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+    torch::Tensor gate,
+    torch::Tensor beta,
+    torch::Tensor state,
+    torch::Tensor output,
+    torch::Tensor checkpoints)
+{
+    TORCH_CHECK(
+        query.is_cuda() && key.is_cuda() && value.is_cuda()
+            && gate.is_cuda() && beta.is_cuda() && state.is_cuda()
+            && output.is_cuda() && checkpoints.is_cuda(),
+        "Qwen3.5 checkpoint tensors must be CUDA");
+    TORCH_CHECK(
+        query.scalar_type() == at::kBFloat16
+            && key.scalar_type() == at::kBFloat16
+            && value.scalar_type() == at::kBFloat16
+            && output.scalar_type() == at::kBFloat16
+            && state.scalar_type() == at::kFloat
+            && checkpoints.scalar_type() == at::kFloat
+            && (gate.scalar_type() == at::kFloat
+                || gate.scalar_type() == at::kBFloat16)
+            && (beta.scalar_type() == at::kFloat
+                || beta.scalar_type() == at::kBFloat16),
+        "Qwen3.5 checkpoint dtype mismatch");
+    TORCH_CHECK(
+        query.is_contiguous() && key.is_contiguous()
+            && value.is_contiguous() && gate.is_contiguous()
+            && beta.is_contiguous() && state.is_contiguous()
+            && output.is_contiguous() && checkpoints.is_contiguous(),
+        "Qwen3.5 checkpoint tensors must be contiguous");
+    TORCH_CHECK(
+        query.dim() == 3 && key.sizes() == query.sizes()
+            && value.dim() == 3
+            && value.size(0) == query.size(0)
+            && value.size(1) == query.size(1)
+            && output.sizes() == value.sizes(),
+        "Qwen3.5 checkpoint activation shape mismatch");
+    const int tokens = static_cast<int>(query.size(0));
+    const int heads = static_cast<int>(query.size(1));
+    const int key_dim = static_cast<int>(query.size(2));
+    const int value_dim = static_cast<int>(value.size(2));
+    TORCH_CHECK(
+        tokens > 0 && key_dim > 0 && key_dim <= 256
+            && value_dim > 0 && value_dim <= 256
+            && state.sizes() == torch::IntArrayRef(
+                {heads, key_dim, value_dim})
+            && checkpoints.sizes() == torch::IntArrayRef(
+                {tokens, heads, key_dim, value_dim})
+            && gate.numel() == (long)tokens * heads
+            && beta.numel() == (long)tokens * heads,
+        "Qwen3.5 checkpoint state shape mismatch");
+    int threads = 1;
+    while (threads < key_dim || threads < value_dim) threads <<= 1;
+    const float* gate_f = gate.scalar_type() == at::kFloat
+        ? gate.data_ptr<float>() : nullptr;
+    const __nv_bfloat16* gate_b = gate.scalar_type() == at::kBFloat16
+        ? reinterpret_cast<const __nv_bfloat16*>(
+            gate.data_ptr<at::BFloat16>()) : nullptr;
+    const float* beta_f = beta.scalar_type() == at::kFloat
+        ? beta.data_ptr<float>() : nullptr;
+    const __nv_bfloat16* beta_b = beta.scalar_type() == at::kBFloat16
+        ? reinterpret_cast<const __nv_bfloat16*>(
+            beta.data_ptr<at::BFloat16>()) : nullptr;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    qwen35_delta_recurrent_batch_kernel<<<
+        heads,
+        threads,
+        2LL * threads * sizeof(float),
+        stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(
+                query.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(
+                key.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(
+                value.data_ptr<at::BFloat16>()),
+            gate_f,
+            gate_b,
+            beta_f,
+            beta_b,
+            state.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(
+                output.data_ptr<at::BFloat16>()),
+            checkpoints.data_ptr<float>(),
             tokens,
             heads,
             key_dim,
@@ -2472,6 +2579,66 @@ __global__ void dense_fp8_quantize_rows_kernel(
     }
 }
 
+// CUDA 12.8 exposes the fast tensor-scaled FP8 GEMM but not the newer
+// row-scaled form.  Reduce the source directly in its native dtype, then
+// quantize in a second launch.  This replaces Torch's FP32 expansion plus
+// abs/amax/div/clamp/cast chain without allocating a full-size temporary.
+template <typename input_t>
+__global__ void dense_fp8_tensor_amax_kernel(
+    const input_t* __restrict__ input,
+    unsigned int* __restrict__ maximum_bits,
+    const int64_t items)
+{
+    float maximum = 0.0f;
+    for (int64_t item =
+             static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         item < items;
+         item += static_cast<int64_t>(gridDim.x) * blockDim.x)
+        maximum = fmaxf(
+            maximum,
+            fabsf(dense_fp8_input_value(input[item])));
+    __shared__ float reductions[256];
+    reductions[threadIdx.x] = maximum;
+    __syncthreads();
+    for (int width = blockDim.x / 2; width > 0; width >>= 1) {
+        if (threadIdx.x < width)
+            reductions[threadIdx.x] = fmaxf(
+                reductions[threadIdx.x], reductions[threadIdx.x + width]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+        atomicMax(maximum_bits, __float_as_uint(reductions[0]));
+}
+
+template <typename input_t>
+__global__ void dense_fp8_quantize_tensor_kernel(
+    const input_t* __restrict__ input,
+    uint8_t* __restrict__ output,
+    float* __restrict__ scale,
+    const int64_t items)
+{
+    const float value_scale = fmaxf(scale[0] / 448.0f, 1.0e-12f);
+    const float inverse_scale = 1.0f / value_scale;
+    for (int64_t item =
+             static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         item < items;
+         item += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const float value = fminf(
+            448.0f,
+            fmaxf(
+                -448.0f,
+                dense_fp8_input_value(input[item]) * inverse_scale));
+        __nv_fp8_e4m3 quantized(value);
+        output[item] = quantized.__x;
+    }
+}
+
+__global__ void dense_fp8_finalize_tensor_scale_kernel(float* scale)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        scale[0] = fmaxf(scale[0] / 448.0f, 1.0e-12f);
+}
+
 torch::Tensor dense_fp8_quantize_rows(
     torch::Tensor input,
     torch::Tensor output,
@@ -2496,13 +2663,49 @@ torch::Tensor dense_fp8_quantize_rows(
         "Dense FP8 scales must be CUDA F32");
     TORCH_CHECK(
         scales.dim() == 2
-            && scales.size(0) == input.size(0)
             && scales.size(1) == 1
+            && (scales.size(0) == 1 || scales.size(0) == input.size(0))
             && scales.is_contiguous(),
-        "Dense FP8 scales must be contiguous [rows,1]");
+        "Dense FP8 scales must be contiguous [1,1] or [rows,1]");
     const int64_t rows = input.size(0);
     const int64_t cols = input.size(1);
     auto stream = at::cuda::getCurrentCUDAStream();
+    // Decode has exactly one row and must stay on the original single-block
+    // quantizer.  The scalar tensor reduction below is only for true batches;
+    // using its three launches for batch one adds hundreds of needless graph
+    // nodes across a full token.
+    if (scales.size(0) == 1 && rows > 1) {
+        const int64_t items = rows * cols;
+        const int blocks = static_cast<int>(std::min<int64_t>(
+            1024, (items + 255) / 256));
+        C10_CUDA_CHECK(cudaMemsetAsync(
+            scales.data_ptr<float>(), 0, sizeof(float), stream));
+        if (input.scalar_type() == torch::kBFloat16) {
+            dense_fp8_tensor_amax_kernel<<<blocks, 256, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+                reinterpret_cast<unsigned int*>(scales.data_ptr<float>()),
+                items);
+            dense_fp8_quantize_tensor_kernel<<<blocks, 256, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+                static_cast<uint8_t*>(output.data_ptr()),
+                scales.data_ptr<float>(),
+                items);
+        } else {
+            dense_fp8_tensor_amax_kernel<<<blocks, 256, 0, stream>>>(
+                input.data_ptr<float>(),
+                reinterpret_cast<unsigned int*>(scales.data_ptr<float>()),
+                items);
+            dense_fp8_quantize_tensor_kernel<<<blocks, 256, 0, stream>>>(
+                input.data_ptr<float>(),
+                static_cast<uint8_t*>(output.data_ptr()),
+                scales.data_ptr<float>(),
+                items);
+        }
+        dense_fp8_finalize_tensor_scale_kernel<<<1, 1, 0, stream>>>(
+            scales.data_ptr<float>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return output;
+    }
     const dim3 grid(static_cast<unsigned int>(rows));
     if (input.scalar_type() == torch::kBFloat16) {
         dense_fp8_quantize_rows_kernel<<<grid, 256, 0, stream>>>(
@@ -2539,7 +2742,7 @@ inline int dense_vq_dtype_tag(const int bits)
     }
 }
 
-constexpr int CCCP_DENSE_VQ_ROWS_PER_BLOCK = 8;
+constexpr int CCCP_DENSE_VQ_ROWS_PER_BLOCK = 16;
 
 template <bool STAGE_INPUT>
 __global__ void dense_vq_gemv_packed_kernel(
@@ -2647,101 +2850,162 @@ torch::Tensor dense_vq_gemv_packed(
     return output;
 }
 
-__global__ void dense_vq_compile_int4_g64_kernel(
-    const uint8_t* __restrict__ packed,
-    const float* __restrict__ codebook,
-    uint8_t* __restrict__ output,
-    __half* __restrict__ scales,
-    const int rows,
-    const int blocks,
-    const int vector,
-    const int dtype_tag,
-    const int groups)
+// GGUF-style compact Decode.  One warp owns one output row, reads packed VQ
+// codes, looks up the small E4M3 codebook, and accumulates the dot product
+// without ever materializing a weight row.  Multiple projections which share
+// the same activation are described by one immutable device metadata table so
+// QKV or Gate/Up execute in a single kernel launch.
+constexpr int CCCP_DENSE_VQ_GROUP_META_FIELDS = 8;
+
+__global__ void dense_vq_gemv_grouped_fp8_codebook_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    const int64_t* __restrict__ metadata,
+    __nv_bfloat16* __restrict__ output,
+    const int projections,
+    const int total_rows,
+    const int columns)
 {
-    const int row = blockIdx.x;
-    if (row >= rows) return;
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
-    const int warps = blockDim.x >> 5;
+    const int global_row =
+        blockIdx.x * CCCP_DENSE_VQ_ROWS_PER_BLOCK + threadIdx.y;
+    extern __shared__ __nv_bfloat16 grouped_staged_input[];
+    for (int column = threadIdx.y * 32 + threadIdx.x;
+         column < columns;
+         column += 32 * CCCP_DENSE_VQ_ROWS_PER_BLOCK)
+        grouped_staged_input[column] = input[column];
+    __syncthreads();
+    if (global_row >= total_rows) return;
+
+    int projection = 0;
+    int output_offset = 0;
+    int projection_rows = 0;
+    #pragma unroll 1
+    for (int candidate = 0; candidate < projections; ++candidate) {
+        const int64_t* item =
+            metadata + candidate * CCCP_DENSE_VQ_GROUP_META_FIELDS;
+        const int candidate_offset = static_cast<int>(item[2]);
+        const int candidate_rows = static_cast<int>(item[3]);
+        if (global_row >= candidate_offset &&
+            global_row < candidate_offset + candidate_rows) {
+            projection = candidate;
+            output_offset = candidate_offset;
+            projection_rows = candidate_rows;
+            break;
+        }
+    }
+    const int64_t* item =
+        metadata + projection * CCCP_DENSE_VQ_GROUP_META_FIELDS;
+    const auto* packed = reinterpret_cast<const uint8_t*>(
+        static_cast<uintptr_t>(item[0]));
+    const auto* codebook = reinterpret_cast<const uint8_t*>(
+        static_cast<uintptr_t>(item[1]));
+    const int blocks = static_cast<int>(item[4]);
+    const int vector = static_cast<int>(item[5]);
+    const int dtype_tag = static_cast<int>(item[6]);
+    const auto* scale_pointer = reinterpret_cast<const float*>(
+        static_cast<uintptr_t>(item[7]));
+    const float codebook_scale = *scale_pointer;
+    const int row = global_row - output_offset;
+    if (row < 0 || row >= projection_rows) return;
+
     const int64_t address = static_cast<int64_t>(
         reinterpret_cast<uintptr_t>(packed));
-    const int columns = blocks * vector;
-    for (int group = warp; group < groups; group += warps) {
-        const int first_column = group * 64 + lane * 2;
-        const int first_block = first_column / vector;
-        const int first_component = first_column - first_block * vector;
-        const int second_column = first_column + 1;
-        const int second_block = second_column / vector;
-        const int second_component = second_column - second_block * vector;
-        const int first_code = routed_index_value(
+    float sum = 0.0f;
+    for (int block = threadIdx.x; block < blocks; block += 32) {
+        const int code = routed_index_value(
             address, dtype_tag,
-            static_cast<long>(row) * blocks + first_block);
-        const int second_code = routed_index_value(
-            address, dtype_tag,
-            static_cast<long>(row) * blocks + second_block);
-        const float first = codebook[
-            static_cast<long>(first_code) * vector + first_component];
-        const float second = codebook[
-            static_cast<long>(second_code) * vector + second_component];
-        float signed_max = fabsf(first) >= fabsf(second) ? first : second;
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            const float other = __shfl_down_sync(
-                0xffffffffu, signed_max, offset, 32);
-            if (fabsf(other) > fabsf(signed_max)) signed_max = other;
+            static_cast<long>(row) * blocks + block);
+        const auto* code_row =
+            codebook + static_cast<long>(code) * vector;
+        const auto* input_row = grouped_staged_input + block * vector;
+        float partial = 0.0f;
+        #pragma unroll
+        for (int component = 0; component < 16; component += 4) {
+            if (component >= vector) break;
+            if (component + 3 < vector) {
+                __nv_fp8x4_e4m3 packed_code;
+                packed_code.__x = __ldg(reinterpret_cast<const uint32_t*>(
+                    code_row + component));
+                const float4 code_value = static_cast<float4>(packed_code);
+                const float2 input01 = __bfloat1622float2(
+                    *reinterpret_cast<const __nv_bfloat162*>(
+                        input_row + component));
+                const float2 input23 = __bfloat1622float2(
+                    *reinterpret_cast<const __nv_bfloat162*>(
+                        input_row + component + 2));
+                partial = fmaf(
+                    code_value.x * codebook_scale, input01.x, partial);
+                partial = fmaf(
+                    code_value.y * codebook_scale, input01.y, partial);
+                partial = fmaf(
+                    code_value.z * codebook_scale, input23.x, partial);
+                partial = fmaf(
+                    code_value.w * codebook_scale, input23.y, partial);
+            } else {
+                __nv_fp8x2_e4m3 packed_code;
+                packed_code.__x = __ldg(reinterpret_cast<const uint16_t*>(
+                    code_row + component));
+                const float2 code_value = static_cast<float2>(packed_code);
+                const float2 input_value = __bfloat1622float2(
+                    *reinterpret_cast<const __nv_bfloat162*>(
+                        input_row + component));
+                partial = fmaf(
+                    code_value.x * codebook_scale, input_value.x, partial);
+                partial = fmaf(
+                    code_value.y * codebook_scale, input_value.y, partial);
+            }
         }
-        signed_max = __shfl_sync(0xffffffffu, signed_max, 0, 32);
-        float scale = signed_max == 0.0f ? 0.0f : signed_max / -8.0f;
-        const __half rounded_scale = __float2half_rn(scale);
-        scale = __half2float(rounded_scale);
-        const float inverse = scale == 0.0f ? 0.0f : 1.0f / scale;
-        const int low = max(
-            0, min(15, __float2int_rn(first * inverse + 8.0f)));
-        const int high = max(
-            0, min(15, __float2int_rn(second * inverse + 8.0f)));
-        output[static_cast<long>(row) * (columns / 2) + group * 32 + lane] =
-            static_cast<uint8_t>(low | (high << 4));
-        if (lane == 0)
-            scales[static_cast<long>(row) * groups + group] = rounded_scale;
+        sum += partial;
     }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset, 32);
+    if (threadIdx.x == 0)
+        output[global_row] = __float2bfloat16_rn(sum);
 }
 
-std::vector<torch::Tensor> dense_vq_compile_int4_g64(
-    torch::Tensor packed,
-    torch::Tensor codebook,
-    int64_t rows,
-    int64_t blocks,
-    int64_t bits)
+torch::Tensor dense_vq_gemv_grouped_fp8_codebook(
+    torch::Tensor input,
+    torch::Tensor metadata,
+    int64_t total_rows)
 {
     TORCH_CHECK(
-        packed.is_cuda() && codebook.is_cuda() &&
-        packed.scalar_type() == at::kByte && packed.dim() == 1 &&
-        codebook.scalar_type() == at::kFloat && codebook.dim() == 2 &&
-        packed.is_contiguous() && codebook.is_contiguous(),
-        "Dense VQ INT4 compilation requires CUDA packed/codebook tensors");
-    const int tag = dense_vq_dtype_tag(static_cast<int>(bits));
-    const int vector = static_cast<int>(codebook.size(1));
-    const int64_t columns = blocks * vector;
-    const int64_t expected_bits = rows * blocks * bits;
+        input.is_cuda() && metadata.is_cuda(),
+        "Dense VQ grouped Decode operands must be CUDA tensors");
     TORCH_CHECK(
-        tag >= 0 && rows > 0 && blocks > 0 && vector > 0 &&
-        columns % 64 == 0 && expected_bits % 8 == 0 &&
-        packed.numel() == expected_bits / 8 &&
-        codebook.size(0) <= (int64_t{1} << bits),
-        "Dense VQ INT4 compilation metadata mismatch");
-    const int64_t groups = columns / 64;
-    auto output = torch::empty({rows, columns / 2}, packed.options());
-    auto scales = torch::empty(
-        {rows, groups}, packed.options().dtype(at::kHalf));
-    dense_vq_compile_int4_g64_kernel<<<
-        static_cast<unsigned>(rows), 256, 0,
-        at::cuda::getCurrentCUDAStream()>>>(
-            packed.data_ptr<uint8_t>(), codebook.data_ptr<float>(),
-            output.data_ptr<uint8_t>(),
-            reinterpret_cast<__half*>(scales.data_ptr<at::Half>()),
-            static_cast<int>(rows), static_cast<int>(blocks), vector, tag,
-            static_cast<int>(groups));
+        input.scalar_type() == at::kBFloat16 && input.dim() == 2 &&
+        input.size(0) == 1 && metadata.scalar_type() == at::kLong &&
+        metadata.dim() == 2 &&
+        metadata.size(1) == CCCP_DENSE_VQ_GROUP_META_FIELDS,
+        "Dense VQ grouped Decode requires BF16 [1,C] and I64 [P,8]");
+    TORCH_CHECK(
+        input.is_contiguous() && metadata.is_contiguous() &&
+        input.get_device() == metadata.get_device(),
+        "Dense VQ grouped Decode operands must be contiguous and colocated");
+    const int columns = static_cast<int>(input.size(1));
+    const int projections = static_cast<int>(metadata.size(0));
+    TORCH_CHECK(
+        columns > 0 && projections > 0 && total_rows > 0,
+        "Dense VQ grouped Decode metadata is empty");
+    const size_t input_bytes = static_cast<size_t>(columns) * sizeof(__nv_bfloat16);
+    TORCH_CHECK(
+        input_bytes <= 48 * 1024,
+        "Dense VQ grouped Decode input exceeds the shared-memory contract");
+    auto output = torch::empty(
+        {1, total_rows}, input.options().dtype(at::kBFloat16));
+    const dim3 block(32, CCCP_DENSE_VQ_ROWS_PER_BLOCK);
+    const dim3 grid(static_cast<unsigned>(
+        (total_rows + CCCP_DENSE_VQ_ROWS_PER_BLOCK - 1) /
+        CCCP_DENSE_VQ_ROWS_PER_BLOCK));
+    auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+    dense_vq_gemv_grouped_fp8_codebook_kernel<<<
+        grid, block, input_bytes, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+        metadata.data_ptr<int64_t>(),
+        reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+        projections,
+        static_cast<int>(total_rows),
+        columns);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return {output, scales};
+    return output;
 }
 
 __global__ void dense_vq_dequant_packed_kernel(
@@ -2799,12 +3063,9 @@ torch::Tensor dense_vq_dequant_packed(
         packed.numel() == expected_bits / 8,
         "dense VQ dequant metadata mismatch");
     const int64_t selected = row_ids.numel() == 0 ? rows : row_ids.numel();
-    if (row_ids.numel()) {
-        TORCH_CHECK(
-            row_ids.min().item<int64_t>() >= 0 &&
-            row_ids.max().item<int64_t>() < rows,
-            "dense VQ row selection is out of range");
-    }
+    // Row ids already originate from the model's validated tokenizer range.
+    // A host-side min/max + item() here invalidates CUDA Graph capture and
+    // serializes every compact decode token, so selection stays device-only.
     auto output = torch::empty(
         {selected, blocks * vector},
         torch::TensorOptions().dtype(torch::kBFloat16).device(packed.device()));
@@ -2817,6 +3078,124 @@ torch::Tensor dense_vq_dequant_packed(
                 output.data_ptr<at::BFloat16>()),
             selected, blocks, vector, tag,
             row_ids.numel() ? row_ids.data_ptr<int64_t>() : nullptr);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+// VQ -> native 8-bit execution image.
+//
+// Quantization belongs to the codebook, not to every reconstructed weight.
+// The caller quantizes the small codebook once (E4M3 on SM89/SM90, symmetric
+// INT8 on SM75/SM80/SM86). Runtime conversion consequently consists only of
+// packed-index extraction plus one aligned 2/4/8/16-byte vector copy per VQ
+// block. The output buffer is supplied by the caller so a bounded execution
+// cache can reuse fixed storage without allocator or graph-address churn.
+template <int VECTOR>
+__global__ void dense_vq_expand_native8_kernel(
+    const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ quantized_codebook,
+    uint8_t* __restrict__ output,
+    const long selected_rows,
+    const long blocks,
+    const int dtype_tag,
+    const int64_t* __restrict__ row_ids)
+{
+    const long item = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const long count = selected_rows * blocks;
+    if (item >= count) return;
+    const long selected_row = item / blocks;
+    const long block = item - selected_row * blocks;
+    const long source_row = row_ids == nullptr
+        ? selected_row
+        : row_ids[selected_row];
+    const int64_t address = static_cast<int64_t>(
+        reinterpret_cast<uintptr_t>(packed));
+    const int code = routed_index_value(
+        address, dtype_tag, source_row * blocks + block);
+    const auto* source = quantized_codebook + static_cast<long>(code) * VECTOR;
+    auto* destination = output + item * VECTOR;
+    if constexpr (VECTOR == 16) {
+        *reinterpret_cast<uint4*>(destination) =
+            *reinterpret_cast<const uint4*>(source);
+    } else if constexpr (VECTOR == 8) {
+        *reinterpret_cast<uint2*>(destination) =
+            *reinterpret_cast<const uint2*>(source);
+    } else if constexpr (VECTOR == 4) {
+        *reinterpret_cast<uint32_t*>(destination) =
+            *reinterpret_cast<const uint32_t*>(source);
+    } else {
+        *reinterpret_cast<uint16_t*>(destination) =
+            *reinterpret_cast<const uint16_t*>(source);
+    }
+}
+
+torch::Tensor dense_vq_expand_native8(
+    torch::Tensor packed,
+    torch::Tensor quantized_codebook,
+    torch::Tensor output,
+    int64_t rows,
+    int64_t blocks,
+    int64_t bits,
+    torch::Tensor row_ids)
+{
+    TORCH_CHECK(
+        packed.is_cuda() && quantized_codebook.is_cuda() &&
+        output.is_cuda() && row_ids.is_cuda(),
+        "VQ native8 conversion operands must be CUDA tensors");
+    const auto execution_dtype = quantized_codebook.scalar_type();
+    TORCH_CHECK(
+        packed.scalar_type() == at::kByte && packed.dim() == 1 &&
+        (execution_dtype == at::ScalarType::Float8_e4m3fn ||
+         execution_dtype == at::kChar) &&
+        quantized_codebook.dim() == 2 &&
+        output.scalar_type() == execution_dtype && output.dim() == 2 &&
+        row_ids.scalar_type() == at::kLong && row_ids.dim() == 1,
+        "VQ native8 conversion requires packed U8, E4M3/INT8 codebook and "
+        "matching output");
+    TORCH_CHECK(
+        packed.is_contiguous() && quantized_codebook.is_contiguous() &&
+        output.is_contiguous() && row_ids.is_contiguous() &&
+        packed.get_device() == quantized_codebook.get_device() &&
+        packed.get_device() == output.get_device() &&
+        packed.get_device() == row_ids.get_device(),
+        "VQ native8 conversion operands must be contiguous and colocated");
+    const int tag = dense_vq_dtype_tag(static_cast<int>(bits));
+    const int vector = static_cast<int>(quantized_codebook.size(1));
+    const int64_t expected_bits = rows * blocks * bits;
+    const int64_t selected = row_ids.numel() == 0 ? rows : row_ids.numel();
+    TORCH_CHECK(
+        tag >= 0 && rows > 0 && blocks > 0 &&
+        (vector == 2 || vector == 4 || vector == 8 || vector == 16) &&
+        expected_bits % 8 == 0 && packed.numel() == expected_bits / 8 &&
+        quantized_codebook.size(0) <= (int64_t{1} << bits) &&
+        output.sizes() == torch::IntArrayRef({selected, blocks * vector}),
+        "VQ native8 conversion metadata or output shape mismatch");
+    // The owning projection validates row ids before dispatch. Avoid a
+    // host-side min/max synchronization here so whole-token CUDA Graph
+    // capture remains possible.
+    const int64_t count = selected * blocks;
+    const int grid = static_cast<int>((count + 255) / 256);
+    auto stream = at::cuda::getCurrentCUDAStream(packed.get_device());
+    const auto* codebook = static_cast<const uint8_t*>(
+        quantized_codebook.data_ptr());
+    auto* destination = static_cast<uint8_t*>(output.data_ptr());
+    if (vector == 16) {
+        dense_vq_expand_native8_kernel<16><<<grid, 256, 0, stream>>>(
+            packed.data_ptr<uint8_t>(), codebook, destination, selected,
+            blocks, tag, row_ids.numel() ? row_ids.data_ptr<int64_t>() : nullptr);
+    } else if (vector == 8) {
+        dense_vq_expand_native8_kernel<8><<<grid, 256, 0, stream>>>(
+            packed.data_ptr<uint8_t>(), codebook, destination, selected,
+            blocks, tag, row_ids.numel() ? row_ids.data_ptr<int64_t>() : nullptr);
+    } else if (vector == 4) {
+        dense_vq_expand_native8_kernel<4><<<grid, 256, 0, stream>>>(
+            packed.data_ptr<uint8_t>(), codebook, destination, selected,
+            blocks, tag, row_ids.numel() ? row_ids.data_ptr<int64_t>() : nullptr);
+    } else {
+        dense_vq_expand_native8_kernel<2><<<grid, 256, 0, stream>>>(
+            packed.data_ptr<uint8_t>(), codebook, destination, selected,
+            blocks, tag, row_ids.numel() ? row_ids.data_ptr<int64_t>() : nullptr);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
@@ -4102,11 +4481,7 @@ __global__ void vq_projection_gate_up_grouped_kernel(
     __syncthreads();
     if (expert < 0 || row >= output_rows)
         return;
-    __syncthreads();
-    if (!gate_meta.valid || !up_meta.valid ||
-        gate_meta.blocks != up_meta.blocks ||
-        gate_meta.vector != up_meta.vector ||
-        gate_meta.dtype_tag != up_meta.dtype_tag)
+    if (!gate_meta.valid || !up_meta.valid)
         return;
     const auto* gate_cb = reinterpret_cast<const __nv_bfloat16*>(
         static_cast<uintptr_t>(gate_meta.codebook_address));
@@ -4114,29 +4489,75 @@ __global__ void vq_projection_gate_up_grouped_kernel(
         static_cast<uintptr_t>(up_meta.codebook_address));
     float gate_values[TOKENS] = {};
     float up_values[TOKENS] = {};
-    for (int block = threadIdx.x; block < gate_meta.blocks; block += 32) {
-        const long gate_index = (long)row * gate_meta.blocks + block;
-        const long up_index = (
-            metadata_rows == 10
-                ? (long)(row + output_rows) * up_meta.blocks + block
-                : (long)row * up_meta.blocks + block);
-        const int gate_code = routed_index_value(
-            gate_meta.index_address, gate_meta.dtype_tag, gate_index);
-        const int up_code = routed_index_value(
-            up_meta.index_address, up_meta.dtype_tag, up_index);
-        const auto* gate_row = gate_cb + (long)gate_code * gate_meta.vector;
-        const auto* up_row = up_cb + (long)up_code * up_meta.vector;
-        for (int item = 0; item < TOKENS; ++item) {
-            if (item >= tile_count)
-                break;
-            const int sorted = tile_begin + item;
-            const int token = static_cast<int>(token_ids[sorted]);
-            const auto* x = grouped_input +
-                item * input_cols + block * gate_meta.vector;
-            gate_values[item] += vq_block_dot_routed_bf16(
-                gate_row, x, gate_meta.vector);
-            up_values[item] += vq_block_dot_routed_bf16(
-                up_row, x, up_meta.vector);
+    const bool same_layout =
+        gate_meta.blocks == up_meta.blocks &&
+        gate_meta.vector == up_meta.vector &&
+        gate_meta.dtype_tag == up_meta.dtype_tag;
+    if (same_layout) {
+        for (int block = threadIdx.x; block < gate_meta.blocks; block += 32) {
+            const long gate_index = (long)row * gate_meta.blocks + block;
+            const long up_index = (
+                metadata_rows == 10
+                    ? (long)(row + output_rows) * up_meta.blocks + block
+                    : (long)row * up_meta.blocks + block);
+            const int gate_code = routed_index_value(
+                gate_meta.index_address, gate_meta.dtype_tag, gate_index);
+            const int up_code = routed_index_value(
+                up_meta.index_address, up_meta.dtype_tag, up_index);
+            const auto* gate_row = gate_cb +
+                (long)gate_code * gate_meta.vector;
+            const auto* up_row = up_cb +
+                (long)up_code * up_meta.vector;
+            for (int item = 0; item < TOKENS; ++item) {
+                if (item >= tile_count)
+                    break;
+                const auto* x = grouped_input +
+                    item * input_cols + block * gate_meta.vector;
+                gate_values[item] += vq_block_dot_routed_bf16(
+                    gate_row, x, gate_meta.vector);
+                up_values[item] += vq_block_dot_routed_bf16(
+                    up_row, x, up_meta.vector);
+            }
+        }
+    } else {
+        // Projection-VQ chooses Gate and Up formats independently.  A p11/d8
+        // Gate beside a p13/d8 Up is valid and common; treating that pair as
+        // absent leaves the activation workspace uninitialized and poisons
+        // the entire Prefill with NaNs.  Decode each projection with its own
+        // block/vector/tag while retaining the combined loop above for the
+        // homogeneous fast path.
+        for (int block = threadIdx.x; block < gate_meta.blocks; block += 32) {
+            const long index = (long)row * gate_meta.blocks + block;
+            const int code = routed_index_value(
+                gate_meta.index_address, gate_meta.dtype_tag, index);
+            const auto* codebook_row = gate_cb +
+                (long)code * gate_meta.vector;
+            for (int item = 0; item < TOKENS; ++item) {
+                if (item >= tile_count)
+                    break;
+                const auto* x = grouped_input +
+                    item * input_cols + block * gate_meta.vector;
+                gate_values[item] += vq_block_dot_routed_bf16(
+                    codebook_row, x, gate_meta.vector);
+            }
+        }
+        for (int block = threadIdx.x; block < up_meta.blocks; block += 32) {
+            const long index = (
+                metadata_rows == 10
+                    ? (long)(row + output_rows) * up_meta.blocks + block
+                    : (long)row * up_meta.blocks + block);
+            const int code = routed_index_value(
+                up_meta.index_address, up_meta.dtype_tag, index);
+            const auto* codebook_row = up_cb +
+                (long)code * up_meta.vector;
+            for (int item = 0; item < TOKENS; ++item) {
+                if (item >= tile_count)
+                    break;
+                const auto* x = grouped_input +
+                    item * input_cols + block * up_meta.vector;
+                up_values[item] += vq_block_dot_routed_bf16(
+                    codebook_row, x, up_meta.vector);
+            }
         }
     }
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -4359,6 +4780,149 @@ torch::Tensor vq_projection_dequant(
         metadata.size(0) == 10 ? 5 : 10,
         reinterpret_cast<__nv_bfloat16*>(output_down.data_ptr<at::BFloat16>()),
         (long)input_cols * inter, input_cols, inter);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output_gu;
+}
+
+// Batched VQ -> native 8-bit projection expansion for Tensor Core execution.
+//
+// Metadata has the same [10,E]/[15,E] layout as vq_projection_dequant, except
+// every codebook pointer already addresses E4M3 or INT8 bytes. Quantizing the
+// tiny shared codebooks is deliberately outside this kernel: the hot path only
+// unpacks one index and copies one aligned 4/8/16-byte codeword.
+//
+// One launch reconstructs every Gate/Up/Down projection.  The former version
+// launched one specialization for each possible vector width and projection
+// (six or nine launches per layer), even though vector width is uniform inside
+// a CUDA block.  Selecting the aligned copy width once per block removes that
+// launch tax and writes Down directly in either grouped-Prefill or flattened
+// two-GEMM Decode layout.
+__global__ void vq_projection_expand_native8_kernel(
+    const int64_t* __restrict__ metadata,
+    const int expert_count,
+    const int metadata_rows,
+    uint8_t* __restrict__ output_gu,
+    uint8_t* __restrict__ output_down,
+    const int intermediate,
+    const int hidden,
+    const bool output_transposed)
+{
+    const int expert = blockIdx.z;
+    if (expert >= expert_count) return;
+    const bool legacy_gate_up = metadata_rows == 10;
+    const int logical_row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (logical_row >= 2 * intermediate + hidden) return;
+    const bool is_down = logical_row >= 2 * intermediate;
+    const bool is_up = !legacy_gate_up &&
+        logical_row >= intermediate && !is_down;
+    const int meta_base = is_down ? (legacy_gate_up ? 5 : 10) :
+        (is_up ? 5 : 0);
+    const int row = is_down
+        ? logical_row - 2 * intermediate
+        : (is_up ? logical_row - intermediate : logical_row);
+    const int cols = is_down ? intermediate : hidden;
+    const int64_t index_address =
+        metadata[(long)(meta_base + 0) * expert_count + expert];
+    const int64_t codebook_address =
+        metadata[(long)(meta_base + 1) * expert_count + expert];
+    const int blocks = static_cast<int>(
+        metadata[(long)(meta_base + 2) * expert_count + expert]);
+    const int vector = static_cast<int>(
+        metadata[(long)(meta_base + 3) * expert_count + expert]);
+    const int tag = static_cast<int>(
+        metadata[(long)(meta_base + 4) * expert_count + expert]);
+    if (index_address == 0 || codebook_address == 0 || blocks <= 0 ||
+        (vector != 4 && vector != 8 && vector != 16) ||
+        blocks * vector != cols)
+        return;
+    const auto* codebook = reinterpret_cast<const uint8_t*>(
+        static_cast<uintptr_t>(codebook_address));
+    uint8_t* destination;
+    if (is_down) {
+        destination = output_transposed
+            ? output_down +
+                (long)row * expert_count * intermediate +
+                (long)expert * intermediate
+            : output_down +
+                (long)expert * hidden * intermediate +
+                (long)row * intermediate;
+    } else {
+        const long projection_offset =
+            is_up
+                ? (long)intermediate * hidden
+                : 0;
+        destination = output_gu +
+            (long)expert * 2 * intermediate * hidden +
+            projection_offset + (long)row * hidden;
+    }
+    for (int block = threadIdx.x; block < blocks; block += blockDim.x) {
+        const int code = routed_index_value(
+            index_address, tag, (long)row * blocks + block);
+        const auto* source = codebook + (long)code * vector;
+        auto* target = destination + block * vector;
+        if (vector == 16) {
+            *reinterpret_cast<uint4*>(target) =
+                *reinterpret_cast<const uint4*>(source);
+        } else if (vector == 8) {
+            *reinterpret_cast<uint2*>(target) =
+                *reinterpret_cast<const uint2*>(source);
+        } else {
+            *reinterpret_cast<uint32_t*>(target) =
+                *reinterpret_cast<const uint32_t*>(source);
+        }
+    }
+}
+
+torch::Tensor vq_projection_expand_native8(
+    torch::Tensor metadata,
+    torch::Tensor output_gu,
+    torch::Tensor output_down)
+{
+    TORCH_CHECK(
+        metadata.is_cuda() && metadata.scalar_type() == at::kLong &&
+        metadata.is_contiguous() && metadata.dim() == 2 &&
+        (metadata.size(0) == 10 || metadata.size(0) == 15),
+        "native8 projection expansion requires CUDA int64 [10,E]/[15,E]");
+    const auto dtype = output_gu.scalar_type();
+    TORCH_CHECK(
+        dtype == at::ScalarType::Float8_e4m3fn || dtype == at::kChar,
+        "native8 projection output must be E4M3 or INT8");
+    TORCH_CHECK(
+        output_gu.is_cuda() && output_gu.scalar_type() == dtype &&
+        output_gu.is_contiguous() && output_gu.dim() == 3 &&
+        output_gu.size(1) % 2 == 0 && output_down.is_cuda() &&
+        output_down.scalar_type() == dtype && output_down.is_contiguous() &&
+        (output_down.dim() == 2 || output_down.dim() == 3),
+        "native8 projection outputs must be contiguous CUDA "
+        "[E,2I,C] plus [E,C,I] or Tensor-Core [C,E*I]");
+    const int expert_count = static_cast<int>(metadata.size(1));
+    const int inter = static_cast<int>(output_gu.size(1) / 2);
+    const int hidden = static_cast<int>(output_gu.size(2));
+    const bool down_transposed = output_down.dim() == 2;
+    const bool valid_down = down_transposed
+        ? output_down.size(0) == hidden &&
+            output_down.size(1) == (long)expert_count * inter
+        : output_down.size(0) == expert_count &&
+            output_down.size(1) == hidden && output_down.size(2) == inter;
+    TORCH_CHECK(
+        output_gu.size(0) == expert_count &&
+        valid_down,
+        "native8 projection output shape mismatch");
+    auto stream = at::cuda::getCurrentCUDAStream(metadata.get_device());
+    const dim3 block(32, 8);
+    const dim3 grid(
+        (2 * inter + hidden + block.y - 1) / block.y,
+        1,
+        expert_count);
+    vq_projection_expand_native8_kernel<<<grid, block, 0, stream>>>(
+        metadata.data_ptr<int64_t>(),
+        expert_count,
+        static_cast<int>(metadata.size(0)),
+        static_cast<uint8_t*>(output_gu.data_ptr()),
+        static_cast<uint8_t*>(output_down.data_ptr()),
+        inter,
+        hidden,
+        down_transposed);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output_gu;
 }
@@ -5926,9 +6490,13 @@ torch::Tensor packed_moe_topk(
               }
               const char* projection_down_setting =
                   std::getenv("CCCP_PROJECTION_DOWN_REDUCE");
-              const bool projection_down_default = (
-                  h20_routed_kernel && projection_layout_tag_value != 2
-              );
+              // The direct projection-down kernel is the common default.
+              // Full-model, all-signature tuning on H20 found the extra
+              // reduction workspace 15% slower for the 4096x2048 Top-K=6
+              // routed shape.  Other architectures never selected it by
+              // default.  Keep the experimental reduction path available
+              // only through the explicit capability override below.
+              const bool projection_down_default = false;
               const bool projection_down_reduce = (
                   projection_down_setting == nullptr
                   ? projection_down_default
@@ -17355,10 +17923,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("vq_gemv", &vq_gemv, "VQ grouped GEMV (fused codebook lookup + dot)");
     m.def("dense_vq_gemv_packed", &dense_vq_gemv_packed,
           "Dense VQ Linear GEMV directly from p8-p16 indices");
-    m.def("dense_vq_compile_int4_g64", &dense_vq_compile_int4_g64,
-          "Compile Dense VQ into a resident INT4-G64 execution image");
+    m.def("dense_vq_gemv_grouped_fp8_codebook",
+          &dense_vq_gemv_grouped_fp8_codebook,
+          "Grouped GGUF-style BF16 Decode directly from packed VQ");
     m.def("dense_vq_dequant_packed", &dense_vq_dequant_packed,
           "Dense VQ BF16 dequantization with optional row selection");
+    m.def("dense_vq_expand_native8", &dense_vq_expand_native8,
+          "Expand packed VQ through a pre-quantized E4M3/INT8 codebook");
     m.def("dense_fp8_quantize_rows", &dense_fp8_quantize_rows,
           "Row-wise BF16/F32 to E4M3 activation conversion");
     m.def("kimi_short_conv3", &kimi_short_conv3,
@@ -17369,6 +17940,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Qwen3.5 one-token gated-delta recurrent update");
     m.def("qwen35_delta_recurrent_batch", &qwen35_delta_recurrent_batch,
           "Qwen3.5 ordered batched gated-delta recurrent update");
+    m.def(
+          "qwen35_delta_recurrent_batch_checkpoint",
+          &qwen35_delta_recurrent_batch_checkpoint,
+          "Qwen3.5 batched gated-delta update with token checkpoints");
     m.def("kimi_kda_recurrent", &kimi_kda_recurrent,
           "Kimi KDA one-token recurrent update with V-first FP32 state");
     m.def("kimi_kda_recurrent_batch", &kimi_kda_recurrent_batch,
@@ -17383,6 +17958,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "vq_projection_dequant",
           &vq_projection_dequant,
           "Dequantize packed three-projection experts to dense BF16");
+    m.def(
+          "vq_projection_expand_native8",
+          &vq_projection_expand_native8,
+          "Expand packed projections to native E4M3/INT8 execution images");
     m.def(
           "packed_moe_topk_grouped",
           &packed_moe_topk_grouped_stub,

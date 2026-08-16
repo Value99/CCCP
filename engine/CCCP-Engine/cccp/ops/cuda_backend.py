@@ -165,6 +165,12 @@ def _projection_dequant(**kwargs):
     return projection_dequant_fused(**kwargs)
 
 
+def _projection_expand_native8(**kwargs):
+    from ..fusedext import projection_expand_native8_fused
+
+    return projection_expand_native8_fused(**kwargs)
+
+
 def _packed_route_slots(**kwargs):
     from ..fusedext import packed_route_slots_fused
 
@@ -591,9 +597,12 @@ def _sparse_paged_attention_flashmla(**kwargs):
     from ..flashmla_sparse import FlashMLASparseRunner, available
 
     query = kwargs["query"]
-    supported, _ = available(query.device)
+    supported, unavailable_reason = available(query.device)
     if not supported:
-        return None
+        raise RuntimeError(
+            "FlashMLA sparse SplitKV backend unavailable: "
+            f"{unavailable_reason or 'unknown reason'}"
+        )
     runner = kwargs.get("runner")
     if runner is None:
         runner = FlashMLASparseRunner.create()
@@ -1238,6 +1247,25 @@ def register(registry: OperatorRegistry) -> None:
         ),
         _projection_dequant,
         priority=100,
+    )
+    registry.register(
+        "cuda.projection_expand_native8.mixed.tensorcore",
+        OperatorCapability(
+            operation="projection_expand_native8",
+            device_types=("cuda",),
+            packed_formats=tuple(f"p{bits}" for bits in range(8, 17)),
+            code_dims=(4, 8, 16),
+            codebook_sizes=(
+                256, 512, 1024, 2048, 4096,
+                8192, 16384, 32768, 65536,
+            ),
+            activations=("none",),
+            max_top_k=1,
+            batch_sizes=tuple(range(1, 8193)),
+            dtypes=("e4m3", "int8"),
+        ),
+        _projection_expand_native8,
+        priority=120,
     )
     registry.register(
         "cuda.packed_moe_topk_grouped.three_projection.mixed.gated",

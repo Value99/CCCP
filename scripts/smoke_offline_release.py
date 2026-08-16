@@ -79,7 +79,7 @@ def main() -> None:
         root / "runtime/cpu/env/python.exe",
         root / "runtime/cuda/env/python.exe",
         root / "runtime/amd/env/python.exe",
-        root / "engine/CCCP-Engine/cccp/native/cccp_cpu_kernels_v192.pyd",
+        root / "engine/CCCP-Engine/cccp/native/cccp_cpu_kernels_v194.pyd",
         root / "toolchain",
     ]
     missing = [str(path) for path in required if not path.exists()]

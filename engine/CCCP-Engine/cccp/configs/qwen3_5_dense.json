@@ -3,6 +3,25 @@
   "architecture": "qwen3_5_dense",
   "display_name": "Qwen3.5 Dense VQ（CCCP）",
   "supports_parallel": false,
+  "speculative": {
+    "provider": "qwen35_mtp",
+    "max_draft": 5,
+    "accept_top_n": 3,
+    "residency": {
+      "cpu": "disabled",
+      "nvidia_fp8": "fp8",
+      "nvidia_legacy": "int8",
+      "independent_of_lru": true
+    },
+    "execution": {
+      "draft": "fixed-block-cuda-graph",
+      "verify": "fixed-block-cuda-graph"
+    },
+    "attachment": {
+      "kind": "config-positive",
+      "field": "mtp_layers"
+    }
+  },
   "defaults": {
     "device": "cuda",
     "max_ctx": 4096,
@@ -10,6 +29,11 @@
     "temperature": 0.0,
     "top_p": 1.0,
     "spec": 0,
+    "spec_by_device": {
+      "cpu": 0,
+      "cuda": 4,
+      "amd": 0
+    },
     "reasoning": "chat",
     "host": "0.0.0.0",
     "port": 8000,

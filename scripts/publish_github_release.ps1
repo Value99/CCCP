@@ -75,8 +75,13 @@ foreach ($file in $localFiles) {
     if ($file.Length -ge 2GB) { throw "GitHub asset must be under 2 GiB: $($file.Name)" }
     $existing = @($release.assets | Where-Object name -eq $file.Name)
     if ($existing.Count -eq 1 -and [long]$existing[0].size -eq $file.Length -and $existing[0].state -eq "uploaded") {
-        Write-Host "Verified existing $($file.Name) ($([math]::Round($file.Length / 1MB, 1)) MiB); skipping upload."
-        continue
+        $localDigest = "sha256:$((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant())"
+        $remoteDigest = [string]$existing[0].digest
+        if ($remoteDigest -and $remoteDigest.ToLowerInvariant() -eq $localDigest) {
+            Write-Host "Verified existing $($file.Name) by SHA-256; skipping upload."
+            continue
+        }
+        Write-Host "Replacing $($file.Name): GitHub digest is missing or differs from the local SHA-256."
     }
     foreach ($old in $existing) {
         Invoke-RestMethod -Uri "$api/releases/assets/$($old.id)" -Headers $headers -Method Delete -TimeoutSec 30 | Out-Null
@@ -115,6 +120,13 @@ foreach ($file in $localFiles) {
     $remote = @($final.assets | Where-Object name -eq $file.Name)
     if ($remote.Count -ne 1 -or [long]$remote[0].size -ne $file.Length -or $remote[0].state -ne "uploaded") {
         throw "Final remote audit failed: $($file.Name)"
+    }
+    $remoteDigest = [string]$remote[0].digest
+    if ($remoteDigest) {
+        $localDigest = "sha256:$((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant())"
+        if ($remoteDigest.ToLowerInvariant() -ne $localDigest) {
+            throw "Final remote SHA-256 audit failed: $($file.Name)"
+        }
     }
 }
 [pscustomobject]@{ReleaseUrl=$final.html_url;Tag=$final.tag_name;Assets=$final.assets.Count} | ConvertTo-Json
