@@ -8,20 +8,21 @@
   <a href="README.md">简体中文</a> · <strong>English</strong> · <a href="README_RU.md">Русский</a>
 </p>
 
-## ⬇️ Download the complete Windows offline package (v0.9.3)
+## ⬇️ Download the complete Windows offline package (v0.9.4)
 
-### [👉 Open the GitHub Release download page](https://github.com/Value99/CCCP/releases/tag/v0.9.3)
+### [👉 Open the GitHub Release download page](https://github.com/Value99/CCCP/releases/tag/v0.9.4)
 
-For a first installation, download the Offline Setup EXE, the `.parts.json` manifest, and all four `.zip.001`–`.zip.004` parts into one folder. Then run `CCCP-Launcher-0.9.3-Offline-Setup.exe`; it verifies, joins, extracts, and launches the application with visible progress. Do not download only the standalone launcher EXE for a first installation.
+For a first installation, download the Offline Setup EXE, the `.parts.json` manifest, and all four `.zip.001`–`.zip.004` parts into one folder. Then run `CCCP-Launcher-0.9.4-Offline-Setup.exe`; it verifies, joins, extracts, and launches the application with visible progress. Do not download only the standalone launcher EXE for a first installation.
 
 The automatically generated `Source code (zip/tar.gz)` links contain only public documentation, images, version metadata, and the standalone updater EXE. They do not contain the launcher, inference-engine, or CCCP quantization/training source code.
 
-### Highlights in 0.9.3
+### Highlights in 0.9.4
 
-- Adds manifest-driven Dense VQ support. Qwen3.5 27B Dense loads as a complete model without expert profiles or expert training controls.
+- Fixes CPU Q4 page placement and automatic thread planning on dual-socket Linux NUMA servers. A real 64-token Qwen3.5 27B Dense VQ run improved from about 7.05 to 9.77 token/s (about +38.6%).
+- Retains the manifest-driven Dense VQ support validated in 0.9.3. Qwen3.5 27B Dense loads as a complete model without expert profiles or expert training controls.
 - NVIDIA Dense VQ uses native FP8 grouped projections, static KV, fused recurrent state, and CUDA Graphs. Qwen3.5 enables architecture-configured MTP with Top-3 verification by default; a real single-H20 run reached 93.21 effective decode token/s and 82.39 token/s end to end.
 - Unifies Kimi 10/15-row combined projections on the packed grouped executor and revalidates DeepSeek-V4, Kimi K3, GLM-5.2, and Qwen3.5 models.
-- AMD full-resident inference now requires the truthful `hip.tp1-token-graph` executor and non-zero Graph submissions. The automated suite reports 322 passed and 11 skipped; AMD performance was not revalidated on physical hardware in this release cycle.
+- AMD full-resident inference now requires the truthful `hip.tp1-token-graph` executor and non-zero Graph submissions. The automated suite reports 324 passed and 11 skipped; AMD performance was not revalidated on physical hardware in this release cycle.
 
 <p align="center">
   <img src="assets/cccp-banner-centered-final.jpg" alt="C.C.C.P. Dynamic Expert Inference Framework" width="100%">
@@ -33,7 +34,7 @@ The automatically generated `Source code (zip/tar.gz)` links contain only public
 </p>
 
 <p align="center">
-  <img alt="Release" src="https://img.shields.io/badge/release-v0.9.3-a52f25">
+  <img alt="Release" src="https://img.shields.io/badge/release-v0.9.4-a52f25">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20x64-7a1e18">
   <img alt="Python" src="https://img.shields.io/badge/Python-not%20required-c49543">
   <img alt="Device" src="https://img.shields.io/badge/default-CPU-3a2118">
@@ -133,7 +134,7 @@ Sources:
 
 ## Quick start
 
-1. Download the Offline Setup, parts manifest, and all four parts from [GitHub Release v0.9.3](https://github.com/Value99/CCCP/releases/tag/v0.9.3).
+1. Download the Offline Setup, parts manifest, and all four parts from [GitHub Release v0.9.4](https://github.com/Value99/CCCP/releases/tag/v0.9.4).
 2. Run the Offline Setup from a writable directory and wait for verification and extraction.
 3. Put a compatible model containing `cccp.json` in the `models` directory next to the application.
 4. Double-click `CCCP-Launcher.exe`.
@@ -215,11 +216,11 @@ Vision input is scheduled for a later release and will open after image preproce
 
 | Platform / hardware | Validation scope | Status |
 | --- | --- | --- |
-| Windows 11 x64 · Core i9-13900H · 31.59 GiB RAM | Launcher, EXE, CPU inference, OpenAI API, profile scanning, and mapped execution of a 118.47 GiB DeepSeek-V4 model; full suite: `322 passed`, `11 skipped` | **CPU functionality passed end to end**; the original throughput target was not met, and GPU paths are covered separately below |
+| Windows 11 x64 · Core i9-13900H · 31.59 GiB RAM | Launcher, EXE, CPU inference, OpenAI API, profile scanning, and mapped execution of a 118.47 GiB DeepSeek-V4 model; full suite: `324 passed`, `11 skipped` | **CPU functionality passed end to end**; the original throughput target was not met, and GPU paths are covered separately below |
 | Windows 11 · NVIDIA RTX 3090 (20 GiB process limit) · CUDA 13 | DeepSeek-V4 constrained-VRAM CUDA/RAM, direct pinned transfer, strict LRU, fused decode, and multi-turn generation | **0.9.2 hardware passed** |
 | NVIDIA RTX 5090 | Real CUDA/RAM runs with DeepSeek-V4 and GLM-5.2 | **Engine tested** |
 | NVIDIA H20-3e (single and multi-GPU) | DeepSeek-V4 TP1/TP4, GLM-5.2 TP2, and Kimi K3 GPU+RAM/TP8 | **Engine tested** |
-| Dual-socket CPU server (96 physical cores) | Shared CPU backend, codebook cache, and runtime images with DeepSeek-V4 and Kimi K3 | **Engine tested** |
+| Dual-socket CPU server (96 physical cores) | Qwen3.5 27B Dense VQ, Q4 NUMA shards, and 64-token Decode | **0.9.4 measured 9.77 token/s, about +38.6% over the stable baseline; no 30 token/s promise** |
 | Windows CUDA 13.0 / `sm_120` | Full NVCC compilation, linking, and module loading | **Toolchain passed**; validation scope ends at module loading |
 | Windows ROCm 7.2.1 / `gfx1151` | HIPIFY, device-code generation, linking, and module loading on a build machine without an AMD GPU | **Toolchain passed**; AMD hardware end-to-end validation is still pending |
 | macOS | Runtime and release package are on the roadmap | **Planned** |
@@ -262,7 +263,7 @@ Thanks to GitHub users [tmzncty](https://github.com/tmzncty) and [Zenon-Chen](ht
 
 ## Links
 
-- Download: [GitHub Release v0.9.3](https://github.com/Value99/CCCP/releases/tag/v0.9.3)
+- Download: [GitHub Release v0.9.4](https://github.com/Value99/CCCP/releases/tag/v0.9.4)
 - Community: [Discord](https://discord.gg/eNnwmAUY4M)
 - Models: [ModelScope · ValueFX](https://www.modelscope.cn/profile/ValueFX)
 - Project page: [GitHub · Value99/CCCP](https://github.com/Value99/CCCP)

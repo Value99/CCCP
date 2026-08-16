@@ -8,20 +8,21 @@
   <a href="README.md">简体中文</a> · <a href="README_EN.md">English</a> · <strong>Русский</strong>
 </p>
 
-## ⬇️ Полный автономный пакет для Windows (v0.9.3)
+## ⬇️ Полный автономный пакет для Windows (v0.9.4)
 
-### [👉 Открыть страницу загрузки GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.3)
+### [👉 Открыть страницу загрузки GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.4)
 
-Для первой установки загрузите в одну папку Offline Setup EXE, файл `.parts.json` и все четыре части `.zip.001`–`.zip.004`. Затем запустите `CCCP-Launcher-0.9.3-Offline-Setup.exe`: установщик проверит, объединит и распакует файлы, покажет прогресс и запустит приложение. Для первой установки недостаточно скачать только отдельный EXE запуска.
+Для первой установки загрузите в одну папку Offline Setup EXE, файл `.parts.json` и все четыре части `.zip.001`–`.zip.004`. Затем запустите `CCCP-Launcher-0.9.4-Offline-Setup.exe`: установщик проверит, объединит и распакует файлы, покажет прогресс и запустит приложение. Для первой установки недостаточно скачать только отдельный EXE запуска.
 
 Автоматические ссылки `Source code (zip/tar.gz)` содержат только публичную документацию, изображения, метаданные версии и отдельный EXE обновления. Исходный код лаунчера, движка инференса и фреймворка квантования/обучения CCCP в них отсутствует.
 
-### Главное в версии 0.9.3
+### Главное в версии 0.9.4
 
-- Добавлена универсальная поддержка Dense VQ по манифесту. Qwen3.5 27B Dense загружается целиком и не показывает настройки профилей или обучения экспертов.
+- Исправлено размещение страниц CPU Q4 и автоматический выбор потоков на двухсокетных Linux NUMA-серверах. Реальный 64-токенный тест Qwen3.5 27B Dense VQ вырос примерно с 7,05 до 9,77 token/s (около +38,6%).
+- Сохранена проверенная в 0.9.3 универсальная поддержка Dense VQ по манифесту. Qwen3.5 27B Dense загружается целиком и не показывает настройки профилей или обучения экспертов.
 - Для NVIDIA Dense VQ используются нативные FP8 grouped-проекции, статический KV, слитое рекуррентное состояние и CUDA Graph. MTP с проверкой Top-3 включается по конфигурации архитектуры; реальный тест на одной H20 дал 93,21 эффективных token/s Decode и 82,39 token/s для полного запроса.
 - Проекции Kimi с метаданными 10/15 строк используют единый packed grouped executor; повторно проверены DeepSeek-V4, Kimi K3, GLM-5.2 и Qwen3.5.
-- AMD full-resident режим обязан показывать `hip.tp1-token-graph` и ненулевые Graph submissions. Автоматические тесты: 322 passed, 11 skipped; производительность AMD в этом цикле не перепроверялась на реальном GPU.
+- AMD full-resident режим обязан показывать `hip.tp1-token-graph` и ненулевые Graph submissions. Автоматические тесты: 324 passed, 11 skipped; производительность AMD в этом цикле не перепроверялась на реальном GPU.
 
 <p align="center">
   <img src="assets/cccp-banner-centered-final.jpg" alt="C.C.C.P. — фреймворк динамических экспертов" width="100%">
@@ -33,7 +34,7 @@
 </p>
 
 <p align="center">
-  <img alt="Версия" src="https://img.shields.io/badge/release-v0.9.3-a52f25">
+  <img alt="Версия" src="https://img.shields.io/badge/release-v0.9.4-a52f25">
   <img alt="Платформа" src="https://img.shields.io/badge/platform-Windows%20x64-7a1e18">
   <img alt="Python" src="https://img.shields.io/badge/Python-%D0%BD%D0%B5%20%D1%82%D1%80%D0%B5%D0%B1%D1%83%D0%B5%D1%82%D1%81%D1%8F-c49543">
   <img alt="Устройство" src="https://img.shields.io/badge/default-CPU-3a2118">
@@ -133,7 +134,7 @@ CCCP использует настройку маршрутизации: кор�
 
 ## Быстрый старт
 
-1. Скачайте Offline Setup, манифест частей и все четыре части из [GitHub Release v0.9.3](https://github.com/Value99/CCCP/releases/tag/v0.9.3).
+1. Скачайте Offline Setup, манифест частей и все четыре части из [GitHub Release v0.9.4](https://github.com/Value99/CCCP/releases/tag/v0.9.4).
 2. Запустите Offline Setup из каталога с правом записи и дождитесь проверки и распаковки.
 3. Поместите совместимую модель с файлом `cccp.json` в каталог `models` рядом с приложением.
 4. Дважды щёлкните `CCCP-Launcher.exe`.
@@ -215,11 +216,11 @@ for chunk in stream:
 
 | Платформа / оборудование | Объём проверки | Статус |
 | --- | --- | --- |
-| Windows 11 x64 · Core i9-13900H · 31,59 GiB RAM | Запускатор, EXE, CPU-инференс, OpenAI API, сканирование профилей и mapped-запуск DeepSeek-V4 размером 118,47 GiB; полный набор: `322 passed`, `11 skipped` | **CPU-функциональность пройдена сквозным тестом**; исходная цель по скорости не достигнута, GPU-пути проверены отдельно ниже |
+| Windows 11 x64 · Core i9-13900H · 31,59 GiB RAM | Запускатор, EXE, CPU-инференс, OpenAI API, сканирование профилей и mapped-запуск DeepSeek-V4 размером 118,47 GiB; полный набор: `324 passed`, `11 skipped` | **CPU-функциональность пройдена сквозным тестом**; исходная цель по скорости не достигнута, GPU-пути проверены отдельно ниже |
 | Windows 11 · NVIDIA RTX 3090 (лимит процесса 20 GiB) · CUDA 13 | DeepSeek-V4 в режиме ограниченной VRAM CUDA/RAM, прямая передача из locked RAM, strict LRU, fused decode и многотуровая генерация | **Аппаратный тест 0.9.2 пройден** |
 | NVIDIA RTX 5090 | Реальные CUDA/RAM-тесты DeepSeek-V4 и GLM-5.2 | **Движок протестирован** |
 | NVIDIA H20-3e (одна и несколько GPU) | DeepSeek-V4 TP1/TP4, GLM-5.2 TP2, Kimi K3 GPU+RAM/TP8 | **Движок протестирован** |
-| Двухсокетный CPU-сервер (96 физических ядер) | Общий CPU-бэкенд, кэш кодовых книг и runtime-образы для DeepSeek-V4 и Kimi K3 | **Движок протестирован** |
+| Двухсокетный CPU-сервер (96 физических ядер) | Qwen3.5 27B Dense VQ, NUMA-разделение Q4 и 64-токенный Decode | **В 0.9.4 измерено 9,77 token/s, примерно +38,6% к стабильной базе; обещания 30 token/s нет** |
 | Windows CUDA 13.0 / `sm_120` | Полная компиляция NVCC, линковка и загрузка модуля | **Цепочка сборки пройдена**; граница проверки — загрузка модуля |
 | Windows ROCm 7.2.1 / `gfx1151` | HIPIFY, генерация кода устройства, линковка и загрузка модуля | **Цепочка сборки пройдена**; аппаратная проверка AMD запланирована |
 | macOS | Runtime и пакет выпуска находятся в дорожной карте | **Запланировано** |
@@ -262,7 +263,7 @@ $release.launcher.sha256
 
 ## Ссылки
 
-- Скачать: [GitHub Release v0.9.3](https://github.com/Value99/CCCP/releases/tag/v0.9.3)
+- Скачать: [GitHub Release v0.9.4](https://github.com/Value99/CCCP/releases/tag/v0.9.4)
 - Сообщество: [Discord](https://discord.gg/eNnwmAUY4M)
 - Модели: [ModelScope · ValueFX](https://www.modelscope.cn/profile/ValueFX)
 - Страница проекта: [GitHub · Value99/CCCP](https://github.com/Value99/CCCP)
