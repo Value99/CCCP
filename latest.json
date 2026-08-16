@@ -1,13 +1,13 @@
 {
   "schema": "cccp-launcher-update-v1",
   "channel": "stable",
-  "version": "0.9.2",
-  "released_at": "2026-08-15T22:20:50+08:00",
-  "title": "CCCP 启动器 0.9.2",
-  "summary": "修复 Windows CUDA 异步批量传输崩溃，完善离线算子编译缓存、GPU 分级卸载和多模型推理链路。",
+  "version": "0.9.3",
+  "released_at": "2026-08-16T12:50:00+08:00",
+  "title": "CCCP 启动器 0.9.3",
+  "summary": "新增通用 Dense VQ 与 Qwen3.5 实模支持，完善 Kimi 组合投影融合执行器和 AMD TokenGraph 真实性门禁。",
   "download": {
     "provider": "GitHub Releases",
-    "url": "https://github.com/Value99/CCCP/releases/tag/v0.9.2",
+    "url": "https://github.com/Value99/CCCP/releases/tag/v0.9.3",
     "extraction_code": ""
   },
   "github": {
@@ -16,8 +16,8 @@
   },
   "launcher": {
     "filename": "CCCP-Launcher.exe",
-    "size_bytes": 40778209,
-    "sha256": "696A72F3200BEAA023C53164F236BD2185DC30486D31F2288500681C0093EC10"
+    "size_bytes": 40782034,
+    "sha256": "BFA4795020E4FAF57DE2277E9165A1FCCE95AA2F72CA901F2618CDE703C4EDBB"
   },
   "runtime": {
     "python_required": false,
@@ -26,10 +26,10 @@
     "platform": "Windows x64"
   },
   "release_notes": [
-    "修复 Windows/WDDM 原生批量 DMA 延迟触发 CUDA illegal memory access。",
-    "内置 CUDA/MSVC/Windows SDK/Ninja，按 SM75/86/89/90/120 自动编译并缓存融合算子。",
-    "GPU 容量按显存、主机内存、磁盘逐级降级，统一保留 1 GiB 显存安全余量。",
-    "关闭桌面应用会结束推理后端，并记忆主题与 CPU/NVIDIA/AMD 设备选择。",
-    "完成 DeepSeek-V4、GLM-5.2、Kimi K3 的配置驱动、训练扫描、KV 复用和 CPU/CUDA 回归。"
+    "Qwen3.5 Dense VQ 由 cccp.json 通用识别，完整加载且不显示专家训练或专家配置。",
+    "H20 单卡 Qwen3.5 实模 Prefill 约 527 token/s、Decode 约 55.56 token/s。",
+    "Kimi 10/15 行组合投影统一进入 packed grouped 融合执行器；DSV4、Kimi、GLM 实模回归通过。",
+    "AMD 全显存推理必须显示 hip.tp1-token-graph 和有效 Graph 提交，旧执行器会被明确拒绝。",
+    "自动化回归 313 passed、11 skipped；CPU 功能通过，但本版不承诺达到目标吞吐。"
   ]
 }

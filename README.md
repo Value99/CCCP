@@ -8,32 +8,32 @@
   <strong>简体中文</strong> · <a href="README_EN.md">English</a> · <a href="README_RU.md">Русский</a>
 </p>
 
-## ⬇️ 下载 Windows 完整离线版（v0.9.2）
+## ⬇️ 下载 Windows 完整离线版（v0.9.3）
 
 > [!IMPORTANT]
 > **第一次使用请下载完整离线包，不要只下载单独的 `CCCP-Launcher.exe`。** 发行包已内置 Python、Miniconda、CPU/CUDA/AMD 推理环境及算子编译工具，无需另外安装依赖。
 
-### [👉 GitHub Release 下载页（推荐）](https://github.com/Value99/CCCP/releases/tag/v0.9.2)
+### [👉 GitHub Release 下载页（推荐）](https://github.com/Value99/CCCP/releases/tag/v0.9.3)
 
 打开下载页后，将下面 **6 个文件**全部下载到同一个文件夹：
 
-1. `CCCP-Launcher-0.9.2-Offline-Setup.exe`
-2. `CCCP-Launcher-v0.9.2-offline.parts.json`
-3. `CCCP-Launcher-v0.9.2-win-x64-offline.zip.001`
-4. `CCCP-Launcher-v0.9.2-win-x64-offline.zip.002`
-5. `CCCP-Launcher-v0.9.2-win-x64-offline.zip.003`
-6. `CCCP-Launcher-v0.9.2-win-x64-offline.zip.004`
+1. `CCCP-Launcher-0.9.3-Offline-Setup.exe`
+2. `CCCP-Launcher-v0.9.3-offline.parts.json`
+3. `CCCP-Launcher-v0.9.3-win-x64-offline.zip.001`
+4. `CCCP-Launcher-v0.9.3-win-x64-offline.zip.002`
+5. `CCCP-Launcher-v0.9.3-win-x64-offline.zip.003`
+6. `CCCP-Launcher-v0.9.3-win-x64-offline.zip.004`
 
-然后双击 `CCCP-Launcher-0.9.2-Offline-Setup.exe`。安装器会自动校验、合并、解压并启动程序，全程显示进度。模型不包含在启动器发行包内，需要单独下载并放入解压目录的 `models` 文件夹。
+然后双击 `CCCP-Launcher-0.9.3-Offline-Setup.exe`。安装器会自动校验、合并、解压并启动程序，全程显示进度。模型不包含在启动器发行包内，需要单独下载并放入解压目录的 `models` 文件夹。
 
 > Release 页面底部的 `Source code (zip/tar.gz)` 是 GitHub 自动生成的公开资料快照，只含公开文档、图片、版本元数据和独立更新 EXE，不包含启动器源码、推理引擎源码或 CCCP 量化/训练框架。普通用户请下载上面列出的离线安装器和 4 个分卷。
 
-### 0.9.2 重点更新
+### 0.9.3 重点更新
 
-- 修复 Windows/WDDM 批量 DMA 延迟触发 CUDA illegal memory access；Windows 使用安全的编译层批量提交，Linux/TCC 保留原生批量 API。
-- 随包提供 CUDA/MSVC/Windows SDK/Ninja，自动适配并缓存 SM75、SM86、SM89、SM90、SM120 融合算子。
-- GPU 容量按显存、主机内存、磁盘逐级降级；显存统一保留 1 GiB，专家数量和模型原生 top-k 不变。
-- 关闭桌面程序会结束推理后端，并记忆主题与 CPU/NVIDIA/AMD 选择；本版已通过 270 项自动化回归和 Windows NVIDIA 真机验证。
+- 新增清单驱动的通用 Dense VQ 支持；Qwen3.5 27B Dense 可直接加载完整模型，界面不会误要求专家配置或专家训练。
+- NVIDIA Dense VQ 使用原生 FP8 分组投影、静态 KV、融合递归状态与 CUDA Graph；H20 单卡实模 Decode 达到约 55.56 token/s。
+- Kimi 的 10/15 行组合投影统一进入 packed grouped 融合路径；DeepSeek-V4、Kimi K3、GLM-5.2 与 Qwen3.5 实模回归通过。
+- AMD 全显存路径增加真实性门禁，必须显示 `hip.tp1-token-graph` 与有效 Graph 提交；本版自动化回归为 313 passed、11 skipped。
 
 <p align="center">
   <img src="assets/cccp-banner-centered-final.jpg" alt="C.C.C.P. 动态专家推理框架" width="100%">
@@ -45,7 +45,7 @@
 </p>
 
 <p align="center">
-  <img alt="Release" src="https://img.shields.io/badge/release-v0.9.2-a52f25">
+  <img alt="Release" src="https://img.shields.io/badge/release-v0.9.3-a52f25">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20x64-7a1e18">
   <img alt="Python" src="https://img.shields.io/badge/Python-%E6%97%A0%E9%9C%80%E5%AE%89%E8%A3%85-c49543">
   <img alt="Device" src="https://img.shields.io/badge/default-CPU-3a2118">
@@ -145,8 +145,8 @@ CCCP 与模型资料：
 
 ## 快速开始
 
-1. 从上方 [GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.2) 下载全部 6 个离线安装文件。
-2. 双击 `CCCP-Launcher-0.9.2-Offline-Setup.exe`，等待校验、合并和解压完成；不要直接在分卷内运行。
+1. 从上方 [GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.3) 下载全部 6 个离线安装文件。
+2. 双击 `CCCP-Launcher-0.9.3-Offline-Setup.exe`，等待校验、合并和解压完成；不要直接在分卷内运行。
 3. 将带有 `cccp.json` 的兼容模型放入程序同级 `models` 目录。
 4. 双击 `CCCP-Launcher.exe`。
 5. 选择模型和专家配置；初次使用也可直接选择全量加载。
@@ -229,6 +229,7 @@ for chunk in stream:
 | --- | --- | --- |
 | Windows 11 x64 · Core i9-13900H · 31.59 GiB RAM | 启动器、EXE、CPU 推理、OpenAI API、配置扫描、118.47 GiB DeepSeek-V4 模型磁盘映射回归；自动化测试 `270 passed` | **CPU 端到端通过**；GPU 路径见下方独立实测 |
 | Windows 11 · NVIDIA RTX 3090（20 GiB 进程限额）· CUDA 13 | DeepSeek-V4 受限显存 CUDA/RAM、直接锁页传输、严格 LRU、融合 Decode 与多轮生成 | **0.9.2 真机通过** |
+| Linux · NVIDIA H20 单卡 | Qwen3.5 27B Dense VQ 完整加载、有限值、多轮与性能 | **0.9.3 真机通过：Decode 55.56 token/s** |
 | NVIDIA RTX 5090 | DeepSeek-V4 和 GLM-5.2 的 CUDA/RAM 路径实机回归 | **引擎实测通过** |
 | NVIDIA H20-3e（单卡与多卡） | DeepSeek-V4 TP1/TP4、GLM-5.2 TP2、Kimi K3 GPU+RAM/TP8 | **引擎实测通过** |
 | 双路 CPU 服务器（96 物理核） | DeepSeek-V4 与 Kimi K3 公共 CPU 后端、码本缓存和运行时映像 | **引擎实测通过** |
@@ -274,7 +275,7 @@ $release.launcher.sha256
 
 ## 链接
 
-- 下载：[GitHub Release v0.9.2](https://github.com/Value99/CCCP/releases/tag/v0.9.2)
+- 下载：[GitHub Release v0.9.3](https://github.com/Value99/CCCP/releases/tag/v0.9.3)
 - 社区：[Discord](https://discord.gg/eNnwmAUY4M)
 - 模型：[ModelScope · ValueFX](https://www.modelscope.cn/profile/ValueFX)
 - 项目主页：[GitHub · Value99/CCCP](https://github.com/Value99/CCCP)
