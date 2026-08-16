@@ -31,9 +31,9 @@
 ### 0.9.3 重点更新
 
 - 新增清单驱动的通用 Dense VQ 支持；Qwen3.5 27B Dense 可直接加载完整模型，界面不会误要求专家配置或专家训练。
-- NVIDIA Dense VQ 使用原生 FP8 分组投影、静态 KV、融合递归状态与 CUDA Graph；H20 单卡实模 Decode 达到约 55.56 token/s。
+- NVIDIA Dense VQ 使用原生 FP8 分组投影、静态 KV、融合递归状态与 CUDA Graph；Qwen3.5 的 MTP 按架构配置默认启用 Top-3 验证，H20 单卡有效 Decode 93.21 token/s、完整请求 82.39 token/s。
 - Kimi 的 10/15 行组合投影统一进入 packed grouped 融合路径；DeepSeek-V4、Kimi K3、GLM-5.2 与 Qwen3.5 实模回归通过。
-- AMD 全显存路径增加真实性门禁，必须显示 `hip.tp1-token-graph` 与有效 Graph 提交；本版自动化回归为 313 passed、11 skipped。
+- AMD 全显存路径增加真实性门禁，必须显示 `hip.tp1-token-graph` 与有效 Graph 提交；本版自动化回归为 322 passed、11 skipped。AMD 本轮未做真机性能复测。
 
 <p align="center">
   <img src="assets/cccp-banner-centered-final.jpg" alt="C.C.C.P. 动态专家推理框架" width="100%">
@@ -227,9 +227,9 @@ for chunk in stream:
 
 | 平台/硬件 | 当前验证情况 | 结论 |
 | --- | --- | --- |
-| Windows 11 x64 · Core i9-13900H · 31.59 GiB RAM | 启动器、EXE、CPU 推理、OpenAI API、配置扫描、118.47 GiB DeepSeek-V4 模型磁盘映射回归；自动化测试 `270 passed` | **CPU 端到端通过**；GPU 路径见下方独立实测 |
+| Windows 11 x64 · Core i9-13900H · 31.59 GiB RAM | 启动器、EXE、CPU 推理、OpenAI API、配置扫描、118.47 GiB DeepSeek-V4 模型磁盘映射回归；完整自动化测试 `322 passed`、`11 skipped` | **CPU 端到端功能通过**；吞吐未达到原性能目标，GPU 路径见下方独立实测 |
 | Windows 11 · NVIDIA RTX 3090（20 GiB 进程限额）· CUDA 13 | DeepSeek-V4 受限显存 CUDA/RAM、直接锁页传输、严格 LRU、融合 Decode 与多轮生成 | **0.9.2 真机通过** |
-| Linux · NVIDIA H20 单卡 | Qwen3.5 27B Dense VQ 完整加载、有限值、多轮与性能 | **0.9.3 真机通过：Decode 55.56 token/s** |
+| Linux · NVIDIA H20 单卡 | Qwen3.5 27B Dense VQ 完整加载、有限值、MTP Top-3 与性能 | **0.9.3 真机通过：有效 Decode 93.21 token/s，完整请求 82.39 token/s** |
 | NVIDIA RTX 5090 | DeepSeek-V4 和 GLM-5.2 的 CUDA/RAM 路径实机回归 | **引擎实测通过** |
 | NVIDIA H20-3e（单卡与多卡） | DeepSeek-V4 TP1/TP4、GLM-5.2 TP2、Kimi K3 GPU+RAM/TP8 | **引擎实测通过** |
 | 双路 CPU 服务器（96 物理核） | DeepSeek-V4 与 Kimi K3 公共 CPU 后端、码本缓存和运行时映像 | **引擎实测通过** |

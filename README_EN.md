@@ -19,9 +19,9 @@ The automatically generated `Source code (zip/tar.gz)` links contain only public
 ### Highlights in 0.9.3
 
 - Adds manifest-driven Dense VQ support. Qwen3.5 27B Dense loads as a complete model without expert profiles or expert training controls.
-- NVIDIA Dense VQ uses native FP8 grouped projections, static KV, fused recurrent state, and CUDA Graphs; a real single-H20 run reached about 55.56 decode token/s.
+- NVIDIA Dense VQ uses native FP8 grouped projections, static KV, fused recurrent state, and CUDA Graphs. Qwen3.5 enables architecture-configured MTP with Top-3 verification by default; a real single-H20 run reached 93.21 effective decode token/s and 82.39 token/s end to end.
 - Unifies Kimi 10/15-row combined projections on the packed grouped executor and revalidates DeepSeek-V4, Kimi K3, GLM-5.2, and Qwen3.5 models.
-- AMD full-resident inference now requires the truthful `hip.tp1-token-graph` executor and non-zero Graph submissions. The automated suite reports 313 passed and 11 skipped.
+- AMD full-resident inference now requires the truthful `hip.tp1-token-graph` executor and non-zero Graph submissions. The automated suite reports 322 passed and 11 skipped; AMD performance was not revalidated on physical hardware in this release cycle.
 
 <p align="center">
   <img src="assets/cccp-banner-centered-final.jpg" alt="C.C.C.P. Dynamic Expert Inference Framework" width="100%">
@@ -215,7 +215,7 @@ Vision input is scheduled for a later release and will open after image preproce
 
 | Platform / hardware | Validation scope | Status |
 | --- | --- | --- |
-| Windows 11 x64 · Core i9-13900H · 31.59 GiB RAM | Launcher, EXE, CPU inference, OpenAI API, profile scanning, and mapped execution of a 118.47 GiB DeepSeek-V4 model; `270 passed` automated tests | **CPU end-to-end passed**; GPU paths are covered by separate hardware runs below |
+| Windows 11 x64 · Core i9-13900H · 31.59 GiB RAM | Launcher, EXE, CPU inference, OpenAI API, profile scanning, and mapped execution of a 118.47 GiB DeepSeek-V4 model; full suite: `322 passed`, `11 skipped` | **CPU functionality passed end to end**; the original throughput target was not met, and GPU paths are covered separately below |
 | Windows 11 · NVIDIA RTX 3090 (20 GiB process limit) · CUDA 13 | DeepSeek-V4 constrained-VRAM CUDA/RAM, direct pinned transfer, strict LRU, fused decode, and multi-turn generation | **0.9.2 hardware passed** |
 | NVIDIA RTX 5090 | Real CUDA/RAM runs with DeepSeek-V4 and GLM-5.2 | **Engine tested** |
 | NVIDIA H20-3e (single and multi-GPU) | DeepSeek-V4 TP1/TP4, GLM-5.2 TP2, and Kimi K3 GPU+RAM/TP8 | **Engine tested** |
