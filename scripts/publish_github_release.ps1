@@ -8,6 +8,24 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+
+function Get-CccpFileSha256([string]$Path) {
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $algorithm = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $digest = $algorithm.ComputeHash($stream)
+            return ([System.BitConverter]::ToString($digest)).Replace("-", "").ToLowerInvariant()
+        }
+        finally {
+            $algorithm.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
 $root = Split-Path $PSScriptRoot -Parent
 if (-not $Version) {
     $Version = [System.IO.File]::ReadAllText((Join-Path $root "VERSION"), [System.Text.Encoding]::UTF8).Trim()
@@ -75,7 +93,7 @@ foreach ($file in $localFiles) {
     if ($file.Length -ge 2GB) { throw "GitHub asset must be under 2 GiB: $($file.Name)" }
     $existing = @($release.assets | Where-Object name -eq $file.Name)
     if ($existing.Count -eq 1 -and [long]$existing[0].size -eq $file.Length -and $existing[0].state -eq "uploaded") {
-        $localDigest = "sha256:$((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant())"
+        $localDigest = "sha256:$(Get-CccpFileSha256 $file.FullName)"
         $remoteDigest = [string]$existing[0].digest
         if ($remoteDigest -and $remoteDigest.ToLowerInvariant() -eq $localDigest) {
             Write-Host "Verified existing $($file.Name) by SHA-256; skipping upload."
@@ -123,7 +141,7 @@ foreach ($file in $localFiles) {
     }
     $remoteDigest = [string]$remote[0].digest
     if ($remoteDigest) {
-        $localDigest = "sha256:$((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant())"
+        $localDigest = "sha256:$(Get-CccpFileSha256 $file.FullName)"
         if ($remoteDigest.ToLowerInvariant() -ne $localDigest) {
             throw "Final remote SHA-256 audit failed: $($file.Name)"
         }

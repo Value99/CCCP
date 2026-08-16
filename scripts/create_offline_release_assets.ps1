@@ -6,6 +6,24 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+function Get-CccpFileSha256([string]$Path) {
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $algorithm = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $digest = $algorithm.ComputeHash($stream)
+            return ([System.BitConverter]::ToString($digest)).Replace("-", "").ToLowerInvariant()
+        }
+        finally {
+            $algorithm.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
 $root = Split-Path $PSScriptRoot -Parent
 if (-not $Version) {
     $Version = [System.IO.File]::ReadAllText((Join-Path $root "VERSION"), [System.Text.Encoding]::UTF8).Trim()
@@ -76,7 +94,7 @@ Write-Host "[6/6] Generate final asset checksums..."
 $checksumPath = Join-Path $output "SHA256SUMS.txt"
 $lines = @()
 foreach ($file in (Get-ChildItem -LiteralPath $output -File | Where-Object Name -ne "SHA256SUMS.txt" | Sort-Object Name)) {
-    $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    $hash = Get-CccpFileSha256 $file.FullName
     $lines += "$hash  $($file.Name)"
 }
 [System.IO.File]::WriteAllLines($checksumPath, $lines, (New-Object System.Text.UTF8Encoding($false)))
