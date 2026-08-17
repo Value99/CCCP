@@ -154,6 +154,8 @@ $env:PYTHONDONTWRITEBYTECODE = "1"
 if ($LASTEXITCODE) { throw "发行目录 Miniconda 依赖自检失败" }
 & (Join-Path $release "runtime\cuda\env\python.exe") -c "import torch; assert torch.version.cuda and not torch.version.hip; print('CUDA environment ok',torch.__version__,torch.version.cuda)"
 if ($LASTEXITCODE) { throw "发行目录 CUDA 环境自检失败" }
+& (Join-Path $release "runtime\cuda\env\python.exe") (Join-Path $root "scripts\audit_packaged_gpu_ops.py") $release
+if ($LASTEXITCODE) { throw "发行目录缺少常用 NVIDIA 架构的随包融合算子" }
 $env:CCCP_LAUNCHER_ROOT = $release
 $env:CCCP_FUSED = "0"
 $env:PYTHONPATH = $engineRelease

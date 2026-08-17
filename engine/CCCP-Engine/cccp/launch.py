@@ -9,6 +9,7 @@ from typing import Any
 
 from .presets import (
     apply_preset_environment,
+    model_context_limit,
     resolve_capacity_profile,
     resolve_preset,
 )
@@ -189,6 +190,19 @@ def _parser() -> argparse.ArgumentParser:
 def _value(args: argparse.Namespace, preset: Any, name: str) -> Any:
     value = getattr(args, name)
     return preset.defaults.get(name) if value is None else value
+
+
+def _context_limit(args: argparse.Namespace, preset: Any) -> int:
+    """Use an explicit debug override or the model's own logical limit."""
+    declared = model_context_limit(preset.manifest)
+    if args.max_ctx is None:
+        return declared
+    requested = int(args.max_ctx)
+    if requested < 64 or requested > declared:
+        raise ValueError(
+            f"--max-ctx={requested} 超出模型声明范围 64..{declared}"
+        )
+    return requested
 
 
 def _spec_value(args: argparse.Namespace, preset: Any) -> int:
@@ -421,7 +435,7 @@ def _apply_environment(
 
 def _summary(args: argparse.Namespace, preset: Any) -> None:
     device = _value(args, preset, "device")
-    max_ctx = _value(args, preset, "max_ctx")
+    max_ctx = _context_limit(args, preset)
     spec = _spec_value(args, preset)
     layout = preset.ep_layout or "-"
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "系统默认")
@@ -431,7 +445,7 @@ def _summary(args: argparse.Namespace, preset: Any) -> None:
         f"profile={preset.profile}({getattr(args, '_profile_source', '显式')})；"
         f"device={device}；tp={preset.tp}"
         f"({getattr(args, '_tp_source', '配置')})；"
-        f"layout={layout}；max_ctx={max_ctx}；spec={spec}；"
+        f"layout={layout}；context=动态扩展(模型上限{max_ctx})；spec={spec}；"
         f"dense={args.dense_residency}；"
         f"dense_bf16={os.environ.get('CCCP_DENSE_BF16', 'none')}；"
         f"extreme={getattr(args, '_extreme_source', '否')}；"
@@ -475,7 +489,7 @@ def _chat_argv(args: argparse.Namespace, preset: Any) -> list[str]:
         "--tp",
         str(preset.tp),
         "--max-ctx",
-        str(_value(args, preset, "max_ctx")),
+        str(_context_limit(args, preset)),
         "--spec",
         str(_spec_value(args, preset)),
         "--temp",
@@ -516,7 +530,7 @@ def _serve_argv(args: argparse.Namespace, preset: Any) -> list[str]:
         "--tp",
         str(preset.tp),
         "--max-ctx",
-        str(_value(args, preset, "max_ctx")),
+        str(_context_limit(args, preset)),
         "--spec",
         str(_spec_value(args, preset)),
         "--host",
@@ -642,7 +656,9 @@ def _maybe_select_auto_extreme(
         )
     decision = detect_auto_extreme(
         str(preset.model_dir),
-        max_ctx=int(_value(args, preset, "max_ctx")),
+        # Capacity admission uses one normal Prefill block. The logical KV
+        # ceiling is model-driven and pages grow only when requests need them.
+        max_ctx=min(4096, _context_limit(args, preset)),
         device="cuda",
         tp_size=1,
         normal_ram_reserve_gib=normal_reserve,

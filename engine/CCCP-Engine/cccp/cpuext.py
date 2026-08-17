@@ -294,17 +294,22 @@ def _ensure_ninja_on_path() -> None:
         os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
 
 
-def _configure_bundled_windows_toolchain() -> bool:
+def _configure_bundled_windows_toolchain(*, force: bool = False) -> bool:
     """Expose the portable MSVC/Windows SDK bundled with the launcher.
 
     The release normally loads its ABI-matched prebuilt ``.pyd``.  This is the
     offline recovery path for a missing/incompatible operator: torch's JIT
     builder can compile from ``csrc`` without Visual Studio being installed.
-    Existing developer-shell settings are deliberately left untouched.
+    Existing developer-shell settings are left untouched unless ``force`` is
+    requested by the offline GPU JIT recovery path.  That path must never mix
+    a user's Visual Studio with the release's CUDA SDK and Windows headers.
     """
     if os.name != "nt":
         return False
-    if all(shutil.which(tool) is not None for tool in ("cl.exe", "lib.exe", "link.exe")):
+    if not force and all(
+        shutil.which(tool) is not None
+        for tool in ("cl.exe", "lib.exe", "link.exe")
+    ):
         return False
 
     repo_root = os.path.realpath(
@@ -370,14 +375,34 @@ def _configure_bundled_windows_toolchain() -> bool:
         ],
     )
     vc_root = os.path.realpath(os.path.join(msvc_tools_root, "..", ".."))
-    os.environ.setdefault("DISTUTILS_USE_SDK", "1")
-    os.environ.setdefault("MSSdk", "1")
-    os.environ.setdefault("VisualStudioVersion", "17.0")
-    os.environ.setdefault("VCINSTALLDIR", vc_root + os.sep)
-    os.environ.setdefault("VCToolsInstallDir", msvc_root + os.sep)
-    os.environ.setdefault("WindowsSdkDir", sdk_root + os.sep)
-    os.environ.setdefault("WindowsSDKVersion", sdk_version + os.sep)
-    return all(shutil.which(tool) is not None for tool in ("cl.exe", "lib.exe", "link.exe"))
+    toolchain_environment = {
+        "DISTUTILS_USE_SDK": "1",
+        "MSSdk": "1",
+        "VisualStudioVersion": "17.0",
+        "VCINSTALLDIR": vc_root + os.sep,
+        "VCToolsInstallDir": msvc_root + os.sep,
+        "WindowsSdkDir": sdk_root + os.sep,
+        "WindowsSDKVersion": sdk_version + os.sep,
+    }
+    for name, value in toolchain_environment.items():
+        if force:
+            os.environ[name] = value
+        else:
+            os.environ.setdefault(name, value)
+    resolved = {
+        tool: shutil.which(tool)
+        for tool in ("cl.exe", "lib.exe", "link.exe")
+    }
+    if not all(resolved.values()):
+        return False
+    if force:
+        expected = os.path.normcase(os.path.realpath(compiler_bin)) + os.sep
+        return all(
+            os.path.normcase(os.path.realpath(path)).startswith(expected)
+            for path in resolved.values()
+            if path is not None
+        )
+    return True
 
 
 def _build(verbose: bool = False):

@@ -35,6 +35,41 @@ from .ops.packed_view import (
 from .prefill import prefill_moe_batch_size
 
 
+def _native8_grouped_backend(capability: tuple[int, int]) -> str | None:
+    """Select a real FP8 Tensor-Core grouped executor for this NVIDIA SM."""
+
+    major, minor = (int(capability[0]), int(capability[1]))
+    if major in (9, 10):
+        # PyTorch's private grouped primitive currently advertises only
+        # Hopper/Blackwell-10.  Keep its single-launch path where supported.
+        return "torch-scaled-grouped-mm"
+    return None
+
+
+def _native8_grouped_mm(
+    value: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    offsets: torch.Tensor,
+    backend: str,
+) -> torch.Tensor:
+    """Run the vendor grouped FP8 primitive on architectures that support it."""
+
+    if backend == "torch-scaled-grouped-mm":
+        return torch._scaled_grouped_mm(
+            value,
+            weights.transpose(1, 2),
+            scale_a=scale_a.view(-1),
+            scale_b=scale_b,
+            offs=offsets,
+            out_dtype=torch.bfloat16,
+            use_fast_accum=True,
+        )
+    raise RuntimeError(f"unsupported native8 grouped backend: {backend}")
+
+
 def _release_host_allocator() -> None:
     """Return dead loader arenas to the OS before enforcing the RAM floor."""
 
@@ -844,6 +879,7 @@ class PackedHybridPool:
         self._native8_codebook_scales: dict[int, float] = {}
         self._native8_prefill_enabled = False
         self.native8_rows_supported = False
+        self._native8_grouped_backend: str | None = None
         self._host_pinned_bytes = 0
         self._host_registrations: dict[int, int] = {}
         self._resident_codebooks = (
@@ -2905,9 +2941,10 @@ class PackedHybridPool:
         ):
             return
         major, minor = torch.cuda.get_device_capability(self.device)
-        if (int(major), int(minor)) < (8, 9):
-            # SM75/80/86 use the same native8 cache layout, but their INT8
-            # grouped short-batch executor is supplied by cuBLASLt/CUTLASS.
+        self._native8_grouped_backend = _native8_grouped_backend(
+            (int(major), int(minor))
+        )
+        if self._native8_grouped_backend is None:
             return
         for codebook in self._device_codebooks.values():
             pointer = int(codebook.data_ptr())
@@ -2929,7 +2966,8 @@ class PackedHybridPool:
                 "[cccp-native8] shared codebooks=E4M3; "
                 f"count={len(self._native8_codebooks)}; "
                 "runtime reconstruction=index-unpack+aligned-copy; "
-                "compute=Tensor-Core scaled-grouped-GEMM",
+                "compute=Tensor-Core FP8 grouped-GEMM; "
+                f"backend={self._native8_grouped_backend}",
                 flush=True,
             )
 
@@ -3559,7 +3597,9 @@ class PackedHybridPool:
             native_input,
             input_scales,
         ) is None:
-            raise RuntimeError("native E4M3 Decode input quantizer rejected rows")
+            raise RuntimeError(
+                "native E4M3 Decode input quantizer rejected rows"
+            )
         gate_up = torch._scaled_mm(
             native_input,
             gu.reshape(count * 2 * intermediate, -1).t(),
@@ -4488,6 +4528,20 @@ class PackedHybridPool:
             int(configured_headroom * 2**30),
         )
         automatic = max(1, (available - safety) // bytes_per_expert)
+        # The compiled projection kernel addresses its dense gate-up output
+        # with a signed 32-bit offset.  A chunk whose gate-up slab passes
+        # 2^31 bytes wraps that offset and writes outside the workspace:
+        # observed as cudaErrorIllegalAddress at expert chunks of 134/135
+        # (hidden=4096, moe_inter=2048, BF16 => 33.5 MiB/expert) while every
+        # chunk under the bound replays cleanly.  The wrapped write sometimes
+        # lands in still-mapped VRAM and corrupts silently instead of
+        # faulting, so the bound is a hard ceiling, not a tuning default.
+        # Gate-up is the largest slab (down is half its size).
+        gate_up_bytes = 2 * intermediate * hidden * execution_bytes
+        kernel_chunk_limit = max(
+            1, (2**31 - 1) // max(1, gate_up_bytes)
+        )
+        automatic = min(automatic, kernel_chunk_limit)
         try:
             requested = int(os.environ.get(
                 "CCCP_PREFILL_DEQUANT_EXPERTS", "0"
@@ -4669,13 +4723,17 @@ class PackedHybridPool:
 
         if self._arenas is None or self._metadata is None:
             raise RuntimeError("packed hybrid pool is not ready")
+        # One Prefill block calls this entry once per model layer.  Retain the
+        # first layer's automatically sized dequant workspace so every
+        # following layer reuses the exact allocation; the block driver
+        # releases it through ``release_host_rows_workspace``.  Rebuilding the
+        # slab per layer forced a synchronize + empty_cache + reallocation
+        # cycle on every layer under WDDM, which stalled Prefill and surfaced
+        # as cudaErrorIllegalAddress from the driver on consumer GPUs.  The
+        # same retention covers GPU-resident rows (DSV4) and the host bridge
+        # (Kimi/GLM) identically.
+        self._retain_prefill_workspace = True
         if not value.is_cuda:
-            # One host Prefill block calls this entry once per model layer.
-            # Retain the first layer's automatically sized dequant workspace
-            # so following layers reuse the exact allocation instead of
-            # fragmenting a small-card allocator with 92 slightly different
-            # BF16 expert slabs.  The model releases it after the block.
-            self._retain_prefill_workspace = True
             device_value, device_ids, device_weights = (
                 self._prepare_host_rows_bridge(
                     value,
@@ -4990,14 +5048,13 @@ class PackedHybridPool:
                                 raise RuntimeError(
                                     "native E4M3 activation quantizer rejected Prefill"
                                 )
-                            gate_up = torch._scaled_grouped_mm(
+                            gate_up = _native8_grouped_mm(
                                 native_input,
-                                gu_buffer[:chunk_count].transpose(1, 2),
+                                gu_buffer[:chunk_count],
                                 scale_a=input_scales.view(-1),
                                 scale_b=gu_scales,
-                                offs=offsets,
-                                out_dtype=torch.bfloat16,
-                                use_fast_accum=True,
+                                offsets=offsets,
+                                backend=self._native8_grouped_backend,
                             )
                         else:
                             projection_dequant(
@@ -5044,14 +5101,13 @@ class PackedHybridPool:
                                 raise RuntimeError(
                                     "native E4M3 activation quantizer rejected MoE hidden rows"
                                 )
-                            down = torch._scaled_grouped_mm(
+                            down = _native8_grouped_mm(
                                 native_activated,
-                                down_buffer[:chunk_count].transpose(1, 2),
+                                down_buffer[:chunk_count],
                                 scale_a=activated_scales.view(-1),
                                 scale_b=down_scales,
-                                offs=offsets,
-                                out_dtype=torch.bfloat16,
-                                use_fast_accum=True,
+                                offsets=offsets,
+                                backend=self._native8_grouped_backend,
                             )
                         else:
                             down = torch._grouped_mm(

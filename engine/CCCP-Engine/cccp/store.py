@@ -78,6 +78,15 @@ def _should_batch_h2d(copy_count: int) -> bool:
     addresses on consumer drivers. Unavailable extensions or rejected layouts
     still use the Python asynchronous copy-stream fallback without changing
     model results.
+
+    Auto mode on Windows additionally keeps large groups out of the compiled
+    submission: batched Prefill chunks submit 100+ ten-MiB copies per group,
+    and both recorded ``cudaErrorIllegalAddress`` incidents surfaced in that
+    window while decode-sized groups (<= 8 copies) hold a clean multi-run
+    record. Those groups still DMA on the same copy stream through the Python
+    fallback, which costs milliseconds of submission CPU against a
+    bandwidth-bound transfer. ``CCCP_H2D_BATCH_MAX_COPIES`` widens the
+    envelope and ``CCCP_H2D_BATCH=1`` restores the previous behaviour.
     """
     # HIPified cudaMemcpyAsync rejects otherwise valid registered-host copies
     # on Windows ROCm (observed at the eighth item of a layer batch). Keep the
@@ -90,6 +99,15 @@ def _should_batch_h2d(copy_count: int) -> bool:
         return False
     if mode in {"1", "true", "on", "yes"}:
         return copy_count > 1
+    if _WINDOWS:
+        try:
+            maximum = int(
+                os.environ.get("CCCP_H2D_BATCH_MAX_COPIES", "8")
+            )
+        except (TypeError, ValueError):
+            maximum = 8
+        if copy_count > max(1, maximum):
+            return False
     minimum = int(os.environ.get("CCCP_H2D_BATCH_MIN_COPIES", "2"))
     return copy_count >= max(2, minimum)
 
@@ -972,7 +990,10 @@ class Manifest:
             self.projection_vq
             or (
                 combined_projection_vq
-                and self.quant.get("vq")
+                and (
+                    self.quant.get("vq")
+                    or self.quant.get("vq_projections")
+                )
                 and self.quant.get("layer_kinds")
             )
         )
@@ -1131,10 +1152,66 @@ class Manifest:
             self.projection_codebook_group_sizes = {}
             self.projection_codebook_group_counts = {}
             self.index_packing = {}
+            # ``quant.vq`` is only a legacy summary of the Gate/Up layout.
+            # Current per-projection manifests may omit it because the exact
+            # Gate/Up and Down shapes already live in ``vq_projections``.
+            # Derive the summary strictly instead of crashing with KeyError;
+            # the storage/runtime path remains the existing combined format.
+            vq_summary = self.quant.get("vq") or {}
+            if not vq_summary:
+                projection_summaries = self.quant.get("vq_projections") or {}
+                vq_summary = {}
+                for kind, projections in projection_summaries.items():
+                    if not isinstance(projections, dict):
+                        raise ValueError(
+                            f"VQ projection summary {kind!r} must be an object"
+                        )
+                    primary = projections.get("gu")
+                    if primary is None:
+                        raise ValueError(
+                            f"VQ projection summary {kind!r} is missing gu"
+                        )
+                    try:
+                        dim, size = (int(value) for value in primary)
+                    except (TypeError, ValueError):
+                        raise ValueError(
+                            f"VQ projection summary {kind!r}.gu must be [dim, size]"
+                        ) from None
+                    if dim <= 0 or size <= 0:
+                        raise ValueError(
+                            f"VQ projection summary {kind!r}.gu must be positive"
+                        )
+                    for projection, shape in projections.items():
+                        try:
+                            projection_dim, projection_size = (
+                                int(value) for value in shape
+                            )
+                        except (TypeError, ValueError):
+                            raise ValueError(
+                                f"VQ projection summary {kind!r}.{projection} "
+                                "must be [dim, size]"
+                            ) from None
+                        if projection_dim != dim or projection_size <= 0:
+                            raise ValueError(
+                                f"VQ projection summary {kind!r}.{projection} "
+                                f"is incompatible with dim={dim}"
+                            )
+                    vq_summary[str(kind)] = (dim, size)
             self.vq_dims = {
-                k: tuple(v)
-                for k, v in m["quant"]["vq"].items()
+                str(kind): tuple(int(value) for value in shape)
+                for kind, shape in vq_summary.items()
             }  # 档 -> (dim, k)
+            referenced_kinds = {
+                str(kind).rstrip("z")
+                for kind in (self.quant.get("layer_kinds") or {}).values()
+                if str(kind) != "drop"
+            }
+            missing_kinds = sorted(referenced_kinds - set(self.vq_dims))
+            if missing_kinds:
+                raise ValueError(
+                    "layer_kinds references undefined VQ summaries: "
+                    f"{missing_kinds}"
+                )
         layout = m["quant"].get("vq_codebook_layout") or {}
         layout_format = layout.get("format")
         if layout_format not in (

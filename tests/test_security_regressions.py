@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import sys
-from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -37,90 +36,11 @@ def _isolated_app(tmp_path, monkeypatch):
     return app_module.create_app(settings)
 
 
-@pytest.mark.parametrize("device", ["cuda", "amd"])
-def test_gpu_automatic_context_calls_imported_backend_probe(monkeypatch, device):
-    calls = []
-    monkeypatch.setattr(app_module, "_memory_status", lambda: (32.0, 24.0))
-    monkeypatch.setattr(
-        app_module,
-        "probe_backend",
-        lambda settings, backend, root: calls.append((backend, root))
-        or {"device_memory_gb": 12.0},
-    )
-    settings = Settings(cccp_engine_path="")
-    assert app_module._automatic_context("", 1.0, device, settings) == 4096
-    assert calls == [(device, settings.cccp_engine_path)]
+def test_gui_launch_does_not_create_a_fixed_context_ceiling():
+    source = (app_module.Path(app_module.__file__)).read_text(encoding="utf-8")
 
-
-@pytest.mark.parametrize("device", ["cuda", "amd"])
-def test_gpu_context_does_not_subtract_host_expert_cache(
-    monkeypatch, device, tmp_path
-):
-    settings = Settings()
-    monkeypatch.setattr(
-        app_module,
-        "probe_backend",
-        lambda *_args, **_kwargs: {"device_memory_gb": 16.0},
-    )
-    monkeypatch.setattr(app_module, "_memory_status", lambda: (64.0, 64.0))
-
-    assert app_module._automatic_context("", 80.0, device, settings) == 4096
-
-
-def test_gpu_context_steps_down_until_fixed_cuda_working_set_fits(
-    monkeypatch,
-):
-    settings = Settings()
-    model = SimpleNamespace(max_context=32768, dense_gb=8.0)
-    monkeypatch.setattr(app_module, "inspect_model", lambda _path: model)
-    monkeypatch.setattr(
-        app_module,
-        "probe_backend",
-        lambda *_args, **_kwargs: {
-            "device_memory_gb": 16.0,
-            "device_available_memory_gb": 14.0,
-        },
-    )
-    minimums = {4096: 20.0, 2048: 16.0, 1024: 13.0, 512: 12.0}
-    monkeypatch.setattr(
-        app_module,
-        "estimate_gpu_vram_plan",
-        lambda _model, *, max_ctx, expert_cache_gb: {
-            "minimum_vram_gb": minimums[max_ctx],
-        },
-    )
-
-    assert app_module._automatic_context(
-        "D:/model", 80.0, "cuda", settings,
-    ) == 1024
-
-
-def test_kimi_ram_dense_gpu_uses_safe_automatic_context(monkeypatch):
-    settings = Settings()
-    model = SimpleNamespace(max_context=131072, dense_gb=56.0)
-    monkeypatch.setattr(app_module, "inspect_model", lambda _path: model)
-    monkeypatch.setattr(
-        app_module,
-        "probe_backend",
-        lambda *_args, **_kwargs: {
-            "device_memory_gb": 16.0,
-            "device_available_memory_gb": 16.0,
-        },
-    )
-    monkeypatch.setattr(app_module, "_memory_status", lambda: (128.0, 96.0))
-    monkeypatch.setattr(
-        app_module,
-        "estimate_gpu_vram_plan",
-        lambda _model, *, max_ctx, expert_cache_gb: {
-            "architecture": "kimi_k3",
-            "minimum_vram_gb": 10.5,
-            "recommended_vram_gb": 66.5,
-        },
-    )
-
-    assert app_module._automatic_context(
-        "D:/kimi", 55.0, "cuda", settings,
-    ) == 512
+    assert "_automatic_context" not in source
+    assert "max_ctx=0" in source
 
 
 def test_cross_site_write_is_rejected_before_state_change(tmp_path, monkeypatch):

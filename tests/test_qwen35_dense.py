@@ -267,6 +267,11 @@ def test_dense_ui_has_no_expert_training_or_profile_language():
     assert "Dense 模型不使用专家配置" in script
     assert "没有动态专家，无需且不支持语料路由扫描" in script
     assert "完整 Dense 模型" in script
+    full_model_card = script.split("function fullModelCard(model)", 1)[1].split(
+        "async function toggleFullModel", 1
+    )[0]
+    assert '${dense ? "Dense VQ"' not in full_model_card
+    assert '${dense ? "完整权重"' not in full_model_card
 
 
 def test_dense_gpu_plan_has_only_resident_and_compact_modes():

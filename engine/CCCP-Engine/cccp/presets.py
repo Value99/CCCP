@@ -80,6 +80,27 @@ def detect_architecture(manifest: dict[str, Any]) -> str:
     return "glm"
 
 
+def model_context_limit(manifest: dict[str, Any]) -> int:
+    """Return the model-declared logical context ceiling.
+
+    Runtime KV pages still start small and grow on demand; this value is only
+    the tokenizer/model contract, never an eager cache allocation request.
+    """
+    config = manifest.get("config") or {}
+    for name in (
+        "max_position_embeddings",
+        "max_sequence_length",
+        "seq_length",
+        "model_max_length",
+    ):
+        value = int(config.get(name) or 0)
+        if value > 0:
+            return value
+    # A malformed early fixture may omit the contract. Keep parsing possible,
+    # but released models are expected to declare one of the fields above.
+    return 32768
+
+
 def load_arch_config(architecture: str) -> dict[str, Any]:
     path = CONFIG_DIR / f"{architecture}.json"
     if not path.is_file():
@@ -536,6 +557,7 @@ __all__ = [
     "detect_architecture",
     "load_arch_config",
     "load_manifest",
+    "model_context_limit",
     "resolve_capacity_profile",
     "resolve_preset",
     "validate_parallel_shapes",

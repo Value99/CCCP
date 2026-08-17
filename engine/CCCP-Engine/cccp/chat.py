@@ -415,42 +415,18 @@ def main(argv=None, should_stop=None) -> None:
     )
     max_new = None if a.no_max_new else a.max_new
 
-    # GLM 默认使用 MLA latent KV，约 0.09MB/token；缺省仍保持 1024，
-    # 长文运行按需显式提高。DSV4 使用环形窗+压缩槽。
+    # No startup-time 1K/4K ceiling: the logical limit comes from cccp.json,
+    # while each architecture's KV implementation expands storage on demand.
     max_ctx = a.max_ctx
     if max_ctx is None:
-        import json as _json
-        import os as _os
-        arch_hint = "glm"
-        try:
-            with open(_os.path.join(a.model, "cccp.json"), encoding="utf-8") as _f:
-                _manifest = _json.load(_f)
-                _config = _manifest["config"]
-                if (
-                    _manifest.get("model_family") == "kimi_k3"
-                    or "kda_layers" in _config
-                ):
-                    arch_hint = "kimi_k3"
-                elif "hc_mult" in _config:
-                    arch_hint = "dsv4"
-                elif (
-                    _manifest.get("tensor_vq")
-                    and not _manifest.get("expert_files")
-                    and str(
-                        _config.get("text_model_type")
-                        or _config.get("outer_model_type")
-                        or ""
-                    ).startswith("qwen3_5")
-                ):
-                    arch_hint = "qwen3_5_dense"
-        except Exception:
-            pass
-        max_ctx = (
-            4096
-            if arch_hint in {"dsv4", "kimi_k3", "qwen3_5_dense"}
-            else 1024
+        from .presets import load_manifest, model_context_limit
+
+        _root, _manifest = load_manifest(a.model)
+        max_ctx = model_context_limit(_manifest)
+        print(
+            f"[chat] context=动态扩展；模型上限={max_ctx}",
+            flush=True,
         )
-        print(f"[chat] max_ctx 按架构缺省: {arch_hint} → {max_ctx}", flush=True)
 
     if reasoning_effort in {"low", "medium"}:
         try:

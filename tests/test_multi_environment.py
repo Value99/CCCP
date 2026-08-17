@@ -35,6 +35,7 @@ def test_amd_maps_to_torch_cuda_api_but_keeps_backend_identity(tmp_path, monkeyp
     monkeypatch.setattr(adapter, "_profile_counts_file", lambda *a, **k: tmp_path / "profile.json")
     command = adapter.build_command(cfg)
     assert command[command.index("--device") + 1] == "cuda"
+    assert "--max-ctx" not in command
     assert command[0] == str(python.resolve())
     assert "--cache-gb" not in command
     assert "--no-extreme" not in command

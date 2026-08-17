@@ -25,6 +25,7 @@ from cccp.packed_hybrid import (  # noqa: E402
     PackedHybridPool,
     PackedExpertSignature,
     automatic_host_pin_budget,
+    _native8_grouped_backend,
 )
 from cccp.dsv4model import (  # noqa: E402
     DSV4CCCPModel,
@@ -58,7 +59,7 @@ from cccp.store import _prefer_direct_pinned_h2d  # noqa: E402
 from cccp.chat_service import _expert_cache_snapshot  # noqa: E402
 from cccp.expert_slots import SlotBook  # noqa: E402
 from cccp.expert_parallel import GpuResidentExpertParallel  # noqa: E402
-from cccp.launch import _apply_environment  # noqa: E402
+from cccp.launch import _apply_environment, _context_limit  # noqa: E402
 from cccp.prefill import prefill_block_size, prefill_ranges  # noqa: E402
 from launcher.profiles import Combination, ExpertRef
 from launcher.settings import Settings
@@ -68,6 +69,21 @@ from launcher.cccp_adapter import (
     inspect_model,
 )
 from launcher.training import load_expert_sizes
+
+
+def test_launch_context_uses_model_contract_not_architecture_default():
+    preset = SimpleNamespace(
+        manifest={"config": {"max_position_embeddings": 1_048_576}},
+        defaults={"max_ctx": 4096},
+    )
+    args = SimpleNamespace(max_ctx=None)
+
+    assert _context_limit(args, preset) == 1_048_576
+    args.max_ctx = 8192
+    assert _context_limit(args, preset) == 8192
+    args.max_ctx = 2_000_000
+    with pytest.raises(ValueError, match="模型声明范围"):
+        _context_limit(args, preset)
 
 
 def test_cpu_thread_auto_keeps_large_smt_bandwidth_headroom(monkeypatch):
@@ -317,7 +333,7 @@ def test_glm_sequential_prefill_is_cuda_only():
     assert '== "cuda"' in source
 
 
-def test_dsv4_long_incremental_range_uses_layer_first_batch(monkeypatch):
+def test_dsv4_long_incremental_range_uses_exact_decode_without_repartition():
     class FakePool:
         def __init__(self):
             self.phases = []
@@ -338,12 +354,13 @@ def test_dsv4_long_incremental_range_uses_layer_first_batch(monkeypatch):
             self.batches = []
 
         def forward_incremental_batch(self, values):
-            self.batches.append(list(values))
-            self.pos += len(values)
-            return torch.tensor([float(self.pos)])
+            raise AssertionError("canonical suffix entered grouped Prefill")
 
-        def forward(self, _values):
-            raise AssertionError("long canonical suffix replayed tokenwise")
+        def forward(self, values):
+            assert len(values) == 1
+            self.batches.append(list(values))
+            self.pos += 1
+            return torch.tensor([float(self.pos)])
 
     engine = object.__new__(Engine)
     engine.model = FakeModel()
@@ -352,8 +369,9 @@ def test_dsv4_long_incremental_range_uses_layer_first_batch(monkeypatch):
     logits = engine._dsv4_prefill_range(list(range(25)), 4, 25)
 
     assert logits.item() == 25.0
-    assert engine.model.batches == [list(range(4, 25))]
-    assert engine.model.pool.phases == ["prefill", "release", "decode"]
+    assert engine.model.batches == [[value] for value in range(4, 25)]
+    assert engine.model.pool.phases == []
+    assert engine.model._last_prefill_scheduler == "incremental-exact-decode"
 
 
 def test_dsv4_short_incremental_range_uses_fused_decode_without_repartition(
@@ -383,7 +401,7 @@ def test_dsv4_short_incremental_range_uses_fused_decode_without_repartition(
             raise AssertionError("short continuation entered grouped Prefill")
 
         def forward(self, values):
-            assert self._canonical_short_decode is True
+            assert len(values) == 1
             self.batches.append(list(values))
             self.pos += len(values)
             return torch.tensor([float(self.pos)])
@@ -395,9 +413,8 @@ def test_dsv4_short_incremental_range_uses_fused_decode_without_repartition(
     logits = engine._dsv4_prefill_range(list(range(8)), 3, 8)
 
     assert logits.item() == 8.0
-    assert engine.model.batches == [[3, 4, 5, 6, 7]]
+    assert engine.model.batches == [[3], [4], [5], [6], [7]]
     assert engine.model.pool.phases == []
-    assert engine.model._canonical_short_decode is False
 
 
 def test_dsv4_single_token_suffix_uses_fused_decode(monkeypatch):
@@ -425,7 +442,7 @@ def test_dsv4_single_token_suffix_uses_fused_decode(monkeypatch):
             raise AssertionError("one-token continuation entered grouped Prefill")
 
         def forward(self, values):
-            assert self._canonical_short_decode is True
+            assert len(values) == 1
             self.batches.append(list(values))
             self.pos += len(values)
             return torch.tensor([float(self.pos)])
@@ -440,7 +457,6 @@ def test_dsv4_single_token_suffix_uses_fused_decode(monkeypatch):
     assert logits.item() == 5.0
     assert engine.model.batches == [[14]]
     assert engine.model.pool.phases == []
-    assert engine.model._canonical_short_decode is False
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows execution policy")
@@ -470,7 +486,7 @@ def test_dsv4_windows_short_suffix_keeps_verified_fused_decode(monkeypatch):
             self.batches = []
 
         def forward(self, values):
-            assert self._canonical_short_decode is True
+            assert len(values) == 1
             self.batches.append(list(values))
             self.pos += len(values)
             return torch.tensor([float(self.pos)])
@@ -486,7 +502,7 @@ def test_dsv4_windows_short_suffix_keeps_verified_fused_decode(monkeypatch):
     logits = engine._dsv4_prefill_range(list(range(8)), 3, 8)
 
     assert logits.item() == 8.0
-    assert engine.model.batches == [[3, 4, 5, 6, 7]]
+    assert engine.model.batches == [[3], [4], [5], [6], [7]]
     assert engine.model.pool.phases == []
 
 
@@ -542,12 +558,13 @@ def test_dsv4_nonfinite_incremental_logits_fail_without_hidden_rebuild():
     assert engine.model.pool.phases == []
 
 
-def test_dsv4_canonical_short_decode_bypasses_static_graph_packets():
-    block_source = inspect.getsource(DSV4CCCPModel._block)
-    attention_source = inspect.getsource(DSV4CCCPModel._attn_batch)
+def test_dsv4_canonical_suffix_has_no_batched_or_eager_special_route():
+    source = inspect.getsource(Engine._dsv4_prefill_range)
 
-    assert "and not canonical_short_decode" in block_source
-    assert '_canonical_short_decode", False' in attention_source
+    assert "forward_incremental_batch" not in source
+    assert "CCCP_DSV4_SHORT_PREFILL_DECODE_TOKENS" not in source
+    assert "_canonical_short_decode" not in source
+    assert "[ids[position]]" in source
 
 
 def test_cuda_route_kernels_keep_masked_experts_out_on_nonfinite_scores():
@@ -661,6 +678,52 @@ def test_dsv4_canonical_commit_removes_private_replay_from_next_turn():
     assert engine.last_kv_stats.processed_tokens == 2
 
 
+def test_dsv4_canonical_commit_reuses_exact_live_state_without_replay():
+    class FakeSnapshot:
+        def __init__(self, pos):
+            self.pos = pos
+            self.nbytes = pos * 8
+
+    class FakeModel:
+        def __init__(self):
+            self.pos = 5
+            self.device = torch.device("cpu")
+            self.restored = []
+
+        def restore_kv(self, snapshot):
+            self.restored.append(snapshot.pos)
+            self.pos = snapshot.pos
+
+        def snapshot_kv(self):
+            return FakeSnapshot(self.pos)
+
+    engine = object.__new__(Engine)
+    engine.arch = "dsv4"
+    engine.model = FakeModel()
+    engine.quiet = True
+    engine._cache_ids = [10, 11, 20, 21, 22]
+    engine._kv_baseline = SimpleNamespace(
+        ids=[10, 11],
+        snapshot=FakeSnapshot(2),
+    )
+    ranges = []
+
+    def advance(ids, start, stop, **_kwargs):
+        ranges.append((start, stop, list(ids[start:stop])))
+        engine.model.pos = stop
+        return torch.tensor([float(stop)])
+
+    engine._dsv4_prefill_range = advance
+    canonical = list(engine._cache_ids)
+
+    engine.commit_canonical_history(canonical)
+
+    assert engine.model.restored == []
+    assert ranges == []
+    assert engine._kv_baseline.ids == canonical
+    assert engine._kv_baseline.snapshot.pos == len(canonical)
+
+
 def test_dsv4_full_batch_workspace_estimate_scales_to_4096():
     assert _dsv4_prefill_workspace_reserve_gb(512) == pytest.approx(1.09375)
     assert _dsv4_prefill_workspace_reserve_gb(4096) == pytest.approx(8.75)
@@ -710,11 +773,19 @@ def test_prefill_cleanup_runs_before_decode_arena_restore():
     reset_source = inspect.getsource(Engine._prefill_from_reset_to_boundary)
     range_source = inspect.getsource(Engine._dsv4_prefill_range)
 
-    for source in (reset_source, range_source):
-        assert "release_host_rows_workspace" in source
-        assert source.index("release_workspace()") < source.index(
-            "activate_decode()"
-        )
+    assert "begin_prefill_block(pool)" in reset_source
+    assert "end_prefill_block(pool)" in reset_source
+    # end_prefill_block 先释放块级工作区,再恢复 Decode 场地(见 prefill.py)。
+    helper = inspect.getsource(
+        __import__("cccp.prefill", fromlist=["end_prefill_block"]).end_prefill_block
+    )
+    assert helper.index("release_host_rows_workspace") < helper.index(
+        "activate_decode_arena"
+    )
+    # Exact suffix Decode keeps the live Decode arena and must not repartition
+    # it as though the existing recurrent KV were a fresh Prefill batch.
+    assert "activate_prefill_arena" not in range_source
+    assert "activate_decode_arena" not in range_source
 
 
 def test_windows_defaults_to_registered_source_direct_dma(monkeypatch):
@@ -1000,7 +1071,14 @@ def test_windows_auto_h2d_uses_compiled_layer_batch(monkeypatch):
     monkeypatch.setattr(store, "_ROCM", False)
     assert store._should_batch_h2d(1) is False
     assert store._should_batch_h2d(2) is True
-    assert store._should_batch_h2d(128) is True
+    # Windows 自动模式把批量提交限制在小组内;大批组经 Python 回退,
+    # 避开 100+ 份十 MiB 级拷贝一次提交时记录在案的越界窗口。
+    assert store._should_batch_h2d(8) is True
+    assert store._should_batch_h2d(9) is False
+    assert store._should_batch_h2d(128) is False
+    monkeypatch.setenv("CCCP_H2D_BATCH_MAX_COPIES", "64")
+    assert store._should_batch_h2d(32) is True
+    assert store._should_batch_h2d(128) is False
 
 
 def test_windows_compiled_h2d_batch_avoids_native_cuda_batch_api():
@@ -1095,7 +1173,7 @@ def test_kimi_ram_dense_cuda_prefill_uses_layer_major_rows():
     )
     assert "self._kda_dynamic_hybrid_rows(" in kda_source
     assert "self._mla_dynamic_hybrid_rows(" in mla_source
-    assert "release_host_rows_workspace" in block_source
+    assert "end_prefill_block(self.pool, restore_decode=False)" in block_source
 
 
 def test_kimi_full_resident_payload_precedes_runtime_graph_capture():
@@ -1294,6 +1372,37 @@ def test_dsv4_long_cuda_requires_flashmla_and_indexer_alignment():
     )
     assert "禁止退回 BF16 Indexer" in attention_source
     assert "sparse_selected" not in attention_source
+
+    allocation_source = inspect.getsource(DSV4CCCPModel._allocate_states)
+    assert "sparse_splitkv_unavailable_reason" in allocation_source
+    assert "if not sparse_splitkv:" in allocation_source
+    assert "raise RuntimeError" not in allocation_source.split(
+        "if not sparse_splitkv:", 1
+    )[1].split("if sparse_splitkv:", 1)[0]
+
+    graph_source = inspect.getsource(
+        DSV4CCCPModel._prepare_tp1_token_graphs
+    )
+    assert "direct_token_limit = min(int(self.max_ctx), 2051)" in graph_source
+    assert "and sparse_splitkv_available" in graph_source
+
+    decode_source = inspect.getsource(DSV4CCCPModel._decode_tp1_token_graph)
+    assert 'if bucket == "topk512"' in decode_source
+    assert "当前上下文已进入 sparse SplitKV 区间" in decode_source
+    assert "禁止退回 sparse=bf16-exact" in decode_source
+
+
+
+
+def test_native8_grouped_backend_matches_vendor_capability():
+    assert _native8_grouped_backend((7, 5)) is None
+    assert _native8_grouped_backend((8, 6)) is None
+    assert _native8_grouped_backend((8, 9)) is None
+    assert _native8_grouped_backend((9, 0)) == "torch-scaled-grouped-mm"
+    assert _native8_grouped_backend((10, 0)) == "torch-scaled-grouped-mm"
+    assert _native8_grouped_backend((12, 0)) is None
+
+
 
 
 def test_hip_full_resident_selects_tp1_before_pool_construction():
@@ -2515,8 +2624,8 @@ def test_dsv4_switches_long_prefill_and_decode_arena_phases():
     assert "phase=prefill-switch" in prefill
     assert "self.resize_gpu_arenas" in prefill
     assert "phase=decode-switch" in decode
-    assert "activate_prefill()" in engine_prefill
-    assert "activate_decode()" in engine_prefill
+    assert "begin_prefill_block(pool)" in engine_prefill
+    assert "end_prefill_block(pool)" in engine_prefill
 
 
 def test_dsv4_prefetch_startup_message_matches_effective_policy():

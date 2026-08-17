@@ -83,6 +83,14 @@ def main() -> None:
         root / "toolchain",
     ]
     missing = [str(path) for path in required if not path.exists()]
+    gpu_root = root / "engine/CCCP-Engine/cccp/native/gpu/cuda"
+    for architecture in ("sm75", "sm86", "sm89", "sm90", "sm120"):
+        candidates = list((gpu_root / architecture).glob("*.pyd"))
+        if len(candidates) != 1:
+            missing.append(
+                f"{gpu_root / architecture} (expected one packaged operator, "
+                f"found {len(candidates)})"
+            )
     if missing:
         raise SystemExit("missing release files:\n" + "\n".join(missing))
     if any((root / name).exists() for name in ("launcher", "webui", "tests", "scripts", "packaging", "build", "dist")):

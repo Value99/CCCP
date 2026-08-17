@@ -204,7 +204,7 @@ function fullModelCard(model) {
   const el = document.createElement("div");
   el.className = "card full-model-card" + (selected ? " selected" : "");
   el.innerHTML = `
-    <div class="badges"><span class="badge model">${dense ? "Dense VQ" : "无配置模式"}</span><span class="badge trained">${dense ? "完整权重" : "全部专家可路由"}</span></div>
+    ${dense ? "" : '<div class="badges"><span class="badge model">无配置模式</span><span class="badge trained">全部专家可路由</span></div>'}
     <h3>${dense ? "完整 Dense 模型" : "全量专家加载"}</h3>
     <div class="desc">${dense ? "模型没有动态专家，直接按 cccp.json 加载全部 Dense VQ 投影；无需训练或专家配置。" : "不应用专家配置或路由白名单；先尝试完整常驻，容量不足时保留全部专家并自动降级到 LRU 与磁盘映射。"}</div>
     <div class="stats">${dense ? `<span><b>${fmtGB(Number(model.dense_gb || 0))}</b> GiB Dense VQ 权重</span><span><b>${Number(model.layers || 0)}</b> 层</span>` : `<span><b>${count}</b> 专家</span><span><b>${fmtGB(Number(model.expert_gb || 0))}</b> GiB 专家权重</span>`}</div>
