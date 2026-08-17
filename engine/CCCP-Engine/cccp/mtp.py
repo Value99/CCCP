@@ -181,9 +181,14 @@ class MTPHead:
 
         位置 j 的 MTP 输入 = (h_main[j], embed(ids[j+1]))，预测 ids[j+2]。
         """
+        from .prefill import end_prefill_block
+
         T = len(ids)
         x = self._combine(h_main[: T - 1], ids[1:])
         h78 = self._layer78(x, 1)  # MTP 输入在 RoPE 位置 1..T-1（与 token 对齐）
+        # 本块 run_rows 在共享主池上保留的专家展开工作区不能带进解码阶段。
+        # 主池的 arena 相位由 engine 管理，这里只释放工作区。
+        end_prefill_block(self.m.pool, restore_decode=False)
         return h78[-1:]
 
     def step(self, h78_prev: torch.Tensor, tok_id: int, pos: int) -> tuple[torch.Tensor, torch.Tensor]:

@@ -31,6 +31,7 @@ from .kimi_ops import (
 )
 from .precision import compute_dtype
 from .prefill import (
+    end_prefill_block,
     prefill_block_size_with_legacy,
     run_prefill_blocks,
 )
@@ -6128,11 +6129,9 @@ class KimiK3CCCPModel:
             config.rms_eps,
             self.w(f"{_ROOT}.model.norm.weight"),
         )
-        release_prefill = getattr(
-            self.pool, "release_host_rows_workspace", None
-        )
-        if callable(release_prefill):
-            release_prefill()
+        # 块级收尾：释放 run_rows 在本块保留的专家展开工作区（Kimi 的
+        # arena 相位由 engine/自身调度管理，这里不触发 decode 重建）。
+        end_prefill_block(self.pool, restore_decode=False)
         self.pos += tokens
         self.last_layer_profile = []
         self.last_cuda_profile = {}
@@ -7521,6 +7520,9 @@ class KimiK3CCCPModel:
             evaluate_block,
             block_size=block,
         )
+        # 块级收尾：释放 run_rows 在本块保留的专家展开工作区（TP 各 rank 的
+        # arena 相位由池自身管理，这里不触发 decode 重建）。
+        end_prefill_block(self.pool, restore_decode=False)
         self.last_prefill_stats["moe_rows"] = (
             int(getattr(self.pool, "prefill_batch_rows", 0))
             - pool_before[0]

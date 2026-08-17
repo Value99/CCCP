@@ -1663,6 +1663,7 @@ class DSV4CCCPModel:
         hot_dtype = compute_dtype(device)
         sparse_splitkv = False
         sparse_features: tuple[str, ...] = ()
+        sparse_unavailable_reason: str | None = None
         requires_sparse_splitkv = _requires_flashmla_splitkv(
             device_type=device.type,
             hip_runtime=torch.version.hip is not None,
@@ -1679,12 +1680,16 @@ class DSV4CCCPModel:
 
             sparse_splitkv, unavailable_reason = flashmla_available(device)
             if not sparse_splitkv:
-                raise RuntimeError(
-                    "DSV4 长上下文 CUDA 必须使用 FlashMLA sparse SplitKV，"
-                    "但后端不可用；禁止退回 sparse=bf16-exact："
-                    f"{unavailable_reason or 'unknown reason'}"
+                # ``max_ctx`` is the logical, dynamically growing KV limit.
+                # It must not prevent an Ada/older GPU from starting while
+                # the live context is still inside the exact direct bucket.
+                # Keep the reason and fail only if execution actually reaches
+                # the sparse-only bucket; no BF16 fallback is introduced.
+                sparse_unavailable_reason = (
+                    unavailable_reason or "unknown reason"
                 )
-            sparse_features = cuda_architecture_features(device)
+            else:
+                sparse_features = cuda_architecture_features(device)
         if sparse_splitkv:
             from .flashmla_sparse import FlashMLASparseRunner
             from .ops.paged_sparse import (
@@ -1702,6 +1707,9 @@ class DSV4CCCPModel:
                 ),
                 "win_pos": torch.full(
                     (B, win), -1, dtype=torch.long, device=device
+                ),
+                "sparse_splitkv_unavailable_reason": (
+                    sparse_unavailable_reason
                 ),
             }
             if sparse_splitkv:
@@ -5487,7 +5495,12 @@ class DSV4CCCPModel:
             ratio = int(context["ratio"])
             if not ratio:
                 continue
-            max_item = (self.max_ctx + ratio - 1) // ratio - 1
+            # Graphs below the sparse boundary only reference the largest
+            # exact direct bucket.  Reserving to the model's logical max_ctx
+            # defeats dynamic KV and can eagerly allocate a million-token
+            # cache.  Pages beyond this point are created on demand.
+            direct_token_limit = min(int(self.max_ctx), 2051)
+            max_item = (direct_token_limit + ratio - 1) // ratio - 1
             state["compressed"].reserve(max_item)
             state["compressed"].device_page_ptrs()
             indexer = state.get("indexer")
@@ -5549,7 +5562,15 @@ class DSV4CCCPModel:
             ("direct128", 128, False),
             ("direct512", 512, False),
         ]
-        if (self.max_ctx + 3) // 4 > int(self.cfg["index_topk"]):
+        sparse_splitkv_available = any(
+            "sparse_runner" in context["state"]
+            for context in self._tp_attention_contexts[0]
+            if int(context["ratio"]) == 4
+        )
+        if (
+            (self.max_ctx + 3) // 4 > int(self.cfg["index_topk"])
+            and sparse_splitkv_available
+        ):
             bucket_specs.append(("topk512", 512, True))
         if hip_runtime:
             # Windows HIP previously captured all four 43-layer variants on
@@ -6113,6 +6134,26 @@ class DSV4CCCPModel:
             position,
             hip_runtime=torch.version.hip is not None,
         )
+        if bucket == "topk512" and bucket not in self._tp1_token_graphs:
+            assert self._tp_attention_contexts is not None
+            reason = next(
+                (
+                    context["state"].get(
+                        "sparse_splitkv_unavailable_reason"
+                    )
+                    for context in self._tp_attention_contexts[0]
+                    if int(context["ratio"]) == 4
+                    and context["state"].get(
+                        "sparse_splitkv_unavailable_reason"
+                    )
+                ),
+                "FlashMLA sparse SplitKV backend unavailable",
+            )
+            raise RuntimeError(
+                "DSV4 当前上下文已进入 sparse SplitKV 区间，"
+                "但本机 CUDA 后端不支持；禁止退回 sparse=bf16-exact："
+                f"{reason}"
+            )
         graph = self._tp1_token_graphs.get(bucket)
         if graph is None:
             return None

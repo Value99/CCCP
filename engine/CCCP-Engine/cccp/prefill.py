@@ -28,6 +28,37 @@ def batched_packed_prefill_available(pool, full_gpu: bool) -> bool:
     )
 
 
+def begin_prefill_block(pool) -> bool:
+    """Switch a packed pool into its batched-Prefill arena when supported.
+
+    Returns whether the pool exposes the phase API, so the caller can pair
+    the call with :func:`end_prefill_block` in a ``finally`` regardless of
+    the pool implementation behind it.
+    """
+    activate = getattr(pool, "activate_prefill_arena", None)
+    if callable(activate):
+        activate()
+        return True
+    return False
+
+
+def end_prefill_block(pool, *, restore_decode: bool = True) -> None:
+    """Release the block-scoped Prefill workspace and restore the Decode arena.
+
+    ``run_rows`` retains its expert-expansion scratch for the whole block;
+    every block driver (engine schedulers, Kimi/MTP prefill) must close the
+    block through this helper so the scratch cannot leak into Decode.  Pools
+    without the phase API are a no-op.
+    """
+    release = getattr(pool, "release_host_rows_workspace", None)
+    if callable(release):
+        release()
+    if restore_decode:
+        activate = getattr(pool, "activate_decode_arena", None)
+        if callable(activate):
+            activate()
+
+
 def prefill_block_size(
     *,
     env_name: str = "CCCP_PREFILL_BLOCK_TOKENS",
@@ -100,6 +131,8 @@ def prefill_moe_batch_size(
 
 __all__ = [
     "batched_packed_prefill_available",
+    "begin_prefill_block",
+    "end_prefill_block",
     "prefill_block_size",
     "prefill_block_size_with_legacy",
     "prefill_ranges",

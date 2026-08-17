@@ -365,6 +365,79 @@ def test_per_expert_projection_manifest_enables_generic_packed_pool(
     assert parsed.expert_audit_files == {3: "experts.L03.audit.json"}
 
 
+def test_per_projection_manifest_derives_legacy_vq_summary(
+    tmp_path: Path,
+) -> None:
+    """New GLM manifests need not repeat vq_projections in quant.vq."""
+    manifest = {
+        "format": "cccp-1",
+        "config": {"n_experts": 2},
+        "dense_file": "dense.safetensors",
+        "expert_files": {"3": "experts.L03.safetensors"},
+        "quant": {
+            "method": "per-expert-per-projection-vq",
+            "vq_projections": {
+                "gud4k32768_dnd4k8192": {
+                    "gu": [4, 32768],
+                    "down": [4, 8192],
+                }
+            },
+            "layer_kinds": {"3": "gud4k32768_dnd4k8192"},
+            "projection_layouts": {
+                "d4-k32768": {
+                    "dim": 4,
+                    "codebook_size": 32768,
+                    "bits": 3.75,
+                },
+                "d4-k8192": {
+                    "dim": 4,
+                    "codebook_size": 8192,
+                    "bits": 3.25,
+                },
+            },
+            "layer_projection_layouts": {
+                "3": {"gu": "d4-k32768", "dn": "d4-k8192"}
+            },
+        },
+    }
+    (tmp_path / "cccp.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    parsed = Manifest(str(tmp_path))
+
+    assert parsed.combined_projection_vq is True
+    assert parsed.projection_vq is False
+    assert parsed.packed_expert_vq is True
+    assert parsed.vq_dims == {"gud4k32768_dnd4k8192": (4, 32768)}
+
+
+def test_per_projection_manifest_rejects_incompatible_dimensions(
+    tmp_path: Path,
+) -> None:
+    manifest = {
+        "format": "cccp-1",
+        "config": {"n_experts": 2},
+        "dense_file": "dense.safetensors",
+        "expert_files": {"3": "experts.L03.safetensors"},
+        "quant": {
+            "method": "per-expert-per-projection-vq",
+            "vq_projections": {
+                "broken": {"gu": [4, 256], "down": [8, 256]}
+            },
+            "layer_kinds": {"3": "broken"},
+            "projection_layouts": {
+                "d4-k256": {"dim": 4, "codebook_size": 256}
+            },
+            "layer_projection_layouts": {
+                "3": {"gu": "d4-k256", "dn": "d4-k256"}
+            },
+        },
+    }
+    (tmp_path / "cccp.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="incompatible with dim=4"):
+        Manifest(str(tmp_path))
+
+
 def test_glm_prefill_uses_public_packed_rows_and_records_routes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

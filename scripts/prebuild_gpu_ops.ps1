@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory=$true)]
     [ValidateSet("cuda", "amd")]
     [string]$Backend,
-    [string]$Architecture = ""
+    [string]$Architecture = "",
+    [switch]$InstallPackaged
 )
 
 $ErrorActionPreference = "Stop"
@@ -34,3 +35,7 @@ if ($Backend -eq "cuda") {
 if (-not (Test-Path -LiteralPath $python)) { throw "缺少 $Backend 环境：$python" }
 & $python -c "from cccp import fusedext; raise SystemExit(0 if fusedext.prebuild() else 1)"
 if ($LASTEXITCODE) { throw "$Backend 融合算子预编译失败" }
+if ($InstallPackaged) {
+    & $python -c "from cccp import fusedext; print('packaged GPU operator', fusedext.install_prebuilt())"
+    if ($LASTEXITCODE) { throw "$Backend 融合算子写入发行树失败" }
+}

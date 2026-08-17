@@ -98,11 +98,8 @@ def _operator_cache_identity(
     return module_name, build_directory, backend, arch
 
 
-def _load_cached_extension(module_name: str, build_directory: Path, suffix: str):
-    """Load a completed local extension without invoking Ninja or a compiler."""
-    binary = build_directory / f"{module_name}{suffix}"
-    if not binary.is_file():
-        return None
+def _load_extension_binary(module_name: str, binary: Path):
+    """Load one exact Python extension binary without invoking a compiler."""
     spec = importlib.util.spec_from_file_location(module_name, binary)
     if spec is None or spec.loader is None:
         raise ImportError(f"无法读取算子缓存：{binary}")
@@ -114,6 +111,48 @@ def _load_cached_extension(module_name: str, build_directory: Path, suffix: str)
         sys.modules.pop(module_name, None)
         raise
     return module
+
+
+def _load_cached_extension(module_name: str, build_directory: Path, suffix: str):
+    """Load a completed local extension without invoking Ninja or a compiler."""
+    binary = build_directory / f"{module_name}{suffix}"
+    if not binary.is_file():
+        return None
+    return _load_extension_binary(module_name, binary)
+
+
+def _packaged_gpu_operator_root() -> Path:
+    """Return the inference package's architecture-specific GPU binaries."""
+    return Path(__file__).resolve().parent / "native" / "gpu"
+
+
+def _packaged_extension_path(
+    module_name: str,
+    backend: str,
+    arch: str,
+    suffix: str,
+) -> Path:
+    return (
+        _packaged_gpu_operator_root()
+        / _safe_cache_component(backend)
+        / _safe_cache_component(arch)
+        / f"{module_name}{suffix}"
+    )
+
+
+def _load_packaged_extension(
+    module_name: str,
+    backend: str,
+    arch: str,
+    suffix: str,
+):
+    """Load an ABI/source/architecture-exact binary shipped in the package."""
+    binary = _packaged_extension_path(
+        module_name, backend, arch, suffix
+    )
+    if not binary.is_file():
+        return None
+    return _load_extension_binary(module_name, binary)
 
 
 def _validate_cuda_toolchain_arch(capability: tuple[int, int]) -> None:
@@ -258,10 +297,7 @@ def _launcher_root() -> Path:
 
 
 def _bundled_windows_tool(name: str) -> str | None:
-    """查找系统或随包 MSVC 工具，不要求用户安装 Visual Studio。"""
-    located = shutil.which(name)
-    if located and os.path.isfile(located):
-        return located
+    """Prefer the release's MSVC tool and consult the system only as fallback."""
     vc_tools = (
         _launcher_root() / "toolchain" / "portable" / "Contents" /
         "VC" / "Tools" / "MSVC"
@@ -278,6 +314,9 @@ def _bundled_windows_tool(name: str) -> str | None:
         candidate = version / "bin" / "Hostx64" / "x64" / name
         if candidate.is_file():
             return str(candidate)
+    located = shutil.which(name)
+    if located and os.path.isfile(located):
+        return located
     return None
 
 
@@ -570,9 +609,29 @@ def _build(verbose: bool = False):
         if os.name == "nt":
             try:
                 from .cpuext import _configure_bundled_windows_toolchain
-                _configure_bundled_windows_toolchain()
-            except (ImportError, OSError):
-                pass
+                configured = _configure_bundled_windows_toolchain(force=True)
+            except (ImportError, OSError) as exc:
+                raise RuntimeError(
+                    "离线包内置 MSVC/Windows SDK 初始化失败"
+                ) from exc
+            if not configured:
+                raise RuntimeError(
+                    "离线包内置 MSVC/Windows SDK 不完整；拒绝使用本机 Visual Studio"
+                )
+            host_compiler = _bundled_windows_tool("cl.exe")
+            toolchain_root = (
+                _launcher_root() / "toolchain" / "portable"
+            ).resolve()
+            if (
+                not host_compiler
+                or not Path(host_compiler).resolve().is_relative_to(toolchain_root)
+            ):
+                raise RuntimeError(
+                    "CUDA Host 编译器未指向离线包 toolchain；拒绝使用本机 MSVC"
+                )
+            os.environ["CC"] = host_compiler
+            os.environ["CXX"] = host_compiler
+            os.environ["CUDAHOSTCXX"] = host_compiler
         _ensure_ninja_on_path()
         # Windows 下新版 setuptools 的 distutils shim 不自动挂
         # _msvccompiler 子模块，而 torch._run_ninja_build 以属性方式访问它；
@@ -609,6 +668,29 @@ def _build(verbose: bool = False):
         )
         build_directory.mkdir(parents=True, exist_ok=True)
         if not force_rebuild:
+            try:
+                _EXT = _load_packaged_extension(
+                    module_name,
+                    cache_backend,
+                    cache_arch,
+                    cpp_extension.LIB_EXT,
+                )
+            except Exception as packaged_error:
+                _EXT = None
+                print(
+                    f"[cccp-op-cache] invalid-bundled backend={cache_backend} "
+                    f"arch={cache_arch} key={build_directory.name} "
+                    f"error={type(packaged_error).__name__}: {packaged_error}",
+                    flush=True,
+                )
+            if _EXT is not None:
+                print(
+                    f"[cccp-op-cache] bundled backend={cache_backend} "
+                    f"arch={cache_arch} key={build_directory.name}",
+                    flush=True,
+                )
+                _ERR = None
+                return _EXT
             try:
                 _EXT = _load_cached_extension(
                     module_name, build_directory, cpp_extension.LIB_EXT
@@ -655,7 +737,11 @@ def _build(verbose: bool = False):
         # toolsets that have not yet been added to nvcc's version table.
         # It is not used for HIP/ROCm.
         if os.name == "nt" and torch.version.hip is None:
+            host_compiler = _bundled_windows_tool("cl.exe")
+            if not host_compiler:
+                raise RuntimeError("离线包缺少 CUDA Host 编译器 cl.exe")
             extra_cuda_cflags.extend([
+                "-ccbin", str(Path(host_compiler).parent),
                 "--allow-unsupported-compiler",
                 # CUDA 13 parses C++20's ``module`` token noisily inside
                 # PyTorch headers and reports a few intentionally unused
@@ -720,6 +806,31 @@ def prebuild() -> bool:
     print("[fusedext] 融合 kernel " + ("编译成功并已缓存" if ok else
           f"不可用（{_ERR}），将使用 torch 批量路径"))
     return ok
+
+
+def install_prebuilt() -> Path:
+    """Copy the active exact operator into the distributable native tree."""
+    extension = _build(verbose=True)
+    if extension is None:
+        raise RuntimeError(f"GPU operator is unavailable: {_ERR}")
+    src = Path(__file__).resolve().parent / "csrc" / "vq_gemv.cu"
+    capability = None
+    rocm_arch = os.environ.get("PYTORCH_ROCM_ARCH", "").strip()
+    if torch.version.hip is None:
+        capability = _select_cuda_architecture()
+    module_name, _build_directory, backend, arch = _operator_cache_identity(
+        src, capability, rocm_arch
+    )
+    from torch.utils import cpp_extension
+
+    destination = _packaged_extension_path(
+        module_name, backend, arch, cpp_extension.LIB_EXT
+    )
+    source_binary = Path(extension.__file__).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if source_binary != destination.resolve():
+        shutil.copy2(source_binary, destination)
+    return destination
 
 
 _build()

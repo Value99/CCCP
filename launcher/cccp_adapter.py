@@ -115,7 +115,7 @@ class LaunchConfig:
     dense_residency: str = "auto"
     extreme: bool = False
     cpu_compile: str = "auto"
-    max_ctx: int = 512
+    max_ctx: int = 0  # 0=模型声明上限；KV 按实际请求动态扩展
     cpu_threads: int = 0
     memory_limit_gb: float = 32.0
     extra_args: list[str] = field(default_factory=list)
@@ -677,8 +677,19 @@ class CCCPEngineAdapter:
         )
         if has_dynamic_experts and cache_gb < 0.25:
             errors.append("专家缓存至少为 0.25 GiB")
-        if not 64 <= int(cfg.max_ctx) <= max(64, model.max_context or 32768):
+        if cfg.max_ctx and not 64 <= int(cfg.max_ctx) <= max(
+            64, model.max_context or 32768
+        ):
             errors.append("max_ctx 超出模型或启动器允许范围")
+        planning_context = (
+            int(cfg.max_ctx)
+            if cfg.max_ctx
+            # Admission only needs the small startup working set.  This value
+            # is deliberately not forwarded to the engine and therefore is
+            # not a context ceiling: KV grows with the real request up to the
+            # limit declared by the model manifest.
+            else min(512, max(64, int(model.max_context or 512)))
+        )
         total_ram, available_ram = _memory_status()
         # 配置预算与运行内存是两个不同概念。配置预算先包含 Dense+共享专家，
         # 余量才装入动态专家；运行估算则由固定权重、专家执行缓存、上下文和
@@ -687,7 +698,7 @@ class CCCPEngineAdapter:
         is_gpu = cfg.device in {"cuda", "amd"}
         gpu_plan = estimate_gpu_vram_plan(
             model,
-            max_ctx=cfg.max_ctx,
+            max_ctx=planning_context,
             expert_cache_gb=cache_gb,
         )
         dense_runtime = (
@@ -764,8 +775,8 @@ class CCCPEngineAdapter:
                     else "缩小专家显存块也无法释放 Dense/工作区；"
                 )
                 message = (
-                    f"当前可用显存约 {available_vram:.2f} GiB，低于该模型在 "
-                    f"{cfg.max_ctx} token 上下文下的 CUDA 最低工作集 "
+                    f"当前可用显存约 {available_vram:.2f} GiB，低于该模型的 "
+                    f"动态上下文初始 CUDA 工作集 "
                     f"{minimum_vram_gb:.2f} GiB（尚差约 {shortfall:.2f} GiB）。"
                     f"{capacity_explanation}请关闭占用显存的程序，"
                     "或改用 CPU 推理"
@@ -1047,9 +1058,12 @@ class CCCPEngineAdapter:
             "--device", "cuda" if cfg.device == "amd" else cfg.device,
             "--dense-residency", cfg.dense_residency,
             "--cpu-compile", cfg.cpu_compile,
-            "--max-ctx", str(cfg.max_ctx),
             "--metrics-jsonl", str(CHAT_METRICS_FILE),
         ]
+        if cfg.max_ctx:
+            # Only an explicit diagnostic/reproduction override becomes a
+            # command-line ceiling. Normal GUI launches stay dynamic.
+            cmd += ["--max-ctx", str(cfg.max_ctx)]
         cache_gb = cfg.cache_gb if cfg.cache_gb is not None else self.settings.expert_cache_gb
         if (
             cache_gb is not None

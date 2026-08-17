@@ -106,6 +106,35 @@ def test_gpu_operator_cache_identity_changes_for_arch_or_source(tmp_path, monkey
     assert sm86[:2] != changed_source[:2]
 
 
+def test_packaged_gpu_operator_uses_exact_backend_arch_and_identity(
+    tmp_path, monkeypatch
+):
+    module_name = "cccp_vq_gpu_v15_cuda_sm89_exact"
+    binary = (
+        tmp_path / "cuda" / "sm89" / f"{module_name}.pyd"
+    )
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"MZ")
+    loaded = object()
+    seen = []
+    monkeypatch.setattr(
+        fusedext, "_packaged_gpu_operator_root", lambda: tmp_path
+    )
+    monkeypatch.setattr(
+        fusedext,
+        "_load_extension_binary",
+        lambda name, path: seen.append((name, path)) or loaded,
+    )
+
+    assert fusedext._load_packaged_extension(
+        module_name, "cuda", "sm89", ".pyd"
+    ) is loaded
+    assert seen == [(module_name, binary)]
+    assert fusedext._load_packaged_extension(
+        module_name, "cuda", "sm86", ".pyd"
+    ) is None
+
+
 def test_bundled_windows_librarian_is_found_without_system_visual_studio(tmp_path, monkeypatch):
     librarian = (
         tmp_path / "toolchain" / "portable" / "Contents" / "VC" / "Tools" /
@@ -117,6 +146,22 @@ def test_bundled_windows_librarian_is_found_without_system_visual_studio(tmp_pat
     monkeypatch.setattr(fusedext.shutil, "which", lambda _name: None)
 
     assert fusedext._bundled_windows_tool("lib.exe") == str(librarian)
+
+
+def test_bundled_windows_tool_wins_over_system_visual_studio(tmp_path, monkeypatch):
+    bundled = (
+        tmp_path / "toolchain" / "portable" / "Contents" / "VC" / "Tools" /
+        "MSVC" / "14.44.35207" / "bin" / "Hostx64" / "x64" / "cl.exe"
+    )
+    system = tmp_path / "system-visual-studio" / "cl.exe"
+    bundled.parent.mkdir(parents=True)
+    system.parent.mkdir(parents=True)
+    bundled.write_bytes(b"bundled")
+    system.write_bytes(b"system")
+    monkeypatch.setenv("CCCP_LAUNCHER_ROOT", str(tmp_path))
+    monkeypatch.setattr(fusedext.shutil, "which", lambda _name: str(system))
+
+    assert fusedext._bundled_windows_tool("cl.exe") == str(bundled)
 
 
 def test_cublas_dll_discovery_accepts_pip_wheel_layout(tmp_path):

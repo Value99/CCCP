@@ -131,9 +131,31 @@ def main() -> None:
             "-Version", version, "-Force",
         )
         if args.command == "full-release":
+            assets_dir = ROOT / "release-assets" / f"v{version}"
+            public_repo = Path(args.git_repo).resolve()
+            run([
+                str(PYTHON), str(ROOT / "scripts" / "sync_public_release.py"),
+                "--version", version,
+                "--assets", str(assets_dir),
+                "--public-repo", str(public_repo),
+                "--workspace", str(ROOT),
+            ])
+            run(["git", "-C", str(public_repo), "add", "--all"])
+            staged = subprocess.run(
+                ["git", "-C", str(public_repo), "diff", "--cached", "--quiet"],
+                cwd=ROOT,
+            )
+            if staged.returncode == 1:
+                run([
+                    "git", "-C", str(public_repo), "commit", "-m",
+                    f"release: publish CCCP Launcher {version}",
+                ])
+            elif staged.returncode != 0:
+                raise subprocess.CalledProcessError(staged.returncode, staged.args)
+            run(["git", "-C", str(public_repo), "push", "origin", "main"])
             powershell(
                 "publish_github_release.ps1",
-                "-AssetsDirectory", str(ROOT / "release-assets" / f"v{version}"),
+                "-AssetsDirectory", str(assets_dir),
                 "-Version", version,
                 "-Repository", args.repo,
                 "-GitRepository", args.git_repo,

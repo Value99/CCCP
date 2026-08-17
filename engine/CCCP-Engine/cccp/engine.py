@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import torch
 
 from .model import GLMModel
+from .prefill import begin_prefill_block, end_prefill_block
 from .speculative import (
     DraftAcceptancePolicy,
     provider_attachment_available,
@@ -1621,17 +1622,16 @@ class Engine:
         *,
         manage_arena: bool = True,
     ) -> torch.Tensor:
-        """Advance canonical DSV4 KV without replaying long suffixes tokenwise.
+        """Append only a new suffix with the normal exact Decode executor.
 
-        A thinking response is committed without its private reasoning.  The
-        public answer therefore has to be appended to the pre-thinking KV
-        branch once.  Replaying tens of tokens through all layers as Decode
-        made the next turn appear to start from zero.  The model's committed
-        layer-first continuation has been checked against sequential Decode
-        and a full Prefill on H20.  Every non-empty tail uses that batched
-        operator; Prefill must never re-enter the one-token Decode executor
-        while its arena is being repartitioned.
+        Existing DSV4 KV is an ordered recurrent state.  It must not be fed
+        back through the layer-first full-Prefill executor, and canonical
+        replay must use the same Attention/MoE Graph path as ordinary token
+        generation.  Full prompts remain batched in
+        :meth:`_prefill_from_reset_to_boundary`; this method processes only
+        the suffix missing from an already reusable KV snapshot.
         """
+        del manage_arena
         if not 0 < start < stop <= len(ids):
             raise ValueError(
                 f"invalid DSV4 prefill range "
@@ -1642,128 +1642,35 @@ class Engine:
             raise RuntimeError(
                 f"DSV4 live position {model.pos} != range start {start}"
             )
-        count = stop - start
-        pool = getattr(model, "pool", None)
-        try:
-            short_decode_limit = max(
-                0,
-                int(os.environ.get(
-                    "CCCP_DSV4_SHORT_PREFILL_DECODE_TOKENS",
-                    "16",
-                )),
+        logits = None
+        for position in range(start, stop):
+            logits = self._with_kv_capacity_retry(
+                model.forward,
+                [ids[position]],
             )
-        except (TypeError, ValueError):
-            short_decode_limit = 16
-        decode_arena_live = (
-            getattr(pool, "_arena_phase", "decode") == "decode"
-        )
-        if (
-            count <= short_decode_limit
-            and decode_arena_live
-        ):
-            # A very short continuation is cheaper through the already-hot
-            # fused Decode graph than through grouped-Prefill setup and an
-            # arena repartition.  This is not the retired reference GEMV
-            # fallback: model.decode still requires the compiled packed MoE
-            # executor, and the existing KV advances exactly once per token.
-            # The canonical KV branch may have just been restored or rolled
-            # back.  Per-layer CUDA graphs capture fixed decode buffers and
-            # are ideal for ordinary generation, but replaying them while a
-            # short canonical suffix is being reconstructed can consume stale
-            # graph state on some Windows/CUDA combinations.  Keep the fused
-            # CUDA operators and hot expert arena, but execute this tiny suffix
-            # without the captured attention/FFN graphs.
-            previous_short_decode = bool(
-                getattr(model, "_canonical_short_decode", False)
-            )
-            model._canonical_short_decode = True
-            try:
-                logits = self._with_kv_capacity_retry(
-                    model.forward,
-                    ids[start:stop],
-                )
-            finally:
-                model._canonical_short_decode = previous_short_decode
-            if model.pos != stop:
+            if model.pos != position + 1:
                 raise RuntimeError(
-                    f"DSV4 fused short continuation position {model.pos} "
-                    f"!= committed position {stop}"
+                    f"DSV4 live position {model.pos} "
+                    f"!= committed position {position + 1}"
                 )
-            if not getattr(self, "quiet", False):
-                print(
-                    "[KV] scheduler=incremental-fused-decode "
-                    f"tokens={count} threshold={short_decode_limit}",
-                    flush=True,
+            finite = torch.isfinite(logits)
+            if not bool(finite.all().item()):
+                finite_count = int(finite.sum().item())
+                raise RuntimeError(
+                    "DSV4 exact suffix Decode produced non-finite logits: "
+                    f"finite={finite_count}/{finite.numel()}, "
+                    f"token={position - start + 1}/{stop - start}, "
+                    f"position={position}"
                 )
-            model._last_prefill_scheduler = "incremental-fused-decode"
-            return logits
-        incremental_batch = getattr(
-            model,
-            "forward_incremental_batch",
-            None,
-        )
-        if callable(incremental_batch):
-            from .prefill import prefill_block_size
-
-            activate_prefill = getattr(
-                pool,
-                "activate_prefill_arena",
-                None,
+        assert logits is not None
+        model._last_prefill_scheduler = "incremental-exact-decode"
+        if not getattr(self, "quiet", False):
+            print(
+                "[KV] scheduler=incremental-exact-decode "
+                f"tokens={stop - start}",
+                flush=True,
             )
-            activate_decode = getattr(
-                pool,
-                "activate_decode_arena",
-                None,
-            )
-            # Prefill reuses the live Decode/LRU arena across requests.  The
-            # packed row operator sizes its temporary expert chunks from the
-            # actual free VRAM, so it can split a wide layer without deleting
-            # the hot experts retained by the previous turn.
-            if manage_arena and callable(activate_prefill):
-                activate_prefill()
-            logits = None
-            try:
-                block = max(1, int(prefill_block_size()))
-                position = start
-                while position < stop:
-                    boundary = min(stop, position + block)
-                    logits = self._with_kv_capacity_retry(
-                        incremental_batch,
-                        ids[position:boundary],
-                    )
-                    if model.pos != boundary:
-                        raise RuntimeError(
-                            f"DSV4 batched live position {model.pos} "
-                            f"!= committed position {boundary}"
-                        )
-                    position = boundary
-            finally:
-                release_workspace = getattr(
-                    pool,
-                    "release_host_rows_workspace",
-                    None,
-                )
-                if manage_arena and callable(release_workspace):
-                    release_workspace()
-                # Always assert/restore Decode readiness.  This is intentionally
-                # called even when the compact arena was not selected so a
-                # previous failed Prefill cannot leak an unready pool forward.
-                if manage_arena and callable(activate_decode):
-                    activate_decode()
-            assert logits is not None
-            if not getattr(self, "quiet", False):
-                print(
-                    "[KV] scheduler=incremental-layer-first "
-                    f"tokens={count} block={min(count, block)}",
-                    flush=True,
-                )
-            model._last_prefill_scheduler = "incremental-layer-first"
-            return logits
-
-        raise RuntimeError(
-            "DSV4 model is missing the required layer-first incremental "
-            "Prefill operator"
-        )
+        return logits
 
     def _save_dsv4_baseline(
         self,
@@ -1787,10 +1694,10 @@ class Engine:
 
         Thinking mode intentionally removes private reasoning from subsequent
         requests.  The generated live token stream therefore differs from the
-        adapter's committed history.  Keeping only the old pre-thinking
-        snapshot made every later turn replay the whole public answer one token
-        at a time.  Build the canonical branch once at commit and save it as
-        the new baseline instead.
+        adapter's committed history.  When token IDs and model position already
+        match, the live KV is the exact next-token state and must be reused
+        directly.  Only a genuinely different public history is rebuilt from
+        the request's stable snapshot.
         """
         if getattr(self, "arch", "glm") != "dsv4":
             return
@@ -1802,14 +1709,22 @@ class Engine:
         started = time.perf_counter()
         live = list(getattr(self, "_cache_ids", None) or ())
         live_pos = int(getattr(self.model, "pos", 0))
+        logits = None
         mode = "live"
         if live == canonical and live_pos <= len(canonical):
             if live_pos < len(canonical):
-                self._dsv4_prefill_range(canonical, live_pos, len(canonical))
+                logits = self._dsv4_prefill_range(
+                    canonical,
+                    live_pos,
+                    len(canonical),
+                )
                 mode = "live-tail"
         else:
             baseline = getattr(self, "_kv_baseline", None)
-            lcp = _token_lcp(canonical, getattr(baseline, "ids", None))
+            lcp = _token_lcp(
+                canonical,
+                getattr(baseline, "ids", None),
+            )
             if (
                 baseline is not None
                 and lcp == len(baseline.ids)
@@ -1818,18 +1733,27 @@ class Engine:
                 and len(baseline.ids) < len(canonical)
             ):
                 self.model.restore_kv(baseline.snapshot)
-                self._dsv4_prefill_range(
+                logits = self._dsv4_prefill_range(
                     canonical,
                     len(baseline.ids),
                     len(canonical),
                 )
                 mode = "canonical-branch"
             else:
-                self._prefill_from_reset_to_boundary(
+                logits = self._prefill_from_reset_to_boundary(
                     canonical,
                     len(canonical),
                 )
                 mode = "canonical-rebuild"
+
+        if logits is not None:
+            finite = torch.isfinite(logits)
+            if not bool(finite.all().item()):
+                finite_count = int(finite.sum().item())
+                raise RuntimeError(
+                    "canonical DSV4 replay produced non-finite logits: "
+                    f"finite={finite_count}/{finite.numel()}, mode={mode}"
+                )
 
         if int(getattr(self.model, "pos", 0)) != len(canonical):
             raise RuntimeError(
@@ -1859,10 +1783,8 @@ class Engine:
         """Build canonical DSV4 state independently of request boundaries."""
         self.reset()
         pool = getattr(self.model, "pool", None)
-        activate_prefill = getattr(pool, "activate_prefill_arena", None)
-        activate_decode = getattr(pool, "activate_decode_arena", None)
-        if manage_arena and callable(activate_prefill):
-            activate_prefill()
+        if manage_arena:
+            begin_prefill_block(pool)
         # A reset prompt is canonical batch prefill, not incremental replay.
         # The old one-token seed followed by ``_dsv4_prefill_range`` forced
         # every remaining prompt token through a complete 43-layer decode and
@@ -1898,15 +1820,8 @@ class Engine:
             # layouts.  Restore the large heat/previous-route arena only after
             # the expanded BF16 expert scratch has been released.  A failed
             # Prefill also restores it so the next request starts cleanly.
-            release_workspace = getattr(
-                pool,
-                "release_host_rows_workspace",
-                None,
-            )
-            if manage_arena and callable(release_workspace):
-                release_workspace()
-            if manage_arena and callable(activate_decode):
-                activate_decode()
+            if manage_arena:
+                end_prefill_block(pool)
         if self.model.pos != baseline_len:
             raise RuntimeError(
                 f"DSV4 batched prefill position {self.model.pos} "
@@ -2173,13 +2088,6 @@ class Engine:
             return logits, snapshot_bytes
 
         pool = getattr(self.model, "pool", None)
-        activate_prefill = getattr(pool, "activate_prefill_arena", None)
-        activate_decode = getattr(pool, "activate_decode_arena", None)
-        release_workspace = getattr(
-            pool,
-            "release_host_rows_workspace",
-            None,
-        )
         try:
             short_decode_limit = max(
                 0,
@@ -2203,16 +2111,13 @@ class Engine:
             )
         arena_active = False
         try:
-            if batch_arena_required and callable(activate_prefill):
-                activate_prefill()
-                arena_active = True
+            if batch_arena_required:
+                arena_active = begin_prefill_block(pool)
             with _PrefillProgressMonitor(self, len(ids)):
                 logits, snapshot_bytes = prepare_selected()
         finally:
-            if arena_active and callable(release_workspace):
-                release_workspace()
-            if arena_active and callable(activate_decode):
-                activate_decode()
+            if arena_active:
+                end_prefill_block(pool)
 
         stats = KVPrefillStats(
             mode=mode,

@@ -32,15 +32,14 @@ from fastapi.staticfiles import StaticFiles
 
 from . import __version__
 from .chat import ChatProxy
-from .accelerators import detect_optional_accelerators, probe_backend
+from .accelerators import detect_optional_accelerators
 from .profiles import ProfileError, ProfileRegistry
 from .resources import user_profile_dir, webui_static
 from .settings import load_settings, Settings
 from .state import AppState
 from .cccp_adapter import (
     LaunchConfig, CCCPEngineAdapter, CCCPEngineError, _memory_status,
-    discover_models, estimate_gpu_vram_plan, full_model_combination,
-    inspect_model,
+    discover_models, full_model_combination, inspect_model,
 )
 from .downloads import DownloadEngine, fetch_index, fetch_profile_text
 from .logbuf import attach_ring_log, tail_lines
@@ -191,68 +190,6 @@ def detect_hardware(settings: Settings | None = None) -> dict:
             "ram_available_gb": round(available_gb, 2),
             "disk_free_gb": round(disk.free / 2**30, 2),
             **optional}
-
-
-def _automatic_context(model_path: str, cache_gb: float, device: str,
-                       settings: Settings) -> int:
-    """按模型上限和当前设备剩余容量选择保守上下文，不接受前端覆盖。"""
-    model = inspect_model(model_path) if model_path else None
-    model_limit = max(64, (model.max_context if model else 0) or 32768)
-    total_ram, available_ram = _memory_status()
-    capacity = available_ram or total_ram
-    if device in {"cuda", "amd"}:
-        runtime = probe_backend(settings, device, settings.cccp_engine_path)
-        capacity = float(
-            runtime.get("device_available_memory_gb")
-            or runtime.get("device_memory_gb")
-            or capacity
-        )
-        if model is not None and capacity > 0:
-            smallest = estimate_gpu_vram_plan(
-                model,
-                max_ctx=max(64, min(512, model_limit)),
-                expert_cache_gb=cache_gb,
-            )
-            if (
-                smallest.get("architecture") == "kimi_k3"
-                and capacity < float(smallest["recommended_vram_gb"])
-            ):
-                # RAM-Dense Kimi is functional on consumer cards, but long
-                # contexts amplify host projections and PCIe expert traffic.
-                return max(64, min(512, model_limit))
-            candidates = tuple(
-                value for value in (4096, 2048, 1024, 512)
-                if value <= model_limit
-            ) or (max(64, model_limit),)
-            for candidate in candidates:
-                plan = estimate_gpu_vram_plan(
-                    model,
-                    max_ctx=candidate,
-                    expert_cache_gb=cache_gb,
-                )
-                if capacity >= float(plan["minimum_vram_gb"]):
-                    return candidate
-            # 512 is the smallest normal GUI context.  Preflight will provide
-            # the precise hard-working-set message if even this cannot fit.
-            return max(64, min(512, model_limit))
-    fixed = float(model.dense_gb if model else 0.0)
-    # ``cache_gb`` is the compact expert RAM budget.  Subtracting it from
-    # VRAM made every GPU launch choose 512 tokens whenever the selected
-    # profile was larger than the card.  The engine independently sizes its
-    # bounded VRAM hot cache after reserving Dense, context and full-batch
-    # Prefill scratch, so GPU context admission must not count host RAM twice.
-    expert_residency = 0.0 if device in {"cuda", "amd"} else float(cache_gb)
-    device_reserve = 2.5 if device in {"cuda", "amd"} else 0.75
-    remaining = capacity - fixed - expert_residency - device_reserve
-    if remaining >= 6:
-        selected = 4096
-    elif remaining >= 3:
-        selected = 2048
-    elif remaining >= 1:
-        selected = 1024
-    else:
-        selected = 512
-    return max(64, min(selected, model_limit))
 
 
 def _training_terminal_progress(job: dict) -> dict:
@@ -788,7 +725,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             dense_residency=str(body.get("dense_residency") or "auto"),
             cpu_compile=cpu_compile,
             extreme=bool(body.get("extreme", False)),
-            max_ctx=_automatic_context(model_path, automatic_cache, device, settings),
+            # 0 means model-declared logical limit with on-demand KV growth.
+            # The launcher must not turn current free memory into a permanent
+            # 512/1024/4096-token ceiling at process start.
+            max_ctx=0,
             cpu_threads=0,
             memory_limit_gb=0.0,
         )
