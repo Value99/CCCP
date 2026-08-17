@@ -40,8 +40,8 @@ def update_manifest(path: Path, version: str, executable: Path) -> None:
         "released_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "title": f"CCCP 启动器 {version}",
         "summary": (
-            "随包提供 SM75/86/89/90/120 CUDA 融合算子，修复缺少 quant.vq "
-            "的模型清单，并改为按模型声明动态扩展上下文。"
+            "修复消费级 NVIDIA 显卡 Prefill 期间三类 cudaErrorIllegalAddress，"
+            "并统一专家展开工作区的块级收尾。"
         ),
     })
     data["download"] = {
@@ -55,11 +55,12 @@ def update_manifest(path: Path, version: str, executable: Path) -> None:
         "sha256": sha256(executable).upper(),
     }
     data["release_notes"] = [
-        "SM75、SM86、SM89、SM90、SM120 的 ABI 精确 CUDA 融合算子随离线包提供；RTX 4090 不再现场调用 NVCC。",
-        "未知架构的 JIT 恢复路径只允许包内 MSVC/Windows SDK；拒绝混用系统 Visual Studio。",
-        "模型清单省略 quant.vq 时从 quant.vq_projections 严格推导并校验，不再触发 KeyError。",
-        "GUI 不再写死 512/1024/4096 token 上限；逻辑上限读取模型清单，KV 随请求增长。",
-        "完整自动化回归 324 passed、11 skipped。",
+        "Prefill 编译投影核按有符号 32 位偏移寻址：gate-up 平板超过 2^31 字节时分片专家数被硬性钳制，消除越界写入与静默显存损坏。",
+        "Prefill 工作区整块保留复用，不再逐层 synchronize/empty_cache/重分配；该循环曾在 WDDM 消费级显卡上触发驱动错误。",
+        "Windows 批量 H2D 拷贝自动限制为每组不超过 8 份，避开百余份十 MiB 级拷贝一次提交的越界窗口；可用 CCCP_H2D_BATCH_MAX_COPIES 调整。",
+        "Kimi Prefill 与 MTP 的专家展开工作区改为统一块级收尾，不再泄漏进 Decode 阶段。",
+        "新增 data/runtime/debug_env.txt 诊断通道：无需终端即可给 serve 进程注入一次性环境变量。",
+        "完整自动化回归 326 passed、11 skipped。",
     ]
     path.write_text(
         json.dumps(data, ensure_ascii=False, indent=2) + "\n",
@@ -110,10 +111,9 @@ def main() -> None:
 
 ### {version} 重点更新
 
-- SM75 / SM86 / SM89 / SM90 / SM120 融合算子随包提供；RTX 4090 直接加载 SM89 算子，不再现场编译。
-- JIT 恢复路径硬绑定包内 MSVC/Windows SDK，不使用系统 Visual Studio。
-- 修复缺少 `quant.vq` 的模型清单加载，并移除 Dense 配置卡冗余标签。
-- GUI 不再写死上下文 token 上限；按模型声明上限动态扩展 KV。
+- 修复消费级 NVIDIA 显卡 Prefill 期间的 `cudaErrorIllegalAddress`：钳制 2 GiB 有符号偏移回绕、整块复用 Prefill 工作区、Windows 批量 H2D 拷贝限每组 ≤8 份。
+- Kimi Prefill 与 MTP 的专家展开工作区统一块级收尾，不再泄漏进 Decode 阶段。
+- 新增 `data/runtime/debug_env.txt` 诊断通道，GUI 下即可注入一次性环境变量。
 """
     en = f"""## ⬇️ Download the complete Windows offline package (v{version})
 
@@ -130,9 +130,9 @@ Run `{setup.name}`. It verifies, joins, extracts, and starts the launcher. Model
 
 ### Highlights in {version}
 
-- Prebuilt SM75/86/89/90/120 operators avoid local NVCC on common NVIDIA GPUs, including RTX 4090.
-- The JIT recovery path is locked to the bundled MSVC/Windows SDK and cannot use system Visual Studio.
-- Fixed manifests without `quant.vq`, removed redundant Dense-card labels, and enabled model-declared dynamic context growth.
+- Fixes consumer-NVIDIA `cudaErrorIllegalAddress` during Prefill: hard-caps the 2 GiB signed-offset wrap, reuses one block-scoped prefill workspace, and limits Windows batched H2D copies to 8 per group.
+- Kimi/MTP expert-expansion workspaces are released by one block-scoped helper and can no longer leak into Decode.
+- New `data/runtime/debug_env.txt` diagnostics channel for the GUI serve process.
 """
     ru = f"""## ⬇️ Полный автономный пакет для Windows (v{version})
 
@@ -149,9 +149,9 @@ Run `{setup.name}`. It verifies, joins, extracts, and starts the launcher. Model
 
 ### Главное в версии {version}
 
-- Готовые операторы SM75/86/89/90/120 исключают локальную компиляцию NVCC на распространённых GPU, включая RTX 4090.
-- Резервный JIT жёстко использует встроенные MSVC/Windows SDK и не обращается к системной Visual Studio.
-- Исправлены манифесты без `quant.vq`, лишние метки Dense и динамический контекст по лимиту модели.
+- Исправлены ошибки `cudaErrorIllegalAddress` во время Prefill на потребительских NVIDIA: ограничен обход 2 ГиБ смещения, рабочая область переиспользуется блоком, пакетные H2D-копии в Windows ограничены 8 на группу.
+- Рабочие области Kimi/MTP освобождаются единым блоковым помощником и не попадают в Decode.
+- Добавлен диагностический канал `data/runtime/debug_env.txt` для процесса serve.
 """
     replace_release_section(public / "README.md", zh, old_version, version)
     replace_release_section(public / "README_EN.md", en, old_version, version)
@@ -184,16 +184,16 @@ Run `{setup.name}`. It verifies, joins, extracts, and starts the launcher. Model
         text = html.read_text(encoding="utf-8")
         text = text.replace(f"0.9.4", version)
         zh_summary = (
-            f"{version} 内置 SM75/86/89/90/120 CUDA 融合算子，修复模型清单"
-            "兼容性，并按模型声明动态扩展上下文。"
+            f"{version} 修复消费级 NVIDIA 显卡 Prefill 期间的越界写入，"
+            "并统一专家展开工作区的块级收尾。"
         )
         en_summary = (
-            f"Version {version} bundles SM75/86/89/90/120 CUDA operators, "
-            "fixes manifest compatibility, and grows context to the model-declared limit."
+            f"Version {version} fixes out-of-bounds writes during Prefill on "
+            "consumer NVIDIA GPUs and unifies block-scoped expert workspace cleanup."
         )
         ru_summary = (
-            f"Версия {version} включает CUDA-операторы SM75/86/89/90/120, "
-            "исправляет манифесты и динамически расширяет контекст до лимита модели."
+            f"Версия {version} исправляет записи за границы памяти во время "
+            "Prefill на потребительских NVIDIA и унифицирует блочную очистку рабочих областей."
         )
         for old_summary in (
             f"{version} 修复双路 NUMA 服务器上的 CPU Q4 页归属与线程调度，并保留已验证的 GPU 推理路径。",
