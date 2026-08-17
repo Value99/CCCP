@@ -449,7 +449,7 @@ stream = client.chat.completions.create(
 
   <script>
     (() => {
-      const fallback = { version: "0.9.4", download: { url: "https://github.com/Value99/CCCP/releases/tag/v0.9.4", extraction_code: "" }, launcher: { sha256: "75CF6EB189F861BEBE2A529F0D35F34C68DBA0CC88791E65E1886D6FEE778E37" } };
+      const fallback = { version: "0.9.6", download: { url: "https://github.com/Value99/CCCP/releases/tag/v0.9.6", extraction_code: "" }, launcher: { sha256: "01A8068E2DEB93DF080BECB7D8D57BBD5D1D4A38DAEA4D9C6DA31CDB657655BE" } };
       let currentRelease = fallback;
       const i18n = {
         zh: {
@@ -465,8 +465,8 @@ stream = client.chat.completions.create(
       Object.assign(i18n.zh, {
         heroLead:"CCCP 推理框架与桌面启动器。MoE 模型可依据任务语料生成专家配置；Dense VQ 模型由清单自动识别并完整加载，均不改动模型权重。",
         frameworkLead:"CCCP 由模型清单驱动同一套多后端运行时：MoE 配置记录模型身份与专家编号并自动去重，Dense VQ 则直接加载完整模型，无需专家训练。",
-        screensLead:"首页聚焦模型、配置与一键启动；MoE 可扫描专家热力图，Dense 模型则直接完整加载。截图来自 0.9.4 本地运行版本。",
-        releaseSummary:"0.9.4 新增通用 Dense VQ 支持与 Qwen3.5 实模验证，同时保持 DeepSeek-V4、Kimi K3、GLM-5.2 回归通过。",
+        screensLead:"首页聚焦模型、配置与一键启动；MoE 可扫描专家热力图，Dense 模型则直接完整加载。截图来自 0.9.6 本地运行版本。",
+        releaseSummary:"0.9.6 修复消费级 NVIDIA 显卡 Prefill 期间的越界写入，并统一专家展开工作区的块级收尾。",
         metricSaving:"更节省 · 量化与专家探测，更省显存",
         metricSmart:"更智能 · 前置筛选，让专家各司其长",
         metricRapid:"更迅速 · 模型更小，海量优化加速",
@@ -481,8 +481,8 @@ stream = client.chat.completions.create(
       Object.assign(i18n.en, {
         heroLead:"A CCCP inference framework and desktop launcher. MoE models can build task profiles from corpora, while manifest-declared Dense VQ models load in full without modifying weights.",
         frameworkLead:"One manifest-driven multi-backend runtime serves both families: MoE profiles record model identity and expert IDs with deduplication, while Dense VQ models load directly and need no expert training.",
-        screensLead:"The home page centers model selection, profiles, and one-click launch. MoE models can scan expert heatmaps; Dense models load directly. Screenshots are from version 0.9.4.",
-        releaseSummary:"Version 0.9.4 adds generic Dense VQ support and real Qwen3.5 validation while preserving DeepSeek-V4, Kimi K3, and GLM-5.2 regressions.",
+        screensLead:"The home page centers model selection, profiles, and one-click launch. MoE models can scan expert heatmaps; Dense models load directly. Screenshots are from version 0.9.6.",
+        releaseSummary:"Version 0.9.6 fixes out-of-bounds writes during Prefill on consumer NVIDIA GPUs and unifies block-scoped expert workspace cleanup.",
         metricSaving:"More saving · quantization and expert detection reduce memory",
         metricSmart:"Smarter · pre-filtered experts play to their strengths",
         metricRapid:"Faster · a smaller model plus extensive optimization",
@@ -497,8 +497,8 @@ stream = client.chat.completions.create(
       Object.assign(i18n.ru, {
         heroLead:"CCCP — среда инференса и настольный запускатор. Для MoE создаются профили по корпусу, а Dense VQ определяется манифестом и загружается целиком без изменения весов.",
         frameworkLead:"Один многоплатформенный runtime управляется манифестом: профили MoE хранят идентификатор модели и экспертов, а Dense VQ загружается напрямую и не требует обучения экспертов.",
-        screensLead:"На главной странице находятся модель, профиль и запуск. Для MoE доступна тепловая карта экспертов, Dense загружается напрямую. Снимки версии 0.9.4.",
-        releaseSummary:"Версия 0.9.4 добавляет универсальную поддержку Dense VQ и реальную проверку Qwen3.5, сохраняя регрессии DeepSeek-V4, Kimi K3 и GLM-5.2.",
+        screensLead:"На главной странице находятся модель, профиль и запуск. Для MoE доступна тепловая карта экспертов, Dense загружается напрямую. Снимки версии 0.9.6.",
+        releaseSummary:"Версия 0.9.6 исправляет записи за границы памяти во время Prefill на потребительских NVIDIA и унифицирует блочную очистку рабочих областей.",
         metricSaving:"Экономнее · квантование и отбор экспертов снижают расход памяти",
         metricSmart:"Умнее · предварительный отбор раскрывает сильные стороны экспертов",
         metricRapid:"Быстрее · меньшая модель и масштабная оптимизация",
