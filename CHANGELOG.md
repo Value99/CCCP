@@ -2,6 +2,25 @@
 
 本项目遵循语义化版本；源码变更通过 Git 提交维护，离线发行目录以版本号命名。
 
+## [0.9.6] - 2026-08-18
+
+- 修复消费级 NVIDIA 显卡 Prefill 期间的 `cudaErrorIllegalAddress`。编译投影核按有符号 32 位偏移寻址 dense gate-up 输出：单个专家分片的 gate-up 平板超过 2^31 字节时偏移回绕并越界写入（hidden=4096、moe_inter=2048、BF16 下第 134/135 个专家处复现）；回绕写入可能落在仍映射的显存中造成静默损坏，因此分片专家数按 `(2^31-1)/gate_up_bytes` 硬性钳制，不作为调优默认值。
+- Prefill 块内逐层重建反量化工作区会在 WDDM 下强制 synchronize、empty_cache 与重新分配循环，拖垮 Prefill 并在消费级 GPU 上以驱动 `cudaErrorIllegalAddress` 暴露；工作区保留策略现在统一覆盖 GPU 常驻行（DSV4）与主机桥（Kimi/GLM）。
+- Windows 自动模式把批量 H2D 拷贝限制为每组不超过 8 份：分块 Prefill 曾一次提交 100+ 份十 MiB 级拷贝，两次记录在案的 `cudaErrorIllegalAddress` 均发生在该窗口，解码规模组（≤8 份）保持多轮干净记录；越界组仍经同一拷贝流的 Python 回退提交。`CCCP_H2D_BATCH_MAX_COPIES` 放宽上限，`CCCP_H2D_BATCH=1` 恢复旧行为。
+- 新增 `prefill.begin_prefill_block` / `end_prefill_block` 统一块级 Prefill 场地管理：进入批量 Prefill 场地、释放 `run_rows` 保留的专家展开工作区并恢复 Decode 场地。engine 调度器、Kimi Prefill 与 MTP 均改经此收尾（Kimi/MTP 以 `restore_decode=False` 只释放工作区、不触发解码场地重建），专家展开工作区不再泄漏进 Decode 阶段。
+- 新增 GUI 诊断通道：安装根 `data/runtime/debug_env.txt`（每行 `KEY=VALUE`，`#` 注释）在启动时注入 serve 进程环境，无需终端即可启用 `CUDA_LAUNCH_BLOCKING=1` 等一次性诊断；文件不存在或为空即正常模式，任何条目都可能拖慢推理或改变驱动行为。
+
+## [0.9.5] - 2026-08-17
+
+- NVIDIA CUDA 融合算子改为随离线包提供按架构和 ABI 精确匹配的预编译文件，覆盖 SM75、SM86、SM89、SM90 与 SM120。RTX 4090 的 SM89 路径直接加载 `cccp_vq_gpu_v15_cuda_sm89_920e8a2276c0098d.pyd`，不再因用户系统的 MSVC/NVCC 组合进入现场编译并报 `Host compiler targets unsupported OS`。
+- 模型清单允许省略冗余的 `quant.vq` 汇总；加载器会从 `quant.vq_projections` 严格推导 Gate/Up 主布局，同时校验 Down 投影维度与 `layer_kinds` 引用，避免 GLM 模型加载时触发 `KeyError: 'vq'`。
+- GUI 正常启动不再把当前内存估算写成 512/1024/4096 token 的永久 `--max-ctx` 上限；逻辑上限读取模型清单，KV 按实际请求增长。显存预检中的 512 token 仅用于估算初始工作集，不会传给推理进程。
+- 修复动态上下文误用模型逻辑上限做启动期能力检查，导致 RTX 4090（SM89）处理短提示也报 `FlashMLA sparse SplitKV unsupported`。SM89 现在可正常运行 direct32/128/512 精确上下文桶，KV 页按实际长度增长；只有实际进入 sparse-only 长上下文区间时才给出明确能力错误，仍不启用 BF16 慢速兜底。
+- 修复 SM89 错调 PyTorch 仅支持 SM90/SM100 的 grouped/rowwise FP8 接口。Ada 固定使用公共“整批 VQ 展开 → BF16 grouped GEMM”Prefill 和 packed 融合 Decode，不进入不稳定的 `_scaled_grouped_mm` / `_scaled_mm` 路线，也不退回逐 token/专家 GEMV；SM90/SM100 保持 FP8 grouped 路线。
+- 修复通用 DSV4 多轮 KV 提交顺序：回答 token 与模型位置完全匹配时直接沿用 0.9.2 已验证的 live KV，不重新 Prefill 或重放回答；仅在思考内容被隐藏、公开历史确实变化时，才从本轮稳定快照逐 token 走正常 Decode/Graph 重建 canonical 分支，禁止把已有 KV 重新送入层优先批量 Prefill。该规则不按 GPU 型号增加特殊分支。
+- 配置库 Dense 模型卡移除 `Dense VQ` 与 `完整权重` 两个冗余标签。
+- 离线封装新增预编译 CUDA 算子清单门禁；缺少任一常用架构时拒绝生成成品。完整自动化回归为 326 passed、11 skipped。
+
 ## [0.9.4] - 2026-08-17
 
 - 修复 Linux 双路 NUMA 服务器上 CPU Q4 执行映像复用 PyTorch 分配器旧内存页时，大量权重页仍停留在单一 NUMA 节点的问题。Q4 编译现在把连续行分片迁移到对应节点，迁移不可用时安全退回仅设置内存策略。
