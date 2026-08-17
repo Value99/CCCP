@@ -8,51 +8,31 @@
   <strong>简体中文</strong> · <a href="README_EN.md">English</a> · <a href="README_RU.md">Русский</a>
 </p>
 
-## ⬇️ 下载 Windows 完整离线版（v0.9.4）
+## ⬇️ 下载 Windows 完整离线版（v0.9.6）
 
 > [!IMPORTANT]
-> **第一次使用请下载完整离线包，不要只下载单独的 `CCCP-Launcher.exe`。** 发行包已内置 Python、Miniconda、CPU/CUDA/AMD 推理环境及算子编译工具，无需另外安装依赖。
+> **第一次使用请下载完整离线包，不要只下载单独的 `CCCP-Launcher.exe`。** 完整包已内置 Python、Miniconda、CPU/CUDA/AMD 推理环境、常见 NVIDIA 架构预编译算子及全部依赖。
 
-### [👉 GitHub Release 下载页（推荐）](https://github.com/Value99/CCCP/releases/tag/v0.9.4)
+### [👉 GitHub Release 下载页（推荐）](https://github.com/Value99/CCCP/releases/tag/v0.9.6)
 
 打开下载页后，将下面 **6 个文件**全部下载到同一个文件夹：
 
-1. `CCCP-Launcher-0.9.4-Offline-Setup.exe`
-2. `CCCP-Launcher-v0.9.4-offline.parts.json`
-3. `CCCP-Launcher-v0.9.4-win-x64-offline.zip.001`
-4. `CCCP-Launcher-v0.9.4-win-x64-offline.zip.002`
-5. `CCCP-Launcher-v0.9.4-win-x64-offline.zip.003`
-6. `CCCP-Launcher-v0.9.4-win-x64-offline.zip.004`
+1. `CCCP-Launcher-0.9.6-Offline-Setup.exe`
+2. `CCCP-Launcher-v0.9.6-offline.parts.json`
+3. `CCCP-Launcher-v0.9.6-win-x64-offline.zip.001`
+4. `CCCP-Launcher-v0.9.6-win-x64-offline.zip.002`
+5. `CCCP-Launcher-v0.9.6-win-x64-offline.zip.003`
+6. `CCCP-Launcher-v0.9.6-win-x64-offline.zip.004`
 
-然后双击 `CCCP-Launcher-0.9.4-Offline-Setup.exe`。安装器会自动校验、合并、解压并启动程序，全程显示进度。模型不包含在启动器发行包内，需要单独下载并放入解压目录的 `models` 文件夹。
+然后双击 `CCCP-Launcher-0.9.6-Offline-Setup.exe`。安装器会自动校验、合并、解压并启动。模型不包含在启动器发行包内，需要单独下载并放入解压目录的 `models` 文件夹。
 
-> Release 页面底部的 `Source code (zip/tar.gz)` 是 GitHub 自动生成的公开资料快照，只含公开文档、图片、版本元数据和独立更新 EXE，不包含启动器源码、推理引擎源码或 CCCP 量化/训练框架。普通用户请下载上面列出的离线安装器和 4 个分卷。
+> Release 页面底部的 `Source code (zip/tar.gz)` 是 GitHub 自动生成的公开资料快照，不包含启动器源码、推理引擎源码、模型或 CCCP 量化框架。普通用户请下载上面列出的离线安装器和分卷。
 
-### 0.9.4 重点更新
+### 0.9.6 重点更新
 
-- 修复 Linux 双路 NUMA 服务器上的 CPU Q4 内存页归属与自动线程规划；Qwen3.5 27B Dense VQ 的 64-token Decode 实测由约 7.05 提升到 9.77 token/s（约 +38.6%）。
-- 保留 0.9.3 已验证的清单驱动 Dense VQ 支持；Qwen3.5 27B Dense 可直接加载完整模型，界面不会误要求专家配置或专家训练。
-- NVIDIA Dense VQ 使用原生 FP8 分组投影、静态 KV、融合递归状态与 CUDA Graph；Qwen3.5 的 MTP 按架构配置默认启用 Top-3 验证，H20 单卡有效 Decode 93.21 token/s、完整请求 82.39 token/s。
-- Kimi 的 10/15 行组合投影统一进入 packed grouped 融合路径；DeepSeek-V4、Kimi K3、GLM-5.2 与 Qwen3.5 实模回归通过。
-- AMD 全显存路径增加真实性门禁，必须显示 `hip.tp1-token-graph` 与有效 Graph 提交；本版自动化回归为 324 passed、11 skipped。AMD 本轮未做真机性能复测。
-
-<p align="center">
-  <img src="assets/cccp-banner-centered-final.jpg" alt="C.C.C.P. 动态专家推理框架" width="100%">
-</p>
-
-<p align="center">
-  <strong>Collective Codebook Compression Pipeline</strong><br>
-  量化、任务专家探测与多后端推理的一体化大型 MoE 模型运行框架
-</p>
-
-<p align="center">
-  <img alt="Release" src="https://img.shields.io/badge/release-v0.9.4-a52f25">
-  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20x64-7a1e18">
-  <img alt="Python" src="https://img.shields.io/badge/Python-%E6%97%A0%E9%9C%80%E5%AE%89%E8%A3%85-c49543">
-  <img alt="Device" src="https://img.shields.io/badge/default-CPU-3a2118">
-</p>
-
-> C.C.C.P. 面向普通电脑运行大型 MoE 模型。框架完整保留模型专家与原始权重，并将量化、任务语料路由探测、专家常驻配置和优化算子串成一条运行链路，让有限内存优先服务当前任务真正需要的专家。
+- 修复消费级 NVIDIA 显卡 Prefill 期间的 `cudaErrorIllegalAddress`：钳制 2 GiB 有符号偏移回绕、整块复用 Prefill 工作区、Windows 批量 H2D 拷贝限每组 ≤8 份。
+- Kimi Prefill 与 MTP 的专家展开工作区统一块级收尾，不再泄漏进 Decode 阶段。
+- 新增 `data/runtime/debug_env.txt` 诊断通道，GUI 下即可注入一次性环境变量。
 
 ## 核心优势
 
@@ -146,8 +126,8 @@ CCCP 与模型资料：
 
 ## 快速开始
 
-1. 从上方 [GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.4) 下载全部 6 个离线安装文件。
-2. 双击 `CCCP-Launcher-0.9.4-Offline-Setup.exe`，等待校验、合并和解压完成；不要直接在分卷内运行。
+1. 从上方 [GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.6) 下载全部 6 个离线安装文件。
+2. 双击 `CCCP-Launcher-0.9.6-Offline-Setup.exe`，等待校验、合并和解压完成；不要直接在分卷内运行。
 3. 将带有 `cccp.json` 的兼容模型放入程序同级 `models` 目录。
 4. 双击 `CCCP-Launcher.exe`。
 5. 选择模型和专家配置；初次使用也可直接选择全量加载。
@@ -230,10 +210,10 @@ for chunk in stream:
 | --- | --- | --- |
 | Windows 11 x64 · Core i9-13900H · 31.59 GiB RAM | 启动器、EXE、CPU 推理、OpenAI API、配置扫描、118.47 GiB DeepSeek-V4 模型磁盘映射回归；完整自动化测试 `324 passed`、`11 skipped` | **CPU 端到端功能通过**；吞吐未达到原性能目标，GPU 路径见下方独立实测 |
 | Windows 11 · NVIDIA RTX 3090（20 GiB 进程限额）· CUDA 13 | DeepSeek-V4 受限显存 CUDA/RAM、直接锁页传输、严格 LRU、融合 Decode 与多轮生成 | **0.9.2 真机通过** |
-| Linux · NVIDIA H20 单卡 | Qwen3.5 27B Dense VQ 完整加载、有限值、MTP Top-3 与性能 | **0.9.3 真机通过：有效 Decode 93.21 token/s，完整请求 82.39 token/s；0.9.4 未改该路径** |
+| Linux · NVIDIA H20 单卡 | Qwen3.5 27B Dense VQ 完整加载、有限值、MTP Top-3 与性能 | **0.9.3 真机通过：有效 Decode 93.21 token/s，完整请求 82.39 token/s；0.9.6 未改该路径** |
 | NVIDIA RTX 5090 | DeepSeek-V4 和 GLM-5.2 的 CUDA/RAM 路径实机回归 | **引擎实测通过** |
 | NVIDIA H20-3e（单卡与多卡） | DeepSeek-V4 TP1/TP4、GLM-5.2 TP2、Kimi K3 GPU+RAM/TP8 | **引擎实测通过** |
-| 双路 CPU 服务器（96 物理核） | Qwen3.5 27B Dense VQ、Q4 NUMA 分片与 64-token Decode | **0.9.4 实测 9.77 token/s；较稳定基线约提升 38.6%，不承诺 30 token/s** |
+| 双路 CPU 服务器（96 物理核） | Qwen3.5 27B Dense VQ、Q4 NUMA 分片与 64-token Decode | **0.9.6 实测 9.77 token/s；较稳定基线约提升 38.6%，不承诺 30 token/s** |
 | Windows CUDA 13.0 / `sm_120` | 完整 NVCC 编译、链接和模块加载 | **编译链通过**；验证范围到模块加载 |
 | Windows ROCm 7.2.1 / `gfx1151` | 无 AMD GPU 构建机上的 HIPIFY、设备代码生成、链接和模块加载 | **编译链通过**，AMD 硬件端到端验证仍待补充 |
 | macOS | 运行环境与发布包处于路线图阶段 | **计划中** |
@@ -276,7 +256,7 @@ $release.launcher.sha256
 
 ## 链接
 
-- 下载：[GitHub Release v0.9.4](https://github.com/Value99/CCCP/releases/tag/v0.9.4)
+- 下载：[GitHub Release v0.9.6](https://github.com/Value99/CCCP/releases/tag/v0.9.6)
 - 社区：[Discord](https://discord.gg/eNnwmAUY4M)
 - 模型：[ModelScope · ValueFX](https://www.modelscope.cn/profile/ValueFX)
 - 项目主页：[GitHub · Value99/CCCP](https://github.com/Value99/CCCP)

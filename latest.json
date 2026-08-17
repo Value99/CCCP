@@ -1,13 +1,13 @@
 {
   "schema": "cccp-launcher-update-v1",
   "channel": "stable",
-  "version": "0.9.4",
-  "released_at": "2026-08-17T06:04:00+08:00",
-  "title": "CCCP 启动器 0.9.4",
-  "summary": "修复双路 NUMA 服务器上的 CPU Q4 页归属与线程调度，并保留 0.9.3 已验证的 Dense VQ、MTP 与 MoE 推理路径。",
+  "version": "0.9.6",
+  "released_at": "2026-08-18T04:57:13+08:00",
+  "title": "CCCP 启动器 0.9.6",
+  "summary": "修复消费级 NVIDIA 显卡 Prefill 期间三类 cudaErrorIllegalAddress，并统一专家展开工作区的块级收尾。",
   "download": {
     "provider": "GitHub Releases",
-    "url": "https://github.com/Value99/CCCP/releases/tag/v0.9.4",
+    "url": "https://github.com/Value99/CCCP/releases/tag/v0.9.6",
     "extraction_code": ""
   },
   "github": {
@@ -16,8 +16,8 @@
   },
   "launcher": {
     "filename": "CCCP-Launcher.exe",
-    "size_bytes": 40781747,
-    "sha256": "75CF6EB189F861BEBE2A529F0D35F34C68DBA0CC88791E65E1886D6FEE778E37"
+    "size_bytes": 40779682,
+    "sha256": "01A8068E2DEB93DF080BECB7D8D57BBD5D1D4A38DAEA4D9C6DA31CDB657655BE"
   },
   "runtime": {
     "python_required": false,
@@ -26,10 +26,11 @@
     "platform": "Windows x64"
   },
   "release_notes": [
-    "CPU Q4 执行映像会把两半行页迁移到对应 NUMA 节点；H20 双路 CPU 的 64-token Decode 实测约 9.77 token/s，较稳定基线约提升 38.6%。",
-    "Windows 预编译 CPU 算子升级为 v195；自动化回归 324 passed、11 skipped。",
-    "Qwen3.5 Dense VQ、MTP、DeepSeek-V4、Kimi K3 与 GLM-5.2 的已验证 GPU 路径保持不变；本补丁没有改动 NVIDIA CUDA 或 AMD HIP 推理结构。",
-    "CPU 实测结果不承诺 30 token/s；不同处理器、内存通道和 NUMA 拓扑会影响吞吐。",
-    "Windows CUDA 的 DeepSeek-V4 超过 2051 token 需要 FlashMLA；本离线包尚未内置时会明确提示，不会静默回退慢速路径。"
+    "Prefill 编译投影核按有符号 32 位偏移寻址：gate-up 平板超过 2^31 字节时分片专家数被硬性钳制，消除越界写入与静默显存损坏。",
+    "Prefill 工作区整块保留复用，不再逐层 synchronize/empty_cache/重分配；该循环曾在 WDDM 消费级显卡上触发驱动错误。",
+    "Windows 批量 H2D 拷贝自动限制为每组不超过 8 份，避开百余份十 MiB 级拷贝一次提交的越界窗口；可用 CCCP_H2D_BATCH_MAX_COPIES 调整。",
+    "Kimi Prefill 与 MTP 的专家展开工作区改为统一块级收尾，不再泄漏进 Decode 阶段。",
+    "新增 data/runtime/debug_env.txt 诊断通道：无需终端即可给 serve 进程注入一次性环境变量。",
+    "完整自动化回归 326 passed、11 skipped。"
   ]
 }

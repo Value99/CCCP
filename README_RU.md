@@ -8,39 +8,29 @@
   <a href="README.md">简体中文</a> · <a href="README_EN.md">English</a> · <strong>Русский</strong>
 </p>
 
-## ⬇️ Полный автономный пакет для Windows (v0.9.4)
+## ⬇️ Полный автономный пакет для Windows (v0.9.6)
 
-### [👉 Открыть страницу загрузки GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.4)
+> [!IMPORTANT]
+> Для первого запуска загрузите полный автономный пакет, а не только `CCCP-Launcher.exe`. Python, Miniconda, среды CPU/CUDA/AMD, готовые операторы NVIDIA и зависимости уже включены.
 
-Для первой установки загрузите в одну папку Offline Setup EXE, файл `.parts.json` и все четыре части `.zip.001`–`.zip.004`. Затем запустите `CCCP-Launcher-0.9.4-Offline-Setup.exe`: установщик проверит, объединит и распакует файлы, покажет прогресс и запустит приложение. Для первой установки недостаточно скачать только отдельный EXE запуска.
+### [👉 Открыть страницу загрузки GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.6)
 
-Автоматические ссылки `Source code (zip/tar.gz)` содержат только публичную документацию, изображения, метаданные версии и отдельный EXE обновления. Исходный код лаунчера, движка инференса и фреймворка квантования/обучения CCCP в них отсутствует.
+Сохраните эти **6 файлов** в одной папке:
 
-### Главное в версии 0.9.4
+1. `CCCP-Launcher-0.9.6-Offline-Setup.exe`
+2. `CCCP-Launcher-v0.9.6-offline.parts.json`
+3. `CCCP-Launcher-v0.9.6-win-x64-offline.zip.001`
+4. `CCCP-Launcher-v0.9.6-win-x64-offline.zip.002`
+5. `CCCP-Launcher-v0.9.6-win-x64-offline.zip.003`
+6. `CCCP-Launcher-v0.9.6-win-x64-offline.zip.004`
 
-- Исправлено размещение страниц CPU Q4 и автоматический выбор потоков на двухсокетных Linux NUMA-серверах. Реальный 64-токенный тест Qwen3.5 27B Dense VQ вырос примерно с 7,05 до 9,77 token/s (около +38,6%).
-- Сохранена проверенная в 0.9.3 универсальная поддержка Dense VQ по манифесту. Qwen3.5 27B Dense загружается целиком и не показывает настройки профилей или обучения экспертов.
-- Для NVIDIA Dense VQ используются нативные FP8 grouped-проекции, статический KV, слитое рекуррентное состояние и CUDA Graph. MTP с проверкой Top-3 включается по конфигурации архитектуры; реальный тест на одной H20 дал 93,21 эффективных token/s Decode и 82,39 token/s для полного запроса.
-- Проекции Kimi с метаданными 10/15 строк используют единый packed grouped executor; повторно проверены DeepSeek-V4, Kimi K3, GLM-5.2 и Qwen3.5.
-- AMD full-resident режим обязан показывать `hip.tp1-token-graph` и ненулевые Graph submissions. Автоматические тесты: 324 passed, 11 skipped; производительность AMD в этом цикле не перепроверялась на реальном GPU.
+Запустите `CCCP-Launcher-0.9.6-Offline-Setup.exe`. Установщик проверит, объединит и распакует пакет. Веса моделей распространяются отдельно.
 
-<p align="center">
-  <img src="assets/cccp-banner-centered-final.jpg" alt="C.C.C.P. — фреймворк динамических экспертов" width="100%">
-</p>
+### Главное в версии 0.9.6
 
-<p align="center">
-  <strong>Collective Codebook Compression Pipeline</strong><br>
-  Квантование, отбор экспертов по задаче и многоплатформенный инференс больших MoE-моделей
-</p>
-
-<p align="center">
-  <img alt="Версия" src="https://img.shields.io/badge/release-v0.9.4-a52f25">
-  <img alt="Платформа" src="https://img.shields.io/badge/platform-Windows%20x64-7a1e18">
-  <img alt="Python" src="https://img.shields.io/badge/Python-%D0%BD%D0%B5%20%D1%82%D1%80%D0%B5%D0%B1%D1%83%D0%B5%D1%82%D1%81%D1%8F-c49543">
-  <img alt="Устройство" src="https://img.shields.io/badge/default-CPU-3a2118">
-</p>
-
-> C.C.C.P. переносит большие MoE-модели на обычные компьютеры, сохраняя полный набор экспертов и исходные веса. Квантование, анализ маршрутов на корпусе задачи, профили резидентных экспертов и оптимизированные операторы образуют единый конвейер, направляющий доступную память на экспертов текущей задачи.
+- Исправлены ошибки `cudaErrorIllegalAddress` во время Prefill на потребительских NVIDIA: ограничен обход 2 ГиБ смещения, рабочая область переиспользуется блоком, пакетные H2D-копии в Windows ограничены 8 на группу.
+- Рабочие области Kimi/MTP освобождаются единым блоковым помощником и не попадают в Decode.
+- Добавлен диагностический канал `data/runtime/debug_env.txt` для процесса serve.
 
 ## Основные преимущества
 
@@ -134,7 +124,7 @@ CCCP использует настройку маршрутизации: кор�
 
 ## Быстрый старт
 
-1. Скачайте Offline Setup, манифест частей и все четыре части из [GitHub Release v0.9.4](https://github.com/Value99/CCCP/releases/tag/v0.9.4).
+1. Скачайте Offline Setup, манифест частей и все четыре части из [GitHub Release v0.9.6](https://github.com/Value99/CCCP/releases/tag/v0.9.6).
 2. Запустите Offline Setup из каталога с правом записи и дождитесь проверки и распаковки.
 3. Поместите совместимую модель с файлом `cccp.json` в каталог `models` рядом с приложением.
 4. Дважды щёлкните `CCCP-Launcher.exe`.
@@ -220,7 +210,7 @@ for chunk in stream:
 | Windows 11 · NVIDIA RTX 3090 (лимит процесса 20 GiB) · CUDA 13 | DeepSeek-V4 в режиме ограниченной VRAM CUDA/RAM, прямая передача из locked RAM, strict LRU, fused decode и многотуровая генерация | **Аппаратный тест 0.9.2 пройден** |
 | NVIDIA RTX 5090 | Реальные CUDA/RAM-тесты DeepSeek-V4 и GLM-5.2 | **Движок протестирован** |
 | NVIDIA H20-3e (одна и несколько GPU) | DeepSeek-V4 TP1/TP4, GLM-5.2 TP2, Kimi K3 GPU+RAM/TP8 | **Движок протестирован** |
-| Двухсокетный CPU-сервер (96 физических ядер) | Qwen3.5 27B Dense VQ, NUMA-разделение Q4 и 64-токенный Decode | **В 0.9.4 измерено 9,77 token/s, примерно +38,6% к стабильной базе; обещания 30 token/s нет** |
+| Двухсокетный CPU-сервер (96 физических ядер) | Qwen3.5 27B Dense VQ, NUMA-разделение Q4 и 64-токенный Decode | **В 0.9.6 измерено 9,77 token/s, примерно +38,6% к стабильной базе; обещания 30 token/s нет** |
 | Windows CUDA 13.0 / `sm_120` | Полная компиляция NVCC, линковка и загрузка модуля | **Цепочка сборки пройдена**; граница проверки — загрузка модуля |
 | Windows ROCm 7.2.1 / `gfx1151` | HIPIFY, генерация кода устройства, линковка и загрузка модуля | **Цепочка сборки пройдена**; аппаратная проверка AMD запланирована |
 | macOS | Runtime и пакет выпуска находятся в дорожной карте | **Запланировано** |
@@ -263,7 +253,7 @@ $release.launcher.sha256
 
 ## Ссылки
 
-- Скачать: [GitHub Release v0.9.4](https://github.com/Value99/CCCP/releases/tag/v0.9.4)
+- Скачать: [GitHub Release v0.9.6](https://github.com/Value99/CCCP/releases/tag/v0.9.6)
 - Сообщество: [Discord](https://discord.gg/eNnwmAUY4M)
 - Модели: [ModelScope · ValueFX](https://www.modelscope.cn/profile/ValueFX)
 - Страница проекта: [GitHub · Value99/CCCP](https://github.com/Value99/CCCP)
