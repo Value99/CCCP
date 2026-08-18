@@ -12760,6 +12760,195 @@ torch::Tensor int4_gemv_packed_f32_v4s(
     return output;
 }
 
+__device__ __forceinline__ uint32_t half2_bits_m(__half2 v)
+{
+    return *reinterpret_cast<uint32_t*>(&v);
+}
+__device__ __forceinline__ uint32_t h2_m(__half lo, __half hi)
+{
+    uint32_t v;
+    asm("mov.b32 %0, {%1, %2};" : "=r"(v) : "h"(__half_as_ushort(lo)),
+        "h"(__half_as_ushort(hi)));
+    return v;
+}
+__device__ __forceinline__ void mma_m16n8k16_m(
+    const uint32_t* a, const uint32_t* b, float* c0, float* c1)
+{
+    float c[4] = {*c0, 0.f, *c1, 0.f};
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+    *c0 = c[0];
+    *c1 = c[1];
+}
+__global__ void marlin_reduce_kernel_g(
+    const float* __restrict__ partial,
+    float* __restrict__ output,
+    int rows,
+    int slices)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    float acc = 0.f;
+    for (int s = 0; s < slices; ++s) acc += partial[(long)row * slices + s];
+    output[row] = acc;
+}
+
+// ---------------------------------------------------------------------------
+// Marlin-style repack + GEMV (all architectures, SM75+).
+// Repack: superstep tile = 8 rows x 32 cols; GEMV thread t (j=t/4,i=t%4)
+// needs input bytes {i, i+4, i+8, i+12} of row j -> one aligned uint32.
+// After repack a superstep is 32 consecutive uint32 (128 B): one fully
+// coalesced 4-byte load per lane, then registers-only dequant + mma.
+// ---------------------------------------------------------------------------
+__global__ void int4_repack_marlin_kernel(
+    const uint8_t* __restrict__ src,
+    uint8_t* __restrict__ dst,
+    const int rows,
+    const int cols)
+{
+    const long words_total = (long)rows * (cols / 32) * 32;
+    for (long w = blockIdx.x * (long)blockDim.x + threadIdx.x;
+         w < words_total;
+         w += (long)gridDim.x * blockDim.x) {
+        const int intra = (int)(w & 31);
+        const long tile = w >> 5;
+        const int tiles_k = cols / 32;
+        const int tile_k = (int)(tile % tiles_k);
+        const int tile_n = (int)(tile / tiles_k);
+        const int j = intra >> 2;
+        const int i = intra & 3;
+        const int row = tile_n * 8 + j;
+        uint32_t out = 0u;
+        if (row < rows) {
+            const uint8_t* srow = src + (long)row * (cols >> 1) + tile_k * 16;
+            out |= ((uint32_t)srow[i]) | ((uint32_t)srow[i + 4] << 8) |
+                   ((uint32_t)srow[i + 8] << 16) | ((uint32_t)srow[i + 12] << 24);
+        }
+        ((uint32_t*)dst)[w] = out;
+    }
+}
+
+torch::Tensor int4_repack_marlin(
+    torch::Tensor packed,
+    int64_t rows,
+    int64_t cols)
+{
+    TORCH_CHECK(cols % 32 == 0, "marlin repack requires cols%32==0");
+    auto dst = torch::empty_like(packed);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const long total = (long)rows * (cols / 32) * 32 / 4;
+    const int blocks = (int)((total + 255) / 256 > 4096 ? 4096 : (total + 255) / 256);
+    int4_repack_marlin_kernel<<<blocks, 256, 0, stream>>>(
+        packed.data_ptr<uint8_t>(),
+        dst.data_ptr<uint8_t>(),
+        (int)rows, (int)cols);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return dst;
+}
+
+constexpr int MARLIN_G_KSPLIT = 2048;
+
+__global__ void int4_gemv_marlin_kernel(
+    const __half* __restrict__ x,
+    const uint32_t* __restrict__ repacked,
+    const __half* __restrict__ scales,
+    float* __restrict__ partial,
+    const int rows,
+    const int cols,
+    const int groups,
+    const int slices)
+{
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row0 = (blockIdx.y * 4 + warp) * 8;
+    const int slice = blockIdx.x;
+    const int k0 = slice * MARLIN_G_KSPLIT;
+    const int k1 = min(cols, k0 + MARLIN_G_KSPLIT);
+    if (row0 >= rows) return;
+    const int j = lane >> 2;
+    const int i = lane & 3;
+    const int tiles_k = cols / 32;
+    const int row = row0 + j;
+    const __half* srow = scales + (long)row * groups;
+    float c0 = 0.f, c1 = 0.f;
+    for (int k = k0; k < k1; k += 32) {
+        const uint32_t word = __ldg(repacked +
+            (((long)(row0 >> 3) * tiles_k + (k >> 5)) << 5) + lane);
+        const float sc = __half2float(__ldg(srow + ((k + 2 * i) >> 6)));
+        const uint32_t bw0 = (word      ) & 0xFF;
+        const uint32_t bw1 = (word >>  8) & 0xFF;
+        const uint32_t bw2 = (word >> 16) & 0xFF;
+        const uint32_t bw3 = (word >> 24) & 0xFF;
+        uint32_t a0[4] = {0u, 0u, 0u, 0u}, a1[4] = {0u, 0u, 0u, 0u};
+        if (lane < 4) {
+            const int ak = 2 * lane;
+            a0[0] = half2_bits_m(__halves2half2(x[k + ak], x[k + ak + 1]));
+            a0[2] = half2_bits_m(__halves2half2(x[k + ak + 8], x[k + ak + 9]));
+            a1[0] = half2_bits_m(__halves2half2(x[k + 16 + ak], x[k + 16 + ak + 1]));
+            a1[2] = half2_bits_m(__halves2half2(x[k + 16 + ak + 8], x[k + 16 + ak + 9]));
+        }
+        const uint32_t xs[2][2] = {{bw0, bw1}, {bw2, bw3}};
+#pragma unroll
+        for (int hs = 0; hs < 2; ++hs) {
+            const float l0 = static_cast<float>(
+                static_cast<int>(xs[hs][0] & 15) - 8) * sc;
+            const float h0 = static_cast<float>(
+                static_cast<int>(xs[hs][0] >> 4) - 8) * sc;
+            const float l1 = static_cast<float>(
+                static_cast<int>(xs[hs][1] & 15) - 8) * sc;
+            const float h1 = static_cast<float>(
+                static_cast<int>(xs[hs][1] >> 4) - 8) * sc;
+            uint32_t bfrag[2] = {
+                h2_m(__float2half_rn(l0), __float2half_rn(h0)),
+                h2_m(__float2half_rn(l1), __float2half_rn(h1)),
+            };
+            mma_m16n8k16_m(hs == 0 ? a0 : a1, bfrag, &c0, &c1);
+        }
+    }
+    if (row < rows) {
+        partial[(long)row * slices + slice] = c0 + c1;
+    }
+}
+
+torch::Tensor int4_gemv_marlin(
+    torch::Tensor x,
+    torch::Tensor repacked,
+    torch::Tensor scales,
+    int64_t rows,
+    int64_t cols,
+    int64_t groups)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int slices = (int)((cols + MARLIN_G_KSPLIT - 1) / MARLIN_G_KSPLIT);
+    static torch::Tensor partial_cache;
+    const long needed = (long)rows * slices;
+    if (!partial_cache.defined() || partial_cache.numel() < needed ||
+        partial_cache.device() != x.device()) {
+        partial_cache = torch::empty(
+            {needed}, torch::TensorOptions()
+                          .dtype(torch::kFloat32).device(x.device()));
+    }
+    torch::Tensor partial = partial_cache.narrow(0, 0, needed);
+    auto output = torch::empty(
+        {rows}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    dim3 block(128);
+    dim3 grid(slices, (unsigned)(((rows / 8) + 3) / 4));
+    int4_gemv_marlin_kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<const __half*>(x.data_ptr()),
+        reinterpret_cast<const uint32_t*>(repacked.data_ptr()),
+        reinterpret_cast<const __half*>(scales.data_ptr()),
+        partial.data_ptr<float>(),
+        (int)rows, (int)cols, (int)groups, slices);
+    marlin_reduce_kernel_g<<<(unsigned)((rows + 255) / 256), 256, 0, stream>>>(
+        partial.data_ptr<float>(), output.data_ptr<float>(),
+        (int)rows, slices);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
 // ---------------------------------------------------------------------------
 // INT4 GEMV v2 — split-K batch=1 kernel, all architectures (SM70+).
 // One warp owns one output row inside a 1024-column segment; each lane loads
@@ -18944,6 +19133,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Segmented vector4 INT4 GEMV (conflict-free, staged activation).");
     m.def("int4_gemv_packed_f32_v4s_bf16", &int4_gemv_packed_f32_v4s<__nv_bfloat16>,
         "Segmented vector4 INT4 GEMV, bf16 activations.");
+    m.def("int4_repack_marlin", &int4_repack_marlin,
+        "Repack INT4-G64 into marlin superstep tiles.");
+    m.def("int4_gemv_marlin", &int4_gemv_marlin,
+        "Marlin-layout INT4 GEMV (coalesced 4B/lane, mma.sync SM75+).");
     m.def("int4_gemv_packed_f32_v2", &int4_gemv_packed_f32_v2<float>,
         "Split-K INT4 batch-1 GEMV (vectorized, all architectures).");
     m.def("int4_gemv_packed_f32_v2_bf16", &int4_gemv_packed_f32_v2<__nv_bfloat16>,

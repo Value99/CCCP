@@ -2523,6 +2523,27 @@ if _EXT is not None:
             return None
         return _EXT.hadamard_bf16(x)
 
+    def int4_gemv_marlin_fused(
+        rows: torch.Tensor,
+        payload: torch.Tensor,
+        scales: torch.Tensor,
+        cols: int,
+        groups: int,
+        group_vector: bool = True,
+    ) -> torch.Tensor | None:
+        """Marlin-layout INT4 GEMV (payload must be repacked)."""
+        if rows.dtype == torch.bfloat16:
+            rows = rows.float()
+        return _EXT.int4_gemv_marlin(
+            rows.contiguous().half(),
+            payload.contiguous(),
+            scales.contiguous(),
+            int(payload.numel() * 2 // cols),
+            int(cols),
+            int(groups),
+        )
+    def int4_repack_marlin_fused(payload, cols):
+        return _EXT.int4_repack_marlin(payload.contiguous(), int(payload.numel() * 2 // cols), int(cols))
     def int4_gemv_v4s_fused(
         rows: torch.Tensor,
         payload: torch.Tensor,
