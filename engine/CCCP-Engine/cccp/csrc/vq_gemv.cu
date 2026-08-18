@@ -12721,9 +12721,18 @@ torch::Tensor int4_gemv_packed_f32_v2(
     auto stream = at::cuda::getCurrentCUDAStream();
     const int segments =
         (int)((cols + kInt4V2SegCols - 1) / kInt4V2SegCols);
-    auto partial = torch::empty(
-        {(long)rows * segments},
-        torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    // Static per-device partial buffer: repeated decode GEMVs reuse one
+    // allocation (address stability also keeps CUDA-Graph replays valid).
+    static torch::Tensor partial_cache;
+    const long needed = (long)rows * segments;
+    if (!partial_cache.defined() ||
+        partial_cache.device() != x.device() ||
+        partial_cache.numel() < needed) {
+        partial_cache = torch::empty(
+            {needed},
+            torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    }
+    torch::Tensor partial = partial_cache.narrow(0, 0, needed);
     auto output = torch::empty(
         {rows},
         torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
