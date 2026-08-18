@@ -13055,7 +13055,7 @@ __global__ void int4_repack_v21b_kernel(
 }
 
 constexpr int V21B_SLICE = 2048;
-constexpr int V21B_MAXB = 5;
+constexpr int V21B_MAXB = 6;  // draft5+首token=6;verify 成本对 B 平坦(权重单流)
 
 // 与 v21 相同的 SLICE 模板化(小矩阵 512):v21b 必须与 v21 的 k 分组树
 // 完全一致才保持 bit 一等(第二十二轮实证:分组不一致时 7e-7 差异会
@@ -13243,6 +13243,21 @@ torch::Tensor int4_gemv_v21b(
         : (cols <= 5120);
     const int slice_cols = small_b ? V21_SMALL_SLICE : V21B_SLICE;
     const int slices = (int)((cols + slice_cols - 1) / slice_cols);
+    // B=6 x 2048 x 4B = 48KB 恰在默认上限,显式 opt-in 避免边界拒绝。
+    static size_t configured_b = 0;
+    const size_t shared_b =
+        (size_t)V21B_MAXB * slice_cols * sizeof(float);
+    if (configured_b < shared_b) {
+        cudaFuncSetAttribute(
+            int4_gemv_v21b_kernel<V21_SMALL_SLICE>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (int)shared_b);
+        cudaFuncSetAttribute(
+            int4_gemv_v21b_kernel<V21B_SLICE>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (int)shared_b);
+        configured_b = shared_b;
+    }
     static torch::Tensor pc;
     const long needed = (long)B * rows * slices;
     if (!pc.defined() || pc.numel() < needed || pc.device() != x.device()) {
@@ -13277,7 +13292,7 @@ torch::Tensor int4_gemv_v21b(
     return output;
 }
 
-constexpr int V1B_MAXB = 5;
+constexpr int V1B_MAXB = 6;
 constexpr int V1B_SLICE = 4096;   // per-slice shared: B*4096*4B <= 80KB
 
 // 命名避开文件头部 #define ROWS_PER_BLOCK 32（宏会让模板参数被展开成字面量）。

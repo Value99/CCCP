@@ -42,11 +42,11 @@ def main() -> int:
             with_stack=True,
         ) as prof:
             output_ids = engine.generate_speculative(
-                plan.input_ids, max_new=options.max_new, k=4,
+                plan.input_ids, max_new=options.max_new, k=int(os.environ.get("CCCP_MTP_K", "4")),
             )
     else:
         output_ids = engine.generate_speculative(
-            plan.input_ids, max_new=options.max_new, k=4,
+            plan.input_ids, max_new=options.max_new, k=int(os.environ.get("CCCP_MTP_K", "4")),
         )
     torch.cuda.synchronize(engine.model.device)
     elapsed = time.perf_counter() - started

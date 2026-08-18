@@ -640,7 +640,7 @@ class DenseVQLinear(nn.Module):
                 return result
             batch = int(rows.shape[0])
             import os  # local: env switch for v21b batch path
-            if 2 <= batch <= 5 and rows.is_cuda and os.environ.get(
+            if 2 <= batch <= 6 and rows.is_cuda and os.environ.get(
                 "CCCP_INT4_GEMV_V21B", "1"
             ) != "0":
                 # MTP verify: one batched weight stream instead of per-token
@@ -1080,7 +1080,7 @@ class DenseVQLinearGroup(nn.Module):
                 if combined is None:
                     raise RuntimeError("grouped Dense VQ INT4 GEMV unavailable")
             elif (
-                2 <= rows.shape[0] <= 5
+                2 <= rows.shape[0] <= 6
                 and rows.is_cuda
                 and os.environ.get("CCCP_INT4_GEMV_V21B", "1") != "0"
             ):
