@@ -596,6 +596,27 @@ class DenseVQLinear(nn.Module):
                         f"CUDA Dense VQ INT4 GEMV unavailable for {self.name}"
                     )
                 return result
+            batch = int(rows.shape[0])
+            if 2 <= batch <= 16 and rows.is_cuda:
+                # Small-batch verify/prefill: run the fused batch-1 GEMV per
+                # token instead of dequantizing the whole INT4 matrix into a
+                # transient FP16 GEMM operand (which streams 4x the weight
+                # bytes through HBM on every call and dominated MTP verify).
+                from .fusedext import int4_gemv_fused as _gemv1
+
+                columns = [
+                    _gemv1(
+                        rows[i : i + 1].float().contiguous(),
+                        self.payload,
+                        self.gpu_scales,
+                        self.cols,
+                        64,
+                        group_vector=True,
+                    )
+                    for i in range(batch)
+                ]
+                if all(item is not None for item in columns):
+                    return torch.stack(columns, dim=0)
             return Int4Weight(
                 self.payload,
                 self.gpu_scales,
