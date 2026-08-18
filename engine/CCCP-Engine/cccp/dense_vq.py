@@ -645,20 +645,13 @@ class DenseVQLinear(nn.Module):
             ) != "0":
                 # MTP verify: one batched weight stream instead of per-token
                 # GEMV loops (v21b), keeping memory-bound traffic at 1x.
-                from .fusedext import (
-                    int4_gemv_v21b_fused,
-                    int4_repack_marlin_fused,
-                )
+                # v1b: bit-identical to per-token v1 (keeps MTP greedy
+                # acceptance) while streaming the weight rows once for B.
+                from .fusedext import int4_gemv_v1b_fused
 
-                repacked = getattr(self, "_v21_payload", None)
-                if repacked is None:
-                    repacked = int4_repack_marlin_fused(
-                        self.payload, self.cols
-                    )
-                    self._v21_payload = repacked
-                result = int4_gemv_v21b_fused(
+                result = int4_gemv_v1b_fused(
                     rows.float(),
-                    repacked,
+                    self.payload,
                     self.gpu_scales,
                     self.cols,
                     64,
