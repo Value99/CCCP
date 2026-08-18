@@ -12912,8 +12912,12 @@ __global__ void int4_gemv_marlin_kernel(
             mma_m16n8k16_m(hs == 0 ? a0 : a1, bfrag, &c0, &c1);
         }
     }
-    if (row < rows) {
-        partial[(long)row * slices + slice] = c0 + c1;
+    // C fragment: lanes 0..3 (m==0) each own two whole output rows,
+    // n = 2*lane and 2*lane+1 — no cross-lane reduce.
+    if (lane < 4) {
+        const int n0 = row0 + 2 * lane;
+        if (n0 < rows) partial[(long)n0 * slices + slice] = c0;
+        if (n0 + 1 < rows) partial[(long)(n0 + 1) * slices + slice] = c1;
     }
 }
 

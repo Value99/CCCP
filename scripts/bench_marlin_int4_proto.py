@@ -299,6 +299,44 @@ def main() -> None:
     print("impulse@17 got :", [round(v, 2) for v in got2.tolist()])
     print("impulse@17 want:", expect2.tolist())
 
+    # ---- Marlin repack 版(引擎内同款 kernel,经 vq_gemv 扩展) ----
+    try:
+        import sys
+        sys.path.insert(0, "/media/tyh20/disk22/cccp-qwen-gemv-20260818/engine/CCCP-Engine")
+        from cccp.fusedext import int4_gemv_marlin_fused, int4_repack_marlin_fused
+        rep = int4_repack_marlin_fused(packed, cols)
+        out_m = int4_gemv_marlin_fused(x, rep, scales, cols, groups)
+        torch.cuda.synchronize()
+        # 冲激诊断 repack 版
+        pk8 = pk.clone()
+        sc8 = sc_d.clone()
+        x0 = torch.zeros(cols_d, device="cuda", dtype=torch.float16)
+        x0[0] = 1.0
+        rep8 = int4_repack_marlin_fused(pk8, cols_d)
+        g8 = int4_gemv_marlin_fused(x0, rep8, sc8, cols_d, groups_d)
+        torch.cuda.synchronize()
+        print("repack impulse@0 got :", [round(v, 2) for v in g8.tolist()])
+        x17 = torch.zeros(cols_d, device="cuda", dtype=torch.float16)
+        x17[17] = 1.0
+        g17 = int4_gemv_marlin_fused(x17, rep8, sc8, cols_d, groups_d)
+        print("repack impulse@17 got:", [round(v, 2) for v in g17.tolist()])
+        diff_m = (out_m[:ref_rows] - ref).abs()
+        rel_m = diff_m / ref.abs().clamp_min(1e-3)
+        print(f"repack+marlin numerics: max_abs={diff_m.max().item():.5f} "
+              f"p99_rel={rel_m.quantile(0.99).item():.4f}")
+        for _ in range(50):
+            int4_gemv_marlin_fused(x, rep, scales, cols, groups)
+        torch.cuda.synchronize()
+        s2 = torch.cuda.Event(enable_timing=True); e2 = torch.cuda.Event(enable_timing=True)
+        s2.record()
+        for _ in range(300):
+            int4_gemv_marlin_fused(x, rep, scales, cols, groups)
+        e2.record(); torch.cuda.synchronize()
+        ms2 = s2.elapsed_time(e2) / 300
+        print(f"repack+marlin: {ms2:.4f} ms -> {nbytes / (ms2 / 1e3) / 1e9:.0f} GB/s")
+    except Exception as exc:  # noqa: BLE001
+        print("repack path unavailable:", type(exc).__name__, exc)
+
     # 带宽
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
