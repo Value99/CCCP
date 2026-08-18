@@ -12618,7 +12618,7 @@ torch::Tensor int4_embedding_lookup_device_row(
 // full coalescing width with no serial dependence chain.  Numerics are
 // identical to v1: acc += ((nibble - 8) * scale) * x[col].
 // ---------------------------------------------------------------------------
-constexpr int kInt4V2SegCols = 1024;  // 32 lanes x 32 columns
+constexpr int kInt4V2SegCols = 4096;  // 32 lanes x 4 uint4 steps
 constexpr int kInt4V2Warps = 8;       // rows per block
 
 template <typename input_t>
@@ -12651,39 +12651,44 @@ __global__ void int4_gemv_packed_f32_v2_kernel(
         packed + (long)row * packed_cols + (col_base >> 1);
     const __half* scale_row = scales + (long)row * groups;
 
-    // Lane owns columns [lane*32, lane*32+32) of the segment.  col_base is a
-    // multiple of 1024, hence of the 64-column group, and lane*32 is either
-    // a group start or its exact half — one scale per lane suffices.
-    const int local = lane * 32;
-    if (local < seg_cols) {
-        const int col0 = col_base + local;
-        const int local_nibbles = min(32, seg_cols - local);
-        const float scale =
-            __half2float(__ldg(scale_row + (col0 >> 6)));
-        const uint4 word = __ldg(reinterpret_cast<const uint4*>(
-            packed_row + (local >> 1)));
-        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&word);
-        // seg_cols is a multiple of 64 and local is a multiple of 32, so a
-        // lane whose window starts inside the segment always owns 32 valid
-        // columns — no per-element tail guards are needed.
-        (void)local_nibbles;
-        float acc = 0.f;
+    // Each lane strides four 16-byte words (128 columns) per step; four
+    // independent accumulators keep four loads in flight and break the FMA
+    // dependence chain.  seg_cols is a multiple of 64, so any word that
+    // starts inside the segment is fully valid — no tail guards needed.
+    float accs[4] = {0.f, 0.f, 0.f, 0.f};
+    const int words = seg_cols / 32;
+    for (int step = lane * 4; step < words; step += 128) {
 #pragma unroll
-        for (int b = 0; b < 16; ++b) {
-            const uint8_t q = bytes[b];
-            acc = __fmaf_rn(
-                static_cast<float>((q & 15) - 8) * scale,
-                shared_x[local + b * 2],
-                acc);
-            acc = __fmaf_rn(
-                static_cast<float>((q >> 4) - 8) * scale,
-                shared_x[local + b * 2 + 1],
-                acc);
+        for (int u = 0; u < 4; ++u) {
+            const int word_index = step + u;
+            if (word_index >= words) break;
+            const int local = word_index * 32;
+            const float scale = __half2float(
+                __ldg(scale_row + ((col_base + local) >> 6)));
+            const uint4 word = __ldg(reinterpret_cast<const uint4*>(
+                packed_row + (local >> 1)));
+            const uint8_t* bytes =
+                reinterpret_cast<const uint8_t*>(&word);
+            float acc = 0.f;
+#pragma unroll
+            for (int b = 0; b < 16; ++b) {
+                const uint8_t q = bytes[b];
+                acc = __fmaf_rn(
+                    static_cast<float>((q & 15) - 8) * scale,
+                    shared_x[local + b * 2],
+                    acc);
+                acc = __fmaf_rn(
+                    static_cast<float>((q >> 4) - 8) * scale,
+                    shared_x[local + b * 2 + 1],
+                    acc);
+            }
+            accs[u & 3] += acc;
         }
-        acc = warp_sum_f32(acc);
-        if (lane == 0) {
-            partial[(long)row * segments + seg] = acc;
-        }
+    }
+    float acc = (accs[0] + accs[1]) + (accs[2] + accs[3]);
+    acc = warp_sum_f32(acc);
+    if (lane == 0) {
+        partial[(long)row * segments + seg] = acc;
     }
 }
 
