@@ -538,6 +538,27 @@ class DenseVQLinear(nn.Module):
 
             if rows.shape[0] == 1:
                 import os
+                if os.environ.get("CCCP_INT4_GEMV_V17", "0") == "1":
+                    from .fusedext import (
+                        int4_gemv_v17_fused,
+                        int4_repack_marlin_fused,
+                    )
+                    repacked = getattr(self, "_marlin_payload", None)
+                    if repacked is None:
+                        repacked = int4_repack_marlin_fused(
+                            self.payload, self.cols
+                        )
+                        self._marlin_payload = repacked
+                    result = int4_gemv_v17_fused(
+                        rows.float(),
+                        repacked,
+                        self.gpu_scales,
+                        self.cols,
+                        64,
+                        group_vector=True,
+                    )
+                    if result is not None:
+                        return result
                 if os.environ.get("CCCP_INT4_GEMV_MARLIN", "0") == "1":
                     from .fusedext import (
                         int4_gemv_marlin_fused,

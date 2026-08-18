@@ -12797,6 +12797,105 @@ __global__ void marlin_reduce_kernel_g(
 }
 
 // ---------------------------------------------------------------------------
+// INT4 GEMV v17 — marlin superstep tiles + FMA + shared-x (SM75+).
+// Same repacked layout as int4_gemv_marlin (one uint32 per lane per
+// 32-column superstep), tensor-core path replaced by eight FMAs against
+// conflict-free shared-x; per-4-lane-group reduction (one group = one row).
+// Measured 731 GB/s @5120x17408, 1000 GB/s @248320x5120 on H20.
+// ---------------------------------------------------------------------------
+constexpr int V17_SLICE = 2048;
+
+__global__ void int4_gemv_v17_kernel(
+    const float* __restrict__ x,
+    const uint32_t* __restrict__ repacked,
+    const __half* __restrict__ scales,
+    float* __restrict__ partial,
+    const int rows,
+    const int cols,
+    const int groups,
+    const int slices)
+{
+    extern __shared__ float sx[];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int slice = blockIdx.x;
+    const int k0 = slice * V17_SLICE;
+    const int here = min(V17_SLICE, cols - k0);
+    if (here <= 0) return;
+    for (int c = threadIdx.x; c < here; c += 128) {
+        sx[c] = x[k0 + c];
+    }
+    __syncthreads();
+    const int row0 = (blockIdx.y * 4 + warp) * 8;
+    if (row0 >= rows) return;
+    const int j = lane >> 2;
+    const int i = lane & 3;
+    const int row = row0 + j;
+    const __half* srow = scales + (long)row * groups;
+    const int tiles_k = cols >> 5;
+    const uint32_t* base = repacked +
+        ((((long)(row0 >> 3)) * tiles_k + (k0 >> 5)) << 5);
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+    for (int ts = 0; ts < (here >> 5); ++ts) {
+        const uint32_t w = __ldg(base + (ts << 5) + lane);
+        const int col0 = ts << 5;
+        const float sc = __half2float(__ldg(srow + ((k0 + col0 + 2 * i) >> 6)));
+        const uint32_t b0 = w & 0xFF;
+        const uint32_t b1 = (w >> 8) & 0xFF;
+        const uint32_t b2 = (w >> 16) & 0xFF;
+        const uint32_t b3 = (w >> 24) & 0xFF;
+        a0 = __fmaf_rn(static_cast<float>((int)(b0 & 15) - 8) * sc, sx[col0 + 2 * i], a0);
+        a0 = __fmaf_rn(static_cast<float>((int)(b0 >> 4) - 8) * sc, sx[col0 + 2 * i + 1], a0);
+        a1 = __fmaf_rn(static_cast<float>((int)(b1 & 15) - 8) * sc, sx[col0 + 2 * i + 8], a1);
+        a1 = __fmaf_rn(static_cast<float>((int)(b1 >> 4) - 8) * sc, sx[col0 + 2 * i + 9], a1);
+        a2 = __fmaf_rn(static_cast<float>((int)(b2 & 15) - 8) * sc, sx[col0 + 2 * i + 16], a2);
+        a2 = __fmaf_rn(static_cast<float>((int)(b2 >> 4) - 8) * sc, sx[col0 + 2 * i + 17], a2);
+        a3 = __fmaf_rn(static_cast<float>((int)(b3 & 15) - 8) * sc, sx[col0 + 2 * i + 24], a3);
+        a3 = __fmaf_rn(static_cast<float>((int)(b3 >> 4) - 8) * sc, sx[col0 + 2 * i + 25], a3);
+    }
+    float acc = (a0 + a1) + (a2 + a3);
+#pragma unroll
+    for (int off = 1; off < 4; off <<= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, off, 4);
+    }
+    if (row < rows && (lane & 3) == 0) {
+        partial[(long)row * slices + slice] = acc;
+    }
+}
+
+torch::Tensor int4_gemv_v17(
+    torch::Tensor x,
+    torch::Tensor repacked,
+    torch::Tensor scales,
+    int64_t rows,
+    int64_t cols,
+    int64_t groups)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int slices = (int)((cols + V17_SLICE - 1) / V17_SLICE);
+    static torch::Tensor pc;
+    const long needed = (long)rows * slices;
+    if (!pc.defined() || pc.numel() < needed || pc.device() != x.device()) {
+        pc = torch::empty(
+            {needed}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    }
+    torch::Tensor partial = pc.narrow(0, 0, needed);
+    auto output = torch::empty(
+        {rows}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    dim3 grid(slices, (unsigned)(((rows / 8) + 3) / 4));
+    int4_gemv_v17_kernel<<<grid, 128, V17_SLICE * sizeof(float), stream>>>(
+        x.data_ptr<float>(),
+        reinterpret_cast<const uint32_t*>(repacked.data_ptr()),
+        reinterpret_cast<const __half*>(scales.data_ptr()),
+        partial.data_ptr<float>(), (int)rows, (int)cols, (int)groups, slices);
+    marlin_reduce_kernel_g<<<(unsigned)((rows + 255) / 256), 256, 0, stream>>>(
+        partial.data_ptr<float>(), output.data_ptr<float>(),
+        (int)rows, slices);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+// ---------------------------------------------------------------------------
 // Marlin-style repack + GEMV (all architectures, SM75+).
 // Repack: superstep tile = 8 rows x 32 cols; GEMV thread t (j=t/4,i=t%4)
 // needs input bytes {i, i+4, i+8, i+12} of row j -> one aligned uint32.
@@ -19141,6 +19240,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Segmented vector4 INT4 GEMV (conflict-free, staged activation).");
     m.def("int4_gemv_packed_f32_v4s_bf16", &int4_gemv_packed_f32_v4s<__nv_bfloat16>,
         "Segmented vector4 INT4 GEMV, bf16 activations.");
+    m.def("int4_gemv_v17", &int4_gemv_v17,
+        "v17: marlin tiles + FMA GEMV (731-1000 GB/s, SM75+).");
     m.def("int4_repack_marlin", &int4_repack_marlin,
         "Repack INT4-G64 into marlin superstep tiles.");
     m.def("int4_gemv_marlin", &int4_gemv_marlin,

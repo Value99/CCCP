@@ -2523,6 +2523,23 @@ if _EXT is not None:
             return None
         return _EXT.hadamard_bf16(x)
 
+    def int4_gemv_v17_fused(
+        rows: torch.Tensor,
+        payload: torch.Tensor,
+        scales: torch.Tensor,
+        cols: int,
+        groups: int,
+        group_vector: bool = True,
+    ) -> torch.Tensor | None:
+        """v17: marlin-layout tiles + FMA (payload must be repacked)."""
+        return _EXT.int4_gemv_v17(
+            rows.float().contiguous(),
+            payload.contiguous(),
+            scales.contiguous(),
+            int(payload.numel() * 8 // cols // 4),
+            int(cols),
+            int(groups),
+        )
     def int4_gemv_marlin_fused(
         rows: torch.Tensor,
         payload: torch.Tensor,
