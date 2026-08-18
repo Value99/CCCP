@@ -39,6 +39,21 @@ def _dense_vq_gemv(**kwargs):
         )
 
 
+def _dense_vq_mma(**kwargs):
+    from ..fusedext import dense_vq_mma_packed_m1_fused
+
+    payload = kwargs["payload"]
+    with torch.cuda.device(payload.device):
+        return dense_vq_mma_packed_m1_fused(
+            kwargs["value"],
+            payload,
+            kwargs["codebook"],
+            kwargs["rows"],
+            kwargs["blocks"],
+            kwargs["bits"],
+        )
+
+
 def _dense_vq_dequant(**kwargs):
     from ..fusedext import dense_vq_dequant_packed_fused
 
@@ -51,6 +66,46 @@ def _dense_vq_dequant(**kwargs):
             kwargs["blocks"],
             kwargs["bits"],
             kwargs.get("row_ids"),
+        )
+
+
+def _dense_vq_dequant_fp8(**kwargs):
+    from ..fusedext import dense_vq_dequant_fp8_packed_fused
+
+    payload = kwargs["payload"]
+    with torch.cuda.device(payload.device):
+        return dense_vq_dequant_fp8_packed_fused(
+            payload,
+            kwargs["codebook"],
+            kwargs["rows"],
+            kwargs["blocks"],
+            kwargs["bits"],
+            kwargs.get("row_ids"),
+        )
+
+
+def _dense_vq_quantize_fp8_codebook(**kwargs):
+    from ..fusedext import dense_vq_quantize_fp8_codebook_fused
+
+    codebook = kwargs["codebook"]
+    with torch.cuda.device(codebook.device):
+        return dense_vq_quantize_fp8_codebook_fused(codebook)
+
+
+def _dense_vq_expand_fp8_tile(**kwargs):
+    from ..fusedext import dense_vq_expand_fp8_tile_out_fused
+
+    payload = kwargs["payload"]
+    with torch.cuda.device(payload.device):
+        return dense_vq_expand_fp8_tile_out_fused(
+            payload,
+            kwargs["fp8_codebook"],
+            kwargs["rows"],
+            kwargs["blocks"],
+            kwargs["bits"],
+            kwargs["row_start"],
+            kwargs["row_count"],
+            kwargs["output"],
         )
 
 
@@ -163,12 +218,6 @@ def _projection_dequant(**kwargs):
     from ..fusedext import projection_dequant_fused
 
     return projection_dequant_fused(**kwargs)
-
-
-def _projection_expand_native8(**kwargs):
-    from ..fusedext import projection_expand_native8_fused
-
-    return projection_expand_native8_fused(**kwargs)
 
 
 def _packed_route_slots(**kwargs):
@@ -597,12 +646,9 @@ def _sparse_paged_attention_flashmla(**kwargs):
     from ..flashmla_sparse import FlashMLASparseRunner, available
 
     query = kwargs["query"]
-    supported, unavailable_reason = available(query.device)
+    supported, _ = available(query.device)
     if not supported:
-        raise RuntimeError(
-            "FlashMLA sparse SplitKV backend unavailable: "
-            f"{unavailable_reason or 'unknown reason'}"
-        )
+        return None
     runner = kwargs.get("runner")
     if runner is None:
         runner = FlashMLASparseRunner.create()
@@ -1071,6 +1117,24 @@ def register(registry: OperatorRegistry) -> None:
         priority=120,
     )
     registry.register(
+        "cuda.dense_vq_mma.p8-p16.m1-prototype",
+        OperatorCapability(
+            operation="dense_vq_mma",
+            device_types=("cuda",),
+            packed_formats=tuple(f"p{bits}" for bits in range(8, 17)),
+            code_dims=(2, 4, 8, 16),
+            codebook_sizes=(
+                256, 512, 1024, 2048, 4096,
+                8192, 16384, 32768, 65536,
+            ),
+            activations=("none",),
+            max_top_k=1,
+            batch_sizes=(1,),
+        ),
+        _dense_vq_mma,
+        priority=10,
+    )
+    registry.register(
         "cuda.dense_vq_dequant.p8-p16.prefill",
         OperatorCapability(
             operation="dense_vq_dequant",
@@ -1087,6 +1151,59 @@ def register(registry: OperatorRegistry) -> None:
         ),
         _dense_vq_dequant,
         priority=120,
+    )
+    registry.register(
+        "cuda.dense_vq_dequant_fp8.p8-p16.tensor-scale",
+        OperatorCapability(
+            operation="dense_vq_dequant_fp8",
+            device_types=("cuda",),
+            packed_formats=tuple(f"p{bits}" for bits in range(8, 17)),
+            code_dims=(2, 4, 8, 16),
+            codebook_sizes=(
+                256, 512, 1024, 2048, 4096,
+                8192, 16384, 32768, 65536,
+            ),
+            activations=("none",),
+            max_top_k=1,
+            batch_sizes=tuple(range(1, 8193)),
+        ),
+        _dense_vq_dequant_fp8,
+        priority=130,
+    )
+    registry.register(
+        "cuda.dense_vq_codebook_fp8.tensor-scale",
+        OperatorCapability(
+            operation="dense_vq_codebook_fp8",
+            device_types=("cuda",),
+            code_dims=(2, 4, 8, 16),
+            codebook_sizes=(
+                256, 512, 1024, 2048, 4096,
+                8192, 16384, 32768, 65536,
+            ),
+            activations=("none",),
+            max_top_k=1,
+            batch_sizes=(1,),
+        ),
+        _dense_vq_quantize_fp8_codebook,
+        priority=130,
+    )
+    registry.register(
+        "cuda.dense_vq_expand_fp8_tile.p8-p16.fixed-output",
+        OperatorCapability(
+            operation="dense_vq_expand_fp8_tile",
+            device_types=("cuda",),
+            packed_formats=tuple(f"p{bits}" for bits in range(8, 17)),
+            code_dims=(2, 4, 8, 16),
+            codebook_sizes=(
+                256, 512, 1024, 2048, 4096,
+                8192, 16384, 32768, 65536,
+            ),
+            activations=("none",),
+            max_top_k=1,
+            batch_sizes=tuple(range(1, 8193)),
+        ),
+        _dense_vq_expand_fp8_tile,
+        priority=130,
     )
     registry.register(
         "cuda.dense_gemv.bf16.decode",
@@ -1247,25 +1364,6 @@ def register(registry: OperatorRegistry) -> None:
         ),
         _projection_dequant,
         priority=100,
-    )
-    registry.register(
-        "cuda.projection_expand_native8.mixed.tensorcore",
-        OperatorCapability(
-            operation="projection_expand_native8",
-            device_types=("cuda",),
-            packed_formats=tuple(f"p{bits}" for bits in range(8, 17)),
-            code_dims=(4, 8, 16),
-            codebook_sizes=(
-                256, 512, 1024, 2048, 4096,
-                8192, 16384, 32768, 65536,
-            ),
-            activations=("none",),
-            max_top_k=1,
-            batch_sizes=tuple(range(1, 8193)),
-            dtypes=("e4m3", "int8"),
-        ),
-        _projection_expand_native8,
-        priority=120,
     )
     registry.register(
         "cuda.packed_moe_topk_grouped.three_projection.mixed.gated",

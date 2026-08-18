@@ -878,6 +878,99 @@ if _EXT is not None:
             int(total_rows),
         )
 
+
+    def dense_vq_dequant_fp8_packed_fused(
+        payload: torch.Tensor,
+        codebook: torch.Tensor,
+        rows: int,
+        blocks: int,
+        bits: int,
+        row_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert packed VQ directly to E4M3 plus one tensor scale.
+
+        The CUDA entry quantizes only the compact codebook before expanding
+        packed indices.  It therefore never creates a full BF16 matrix.
+        """
+        if row_ids is None:
+            row_ids = torch.empty(
+                0, dtype=torch.int64, device=payload.device
+            )
+        result = _EXT.dense_vq_dequant_fp8_packed(
+            payload.contiguous().reshape(-1),
+            codebook.float().contiguous(),
+            int(rows),
+            int(blocks),
+            int(bits),
+            row_ids.contiguous(),
+        )
+        return result[0], result[1]
+    def dense_vq_mma_packed_m1_fused(
+        input: torch.Tensor,
+        payload: torch.Tensor,
+        codebook: torch.Tensor,
+        rows: int,
+        blocks: int,
+        bits: int,
+    ) -> torch.Tensor:
+        """Decode packed VQ inside a one-row Tensor Core MMA kernel."""
+        if codebook.dtype != torch.float16:
+            raise ValueError(
+                "Dense VQ direct MMA requires a persistent FP16 codebook"
+            )
+        return _EXT.dense_vq_mma_packed_m1(
+            input.float().contiguous(),
+            payload.contiguous().reshape(-1),
+            codebook.contiguous(),
+            int(rows),
+            int(blocks),
+            int(bits),
+        )
+    def dense_vq_compile_int4_g64_fused(
+        payload: torch.Tensor,
+        codebook: torch.Tensor,
+        rows: int,
+        blocks: int,
+        bits: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compile Dense VQ into the common resident INT4-G64 format."""
+        result = _EXT.dense_vq_compile_int4_g64(
+            payload.contiguous().reshape(-1),
+            codebook.float().contiguous(),
+            int(rows),
+            int(blocks),
+            int(bits),
+        )
+        return result[0], result[1]
+    def dense_vq_quantize_fp8_codebook_fused(
+        codebook: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Prepare the compact E4M3 codebook shared by every row tile."""
+        result = _EXT.dense_vq_quantize_fp8_codebook(
+            codebook.float().contiguous()
+        )
+        return result[0], result[1]
+    def dense_vq_expand_fp8_tile_out_fused(
+        payload: torch.Tensor,
+        fp8_codebook: torch.Tensor,
+        rows: int,
+        blocks: int,
+        bits: int,
+        row_start: int,
+        row_count: int,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode one contiguous VQ row tile into fixed E4M3 storage."""
+        return _EXT.dense_vq_expand_fp8_tile_out(
+            payload.contiguous().reshape(-1),
+            fp8_codebook.contiguous(),
+            int(rows),
+            int(blocks),
+            int(bits),
+            int(row_start),
+            int(row_count),
+            output,
+        )
     def dense_vq_dequant_packed_fused(
         payload: torch.Tensor,
         codebook: torch.Tensor,
@@ -2430,6 +2523,153 @@ if _EXT is not None:
             return None
         return _EXT.hadamard_bf16(x)
 
+    def int4_repack_v21_fused(payload, cols):
+        return _EXT.int4_repack_v21(
+            payload.contiguous(),
+            int(payload.numel() * 2 // cols),
+            int(cols),
+        )
+    def int4_gemv_v1b_fused(
+        rows: torch.Tensor,
+        payload: torch.Tensor,
+        scales: torch.Tensor,
+        cols: int,
+        group_size: int,
+        group_vector: bool = True,
+    ) -> torch.Tensor | None:
+        """v1b: batched (2..5) GEMV, bit-identical to v1 per-token."""
+        if (
+            not rows.is_cuda
+            or rows.dtype not in (torch.float32, torch.bfloat16)
+            or payload.dtype != torch.uint8
+            or scales.dtype != torch.float16
+            or group_size != 64
+            or cols <= 0
+            or cols % 64
+        ):
+            return None
+        return _EXT.int4_gemv_v1b(
+            rows.float().contiguous(),
+            payload.contiguous(),
+            scales.contiguous(),
+            int(payload.numel() * 2 // cols),
+            int(cols),
+            int(cols // group_size),
+        )
+    def int4_gemv_v21b_fused(
+        rows: torch.Tensor,
+        payload: torch.Tensor,
+        scales: torch.Tensor,
+        cols: int,
+        groups: int,
+        group_vector: bool = True,
+    ) -> torch.Tensor | None:
+        """v21b: batched (2..5 rows) GEMV, one weight stream."""
+        return _EXT.int4_gemv_v21b(
+            rows.float().contiguous(),
+            payload.contiguous(),
+            scales.contiguous(),
+            int(payload.numel() * 2 // cols),
+            int(cols),
+            int(groups),
+        )
+    def int4_gemv_v21_fused(
+        rows: torch.Tensor,
+        payload: torch.Tensor,
+        scales: torch.Tensor,
+        cols: int,
+        groups: int,
+        group_vector: bool = True,
+    ) -> torch.Tensor | None:
+        """v21: superstep-interleave layout + 16B/lane GEMV."""
+        return _EXT.int4_gemv_v21(
+            rows.float().contiguous(),
+            payload.contiguous(),
+            scales.contiguous(),
+            int(payload.numel() * 2 // cols),
+            int(cols),
+            int(groups),
+        )
+    def int4_gemv_v17_fused(
+        rows: torch.Tensor,
+        payload: torch.Tensor,
+        scales: torch.Tensor,
+        cols: int,
+        groups: int,
+        group_vector: bool = True,
+    ) -> torch.Tensor | None:
+        """v17: marlin-layout tiles + FMA (payload must be repacked)."""
+        return _EXT.int4_gemv_v17(
+            rows.float().contiguous(),
+            payload.contiguous(),
+            scales.contiguous(),
+            int(payload.numel() * 8 // cols // 4),
+            int(cols),
+            int(groups),
+        )
+    def int4_gemv_marlin_fused(
+        rows: torch.Tensor,
+        payload: torch.Tensor,
+        scales: torch.Tensor,
+        cols: int,
+        groups: int,
+        group_vector: bool = True,
+    ) -> torch.Tensor | None:
+        """Marlin-layout INT4 GEMV (payload must be repacked)."""
+        if rows.dtype == torch.bfloat16:
+            rows = rows.float()
+        return _EXT.int4_gemv_marlin(
+            rows.contiguous().half(),
+            payload.contiguous(),
+            scales.contiguous(),
+            int(payload.numel() * 2 // cols),
+            int(cols),
+            int(groups),
+        )
+    def int4_repack_marlin_fused(payload, cols):
+        return _EXT.int4_repack_marlin(payload.contiguous(), int(payload.numel() * 2 // cols), int(cols))
+    def int4_gemv_v4s_fused(
+        rows: torch.Tensor,
+        payload: torch.Tensor,
+        scales: torch.Tensor,
+        cols: int,
+        groups: int,
+        group_vector: bool = True,
+    ) -> torch.Tensor | None:
+        """Segmented vector4 INT4 GEMV (conflict-free lanes, staged x)."""
+        if rows.dtype == torch.bfloat16:
+            return _EXT.int4_gemv_packed_f32_v4s_bf16(
+                rows.contiguous(), payload.contiguous(), scales.contiguous(),
+                int(payload.numel() * 2 // cols), int(cols), int(groups))
+        return _EXT.int4_gemv_packed_f32_v4s(
+            rows.float().contiguous(), payload.contiguous(), scales.contiguous(),
+            int(payload.numel() * 2 // cols), int(cols), int(groups))
+    def int4_gemv_v2_fused(
+        rows: torch.Tensor,
+        payload: torch.Tensor,
+        scales: torch.Tensor,
+        cols: int,
+        groups: int,
+        group_vector: bool = True,
+    ) -> torch.Tensor | None:
+        """Split-K INT4 GEMV: one uint4 per lane, 1024-column segments."""
+        if rows.dtype == torch.bfloat16:
+            return _EXT.int4_gemv_packed_f32_v2_bf16(
+                rows.contiguous(),
+                payload.contiguous(),
+                scales.contiguous(),
+                int(payload.numel() * 2 // cols),
+                int(cols),
+                int(groups),
+            )
+        return _EXT.int4_gemv_packed_f32_v2(
+            rows.float().contiguous(),
+            payload.contiguous(),
+            scales.contiguous(),
+            int(payload.numel() * 2 // cols),
+            int(cols),
+            int(groups),
+        )
     def int4_gemv_fused(
         x: torch.Tensor,
         packed: torch.Tensor,
@@ -3806,6 +4046,17 @@ else:
     def dense_vq_gemv_grouped_fp8_codebook_fused(*args, **kwargs):
         raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")
 
+
+    def dense_vq_dequant_fp8_packed_fused(*args, **kwargs):
+        raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")
+    def dense_vq_mma_packed_m1_fused(*args, **kwargs):
+        raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")
+    def dense_vq_compile_int4_g64_fused(*args, **kwargs):
+        raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")
+    def dense_vq_quantize_fp8_codebook_fused(*args, **kwargs):
+        raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")
+    def dense_vq_expand_fp8_tile_out_fused(*args, **kwargs):
+        raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")
     def dense_vq_dequant_packed_fused(*args, **kwargs):
         raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")
 

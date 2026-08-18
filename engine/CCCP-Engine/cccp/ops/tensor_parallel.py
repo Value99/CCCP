@@ -3576,7 +3576,7 @@ class TensorParallelKDA:
             zero=zero,
         )
 
-    def capture(self, layers=None) -> None:
+    def capture(self) -> None:
         from ..fusedext import (
             make_tp_graph_launch_batch,
             tp_peer_copy_fused,
@@ -3594,12 +3594,7 @@ class TensorParallelKDA:
             spec.gate_rank,
             self.local_heads,
         )
-        selected_states = (
-            tuple(self.layers.values())
-            if layers is None
-            else tuple(self.layers[int(layer)] for layer in layers)
-        )
-        for state in selected_states:
+        for state in self.layers.values():
             owner_device = self.devices[state.owner]
             with torch.cuda.device(owner_device):
                 state.source.zero_()
@@ -3723,25 +3718,21 @@ class TensorParallelKDA:
                     event = torch.cuda.Event()
                     event.record(torch.cuda.current_stream(device))
                     state.input_events.append(event)
-            if (
-                state.output_replicas is None
-                or state.output_events is None
-            ):
-                state.output_replicas = []
-                state.output_events = []
-                for device in self.devices:
-                    with torch.cuda.device(device):
-                        state.output_replicas.append(
-                            torch.empty(
-                                1,
-                                spec.hidden_size,
-                                dtype=torch.bfloat16,
-                                device=device,
-                            )
+            state.output_replicas = []
+            state.output_events = []
+            for device in self.devices:
+                with torch.cuda.device(device):
+                    state.output_replicas.append(
+                        torch.empty(
+                            1,
+                            spec.hidden_size,
+                            dtype=torch.bfloat16,
+                            device=device,
                         )
-                        event = torch.cuda.Event()
-                        event.record(torch.cuda.current_stream(device))
-                        state.output_events.append(event)
+                    )
+                    event = torch.cuda.Event()
+                    event.record(torch.cuda.current_stream(device))
+                    state.output_events.append(event)
             state.contributions = contributions
             state.graph_batch = make_tp_graph_launch_batch(
                 [

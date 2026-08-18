@@ -33,6 +33,7 @@
 //        or scripts/prebuild_gpu_ops.ps1 (uses the bundled toolchain).
 
 #include <torch/extension.h>
+#include <mma.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Exceptions.h>
 #include <cuda_bf16.h>
@@ -3034,6 +3035,408 @@ __global__ void dense_vq_dequant_packed_kernel(
     for (int component = 0; component < vector; ++component)
         destination[component] = __float2bfloat16_rn(source[component]);
 }
+
+
+__global__ void dense_vq_expand_fp8_packed_kernel(
+    const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ fp8_codebook,
+    uint8_t* __restrict__ output,
+    const long selected_rows,
+    const long row_start,
+    const long blocks,
+    const int vector,
+    const int dtype_tag,
+    const int64_t* __restrict__ row_ids)
+{
+    const long item = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const long count = selected_rows * blocks;
+    if (item >= count) return;
+    const long selected_row = item / blocks;
+    const long block = item - selected_row * blocks;
+    const long source_row = row_ids == nullptr
+        ? row_start + selected_row
+        : row_ids[selected_row];
+    const int64_t address = static_cast<int64_t>(
+        reinterpret_cast<uintptr_t>(packed));
+    const int code = routed_index_value(
+        address, dtype_tag, source_row * blocks + block);
+    const uint8_t* source = fp8_codebook + static_cast<long>(code) * vector;
+    uint8_t* destination = output +
+        (selected_row * blocks + block) * vector;
+    for (int component = 0; component < vector; ++component)
+        destination[component] = source[component];
+}
+
+std::vector<torch::Tensor> dense_vq_quantize_fp8_codebook(
+    torch::Tensor codebook)
+{
+    TORCH_CHECK(
+        codebook.is_cuda() && codebook.scalar_type() == at::kFloat &&
+        codebook.dim() == 2 && codebook.is_contiguous() &&
+        codebook.numel() > 0,
+        "Dense VQ FP8 codebook conversion requires contiguous CUDA FP32");
+    auto fp8_options = codebook.options().dtype(
+        at::ScalarType::Float8_e4m3fn);
+    auto fp8_codebook = torch::empty(codebook.sizes(), fp8_options);
+    auto scale = torch::empty(
+        {1, 1}, codebook.options().dtype(at::kFloat));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    C10_CUDA_CHECK(cudaMemsetAsync(
+        scale.data_ptr<float>(), 0, sizeof(float), stream));
+    const int64_t items = codebook.numel();
+    const int reduction_blocks = static_cast<int>(std::min<int64_t>(
+        1024, (items + 255) / 256));
+    dense_fp8_tensor_amax_kernel<float><<<
+        reduction_blocks, 256, 0, stream>>>(
+            codebook.data_ptr<float>(),
+            reinterpret_cast<unsigned int*>(scale.data_ptr<float>()),
+            items);
+    dense_fp8_quantize_tensor_kernel<float><<<
+        reduction_blocks, 256, 0, stream>>>(
+            codebook.data_ptr<float>(),
+            static_cast<uint8_t*>(fp8_codebook.data_ptr()),
+            scale.data_ptr<float>(),
+            items);
+    dense_fp8_finalize_tensor_scale_kernel<<<1, 1, 0, stream>>>(
+        scale.data_ptr<float>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {fp8_codebook, scale};
+}
+
+std::vector<torch::Tensor> dense_vq_dequant_fp8_packed(
+    torch::Tensor packed,
+    torch::Tensor codebook,
+    int64_t rows,
+    int64_t blocks,
+    int64_t bits,
+    torch::Tensor row_ids)
+{
+    TORCH_CHECK(
+        packed.is_cuda() && codebook.is_cuda() && row_ids.is_cuda(),
+        "Dense VQ FP8 conversion operands must be CUDA tensors");
+    TORCH_CHECK(
+        packed.scalar_type() == at::kByte && packed.dim() == 1 &&
+        codebook.scalar_type() == at::kFloat && codebook.dim() == 2 &&
+        row_ids.scalar_type() == at::kLong && row_ids.dim() == 1 &&
+        packed.is_contiguous() && codebook.is_contiguous() &&
+        row_ids.is_contiguous(),
+        "Dense VQ FP8 conversion operand layout mismatch");
+    const int tag = dense_vq_dtype_tag(static_cast<int>(bits));
+    const int vector = static_cast<int>(codebook.size(1));
+    const int64_t entries = codebook.size(0);
+    const int64_t expected_bits = rows * blocks * bits;
+    TORCH_CHECK(
+        tag >= 0 && rows > 0 && blocks > 0 && vector > 0 &&
+        expected_bits % 8 == 0 && packed.numel() == expected_bits / 8 &&
+        entries > 0 && entries <= (int64_t{1} << bits),
+        "Dense VQ FP8 conversion metadata mismatch");
+    const int64_t selected = row_ids.numel() == 0 ? rows : row_ids.numel();
+    auto converted_codebook = dense_vq_quantize_fp8_codebook(codebook);
+    auto fp8_codebook = converted_codebook[0];
+    auto scale = converted_codebook[1];
+    auto output = torch::empty(
+        {selected, blocks * vector}, fp8_codebook.options());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    // A VQ matrix only contains values from its codebook. Quantize that
+    // compact table once, then expand byte-sized E4M3 values while decoding
+    // the packed indices. This never materializes the old full BF16 matrix.
+    const int64_t count = selected * blocks;
+    dense_vq_expand_fp8_packed_kernel<<<
+        static_cast<unsigned>((count + 255) / 256), 256, 0, stream>>>(
+            packed.data_ptr<uint8_t>(),
+            static_cast<const uint8_t*>(fp8_codebook.data_ptr()),
+            static_cast<uint8_t*>(output.data_ptr()),
+            selected,
+            0,
+            blocks,
+            vector,
+            tag,
+            row_ids.numel() ? row_ids.data_ptr<int64_t>() : nullptr);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {output, scale};
+}
+
+__global__ void dense_vq_compile_int4_g64_kernel(
+    const uint8_t* __restrict__ packed,
+    const float* __restrict__ codebook,
+    uint8_t* __restrict__ output,
+    __half* __restrict__ scales,
+    const int rows,
+    const int blocks,
+    const int vector,
+    const int dtype_tag,
+    const int groups)
+{
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const int64_t address = static_cast<int64_t>(
+        reinterpret_cast<uintptr_t>(packed));
+    const int columns = blocks * vector;
+    for (int group = warp; group < groups; group += warps) {
+        const int first_column = group * 64 + lane * 2;
+        const int first_block = first_column / vector;
+        const int first_component = first_column - first_block * vector;
+        const int second_column = first_column + 1;
+        const int second_block = second_column / vector;
+        const int second_component = second_column - second_block * vector;
+        const int first_code = routed_index_value(
+            address, dtype_tag,
+            static_cast<long>(row) * blocks + first_block);
+        const int second_code = routed_index_value(
+            address, dtype_tag,
+            static_cast<long>(row) * blocks + second_block);
+        const float first = codebook[
+            static_cast<long>(first_code) * vector + first_component];
+        const float second = codebook[
+            static_cast<long>(second_code) * vector + second_component];
+        float signed_max = fabsf(first) >= fabsf(second) ? first : second;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const float other = __shfl_down_sync(
+                0xffffffffu, signed_max, offset, 32);
+            if (fabsf(other) > fabsf(signed_max)) signed_max = other;
+        }
+        signed_max = __shfl_sync(0xffffffffu, signed_max, 0, 32);
+        float scale = signed_max == 0.0f ? 0.0f : signed_max / -8.0f;
+        const __half rounded_scale = __float2half_rn(scale);
+        scale = __half2float(rounded_scale);
+        const float inverse = scale == 0.0f ? 0.0f : 1.0f / scale;
+        const int low = max(
+            0, min(15, __float2int_rn(first * inverse + 8.0f)));
+        const int high = max(
+            0, min(15, __float2int_rn(second * inverse + 8.0f)));
+        output[static_cast<long>(row) * (columns / 2) + group * 32 + lane] =
+            static_cast<uint8_t>(low | (high << 4));
+        if (lane == 0)
+            scales[static_cast<long>(row) * groups + group] = rounded_scale;
+    }
+}
+
+std::vector<torch::Tensor> dense_vq_compile_int4_g64(
+    torch::Tensor packed,
+    torch::Tensor codebook,
+    int64_t rows,
+    int64_t blocks,
+    int64_t bits)
+{
+    TORCH_CHECK(
+        packed.is_cuda() && codebook.is_cuda() &&
+        packed.scalar_type() == at::kByte && packed.dim() == 1 &&
+        codebook.scalar_type() == at::kFloat && codebook.dim() == 2 &&
+        packed.is_contiguous() && codebook.is_contiguous(),
+        "Dense VQ INT4 compilation requires CUDA packed/codebook tensors");
+    const int tag = dense_vq_dtype_tag(static_cast<int>(bits));
+    const int vector = static_cast<int>(codebook.size(1));
+    const int64_t columns = blocks * vector;
+    const int64_t expected_bits = rows * blocks * bits;
+    TORCH_CHECK(
+        tag >= 0 && rows > 0 && blocks > 0 && vector > 0 &&
+        columns % 64 == 0 && expected_bits % 8 == 0 &&
+        packed.numel() == expected_bits / 8 &&
+        codebook.size(0) <= (int64_t{1} << bits),
+        "Dense VQ INT4 compilation metadata mismatch");
+    const int64_t groups = columns / 64;
+    auto output = torch::empty({rows, columns / 2}, packed.options());
+    auto scales = torch::empty(
+        {rows, groups}, packed.options().dtype(at::kHalf));
+    dense_vq_compile_int4_g64_kernel<<<
+        static_cast<unsigned>(rows), 256, 0,
+        at::cuda::getCurrentCUDAStream()>>>(
+            packed.data_ptr<uint8_t>(), codebook.data_ptr<float>(),
+            output.data_ptr<uint8_t>(),
+            reinterpret_cast<__half*>(scales.data_ptr<at::Half>()),
+            static_cast<int>(rows), static_cast<int>(blocks), vector, tag,
+            static_cast<int>(groups));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {output, scales};
+}
+
+
+torch::Tensor dense_vq_expand_fp8_tile_out(
+    torch::Tensor packed,
+    torch::Tensor fp8_codebook,
+    int64_t rows,
+    int64_t blocks,
+    int64_t bits,
+    int64_t row_start,
+    int64_t row_count,
+    torch::Tensor output)
+{
+    TORCH_CHECK(
+        packed.is_cuda() && fp8_codebook.is_cuda() && output.is_cuda(),
+        "Dense VQ FP8 tile operands must be CUDA tensors");
+    TORCH_CHECK(
+        packed.scalar_type() == at::kByte && packed.dim() == 1 &&
+        fp8_codebook.scalar_type() == at::ScalarType::Float8_e4m3fn &&
+        fp8_codebook.dim() == 2 &&
+        output.scalar_type() == at::ScalarType::Float8_e4m3fn &&
+        output.dim() == 2 && packed.is_contiguous() &&
+        fp8_codebook.is_contiguous() && output.is_contiguous(),
+        "Dense VQ FP8 tile operand layout mismatch");
+    const int tag = dense_vq_dtype_tag(static_cast<int>(bits));
+    const int vector = static_cast<int>(fp8_codebook.size(1));
+    const int64_t expected_bits = rows * blocks * bits;
+    TORCH_CHECK(
+        tag >= 0 && rows > 0 && blocks > 0 && vector > 0 &&
+        expected_bits % 8 == 0 && packed.numel() == expected_bits / 8 &&
+        fp8_codebook.size(0) > 0 &&
+        fp8_codebook.size(0) <= (int64_t{1} << bits) &&
+        row_start >= 0 && row_count > 0 && row_start + row_count <= rows &&
+        output.size(0) >= row_count && output.size(1) == blocks * vector,
+        "Dense VQ FP8 tile metadata/workspace mismatch");
+    const int device = packed.get_device();
+    TORCH_CHECK(
+        fp8_codebook.get_device() == device && output.get_device() == device,
+        "Dense VQ FP8 tile tensors must share one device");
+    const int64_t count = row_count * blocks;
+    dense_vq_expand_fp8_packed_kernel<<<
+        static_cast<unsigned>((count + 255) / 256), 256, 0,
+        at::cuda::getCurrentCUDAStream()>>>(
+            packed.data_ptr<uint8_t>(),
+            static_cast<const uint8_t*>(fp8_codebook.data_ptr()),
+            static_cast<uint8_t*>(output.data_ptr()),
+            row_count,
+            row_start,
+            blocks,
+            vector,
+            tag,
+            nullptr);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output.narrow(0, 0, row_count);
+}
+
+
+__global__ void dense_vq_mma_packed_m1_kernel(
+    const float* __restrict__ input,
+    const uint8_t* __restrict__ packed,
+    const __half* __restrict__ codebook,
+    float* __restrict__ output,
+    const int rows,
+    const int blocks,
+    const int vector,
+    const int dtype_tag)
+{
+    using namespace nvcuda;
+    constexpr int tile = 16;
+    const int lane = threadIdx.x;
+    const int row_start = static_cast<int>(blockIdx.x) * tile;
+    const int columns = blocks * vector;
+    const int64_t address = static_cast<int64_t>(
+        reinterpret_cast<uintptr_t>(packed));
+    __shared__ __align__(32) __half a_shared[tile * tile];
+    __shared__ __align__(32) __half b_shared[tile * tile];
+    __shared__ __align__(32) float c_shared[tile * tile];
+    wmma::fragment<wmma::matrix_a, tile, tile, tile, __half,
+                   wmma::row_major> a_fragment;
+    wmma::fragment<wmma::matrix_b, tile, tile, tile, __half,
+                   wmma::col_major> b_fragment;
+    wmma::fragment<wmma::accumulator, tile, tile, tile, float>
+        accumulator;
+    wmma::fill_fragment(accumulator, 0.0f);
+    for (int item = lane; item < tile * tile; item += 32)
+        a_shared[item] = __float2half_rn(0.0f);
+    __syncwarp();
+
+    for (int column_start = 0; column_start < columns;
+         column_start += tile) {
+        if (lane < tile)
+            a_shared[lane] = __float2half_rn(input[column_start + lane]);
+        const int code_blocks_per_row = tile / vector;
+        const int tile_code_blocks = tile * code_blocks_per_row;
+        for (int item = lane; item < tile_code_blocks; item += 32) {
+            // B is KxN and column-major. Each B column is one original
+            // output row. Packed VQ is decoded only into shared fragment
+            // staging and is never emitted as a global weight tile.
+            const int b_column = item / code_blocks_per_row;
+            const int local_block = item - b_column * code_blocks_per_row;
+            const int output_row = row_start + b_column;
+            const int source_block = column_start / vector + local_block;
+            if (output_row < rows) {
+                const int code = routed_index_value(
+                    address,
+                    dtype_tag,
+                    static_cast<long>(output_row) * blocks + source_block);
+                const __half* code_row =
+                    codebook + static_cast<long>(code) * vector;
+                const int destination =
+                    b_column * tile + local_block * vector;
+                for (int component = 0; component < vector; ++component)
+                    b_shared[destination + component] = code_row[component];
+            } else {
+                const int destination =
+                    b_column * tile + local_block * vector;
+                for (int component = 0; component < vector; ++component)
+                    b_shared[destination + component] =
+                        __float2half_rn(0.0f);
+            }
+        }
+        __syncwarp();
+        wmma::load_matrix_sync(a_fragment, a_shared, tile);
+        wmma::load_matrix_sync(b_fragment, b_shared, tile);
+        wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
+        __syncwarp();
+    }
+    wmma::store_matrix_sync(
+        c_shared, accumulator, tile, wmma::mem_row_major);
+    __syncwarp();
+    if (lane < tile && row_start + lane < rows)
+        output[row_start + lane] = c_shared[lane];
+}
+
+torch::Tensor dense_vq_mma_packed_m1(
+    torch::Tensor input,
+    torch::Tensor packed,
+    torch::Tensor codebook,
+    int64_t rows,
+    int64_t blocks,
+    int64_t bits)
+{
+#if defined(__HIP_PLATFORM_AMD__)
+    TORCH_CHECK(false, "Dense VQ direct MMA is unavailable on HIP");
+#else
+    TORCH_CHECK(
+        input.is_cuda() && packed.is_cuda() && codebook.is_cuda() &&
+        input.scalar_type() == at::kFloat && input.dim() == 2 &&
+        input.size(0) == 1 && input.is_contiguous() &&
+        packed.scalar_type() == at::kByte && packed.dim() == 1 &&
+        packed.is_contiguous() &&
+        codebook.scalar_type() == at::kHalf && codebook.dim() == 2 &&
+        codebook.is_contiguous(),
+        "Dense VQ direct MMA requires CUDA FP32 [1,C], packed uint8, "
+        "and FP16 codebook");
+    const int tag = dense_vq_dtype_tag(static_cast<int>(bits));
+    const int vector = static_cast<int>(codebook.size(1));
+    const int64_t columns = blocks * vector;
+    const int64_t expected_bits = rows * blocks * bits;
+    TORCH_CHECK(
+        tag >= 0 && rows > 0 && rows % 16 == 0 && blocks > 0 &&
+        vector > 0 && 16 % vector == 0 && columns % 16 == 0 &&
+        expected_bits % 8 == 0 &&
+        packed.numel() == expected_bits / 8 &&
+        input.size(1) == columns &&
+        codebook.size(0) <= (int64_t{1} << bits),
+        "Dense VQ direct MMA metadata mismatch");
+    auto output = torch::empty({1, rows}, input.options());
+    dense_vq_mma_packed_m1_kernel<<<
+        static_cast<unsigned>((rows + 15) / 16), 32, 0,
+        at::cuda::getCurrentCUDAStream()>>>(
+            input.data_ptr<float>(),
+            packed.data_ptr<uint8_t>(),
+            reinterpret_cast<const __half*>(codebook.data_ptr<at::Half>()),
+            output.data_ptr<float>(),
+            static_cast<int>(rows),
+            static_cast<int>(blocks),
+            vector,
+            tag);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+#endif
+}
+
+
 
 torch::Tensor dense_vq_dequant_packed(
     torch::Tensor packed,
@@ -12207,6 +12610,1274 @@ torch::Tensor int4_embedding_lookup_device_row(
     return output;
 }
 
+
+// ---------------------------------------------------------------------------
+// INT4 GEMV vector4-segmented — the measured best of both worlds:
+// v1 vector4's conflict-free lane layout (columns stride-2 inside 64-col
+// groups, 8 lanes per group, one shfl scale per subgroup) but the
+// activation is staged per 4096-column segment instead of the whole row,
+// cutting shared staging traffic ~4x for wide matrices.  Segments combine
+// through the v2 partial/reduce pair.  All-architecture LDG + FMA only.
+// ---------------------------------------------------------------------------
+__global__ void int4_gemv_v2_reduce_kernel(
+    const float* __restrict__ partial,
+    float* __restrict__ output,
+    const int rows,
+    const int segments);
+
+constexpr int kInt4V4SegCols = 4096;  // 64 groups per segment
+constexpr int kInt4V4Warps = 8;       // rows per block
+
+template <typename input_t>
+__global__ void int4_gemv_packed_f32_v4s_kernel(
+    const input_t* __restrict__ x,
+    const uint8_t* __restrict__ packed,
+    const __half* __restrict__ scales,
+    float* __restrict__ partial,
+    const int rows,
+    const int cols,
+    const int groups,
+    const int segments)
+{
+    __shared__ float shared_x[kInt4V4SegCols];
+    const int lane = threadIdx.x;
+    const int row = blockIdx.y * kInt4V4Warps + threadIdx.y;
+    const int seg = blockIdx.x;
+    const int col_base = seg * kInt4V4SegCols;
+    const int seg_cols = min(kInt4V4SegCols, cols - col_base);
+    if (seg_cols <= 0) return;
+    const int seg_groups = seg_cols >> 6;
+
+    // Stage only this segment's activation (16 KiB), 256 threads.
+    for (int c = threadIdx.y * 32 + lane; c < seg_cols; c += 256) {
+        shared_x[c] = vq_scalar_to_float(x + (long)(col_base + c));
+    }
+    __syncthreads();
+    if (row >= rows) return;
+
+    const int packed_cols = cols >> 1;
+    const uint8_t* packed_row =
+        packed + (long)row * packed_cols + (col_base >> 1);
+    const __half* scale_row = scales + (long)row * groups;
+
+    // v1 vector4 inner loop restricted to this segment's groups.
+    const int group_in_iteration = lane >> 3;
+    const int group_lane = lane & 7;
+    float acc0 = 0.f, acc1 = 0.f;
+    const int group_span = kInt4V4SegCols >> 6;  // 64
+    for (int gbase = seg * group_span;
+         gbase < seg * group_span + seg_groups; gbase += 8) {
+        const int g0 = gbase + group_in_iteration;
+        const int g1 = gbase + 4 + group_in_iteration;
+        float s0 = 0.f, s1 = 0.f;
+        if (group_lane == 0) {
+            if (g0 < seg * group_span + seg_groups)
+                s0 = __half2float(__ldg(scale_row + g0));
+            if (g1 < seg * group_span + seg_groups)
+                s1 = __half2float(__ldg(scale_row + g1));
+        }
+        s0 = __shfl_sync(0xffffffffu, s0, 0, 8);
+        s1 = __shfl_sync(0xffffffffu, s1, 0, 8);
+        if (g0 < seg * group_span + seg_groups) {
+            const uint32_t codes = __ldg(reinterpret_cast<const uint32_t*>(
+                packed_row + (g0 - seg * group_span) * 32 + group_lane * 4));
+            const int col = g0 * 64 + group_lane * 8 - col_base;
+            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&codes);
+#pragma unroll
+            for (int item = 0; item < 4; ++item) {
+                const uint8_t q = bytes[item];
+                acc0 = __fmaf_rn(
+                    static_cast<float>((q & 15) - 8) * s0,
+                    shared_x[col + item * 2], acc0);
+                acc0 = __fmaf_rn(
+                    static_cast<float>((q >> 4) - 8) * s0,
+                    shared_x[col + item * 2 + 1], acc0);
+            }
+        }
+        if (g1 < seg * group_span + seg_groups) {
+            const uint32_t codes = __ldg(reinterpret_cast<const uint32_t*>(
+                packed_row + (g1 - seg * group_span) * 32 + group_lane * 4));
+            const int col = g1 * 64 + group_lane * 8 - col_base;
+            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&codes);
+#pragma unroll
+            for (int item = 0; item < 4; ++item) {
+                const uint8_t q = bytes[item];
+                acc1 = __fmaf_rn(
+                    static_cast<float>((q & 15) - 8) * s1,
+                    shared_x[col + item * 2], acc1);
+                acc1 = __fmaf_rn(
+                    static_cast<float>((q >> 4) - 8) * s1,
+                    shared_x[col + item * 2 + 1], acc1);
+            }
+        }
+    }
+    float acc = acc0 + acc1;
+    acc = warp_sum_f32(acc);
+    if (lane == 0) {
+        partial[(long)row * segments + seg] = acc;
+    }
+}
+
+template <typename input_t>
+torch::Tensor int4_gemv_packed_f32_v4s(
+    torch::Tensor x,
+    torch::Tensor packed,
+    torch::Tensor scales,
+    int64_t rows,
+    int64_t cols,
+    int64_t groups)
+{
+    TORCH_CHECK(cols % 64 == 0, "v4s requires 64-column G64 groups");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int segments =
+        (int)((cols + kInt4V4SegCols - 1) / kInt4V4SegCols);
+    static torch::Tensor partial_cache;
+    const long needed = (long)rows * segments;
+    if (!partial_cache.defined() ||
+        partial_cache.device() != x.device() ||
+        partial_cache.numel() < needed) {
+        partial_cache = torch::empty(
+            {needed},
+            torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    }
+    torch::Tensor partial = partial_cache.narrow(0, 0, needed);
+    auto output = torch::empty(
+        {rows},
+        torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    dim3 block(32, kInt4V4Warps);
+    dim3 grid(segments, (unsigned)((rows + kInt4V4Warps - 1) / kInt4V4Warps));
+    int4_gemv_packed_f32_v4s_kernel<input_t><<<grid, block, 0, stream>>>(
+        reinterpret_cast<const input_t*>(x.data_ptr()),
+        packed.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half*>(scales.data_ptr()),
+        partial.data_ptr<float>(),
+        (int)rows, (int)cols, (int)groups, segments);
+    int4_gemv_v2_reduce_kernel<<<(unsigned)rows, 32, 0, stream>>>(
+        partial.data_ptr<float>(),
+        output.data_ptr<float>(),
+        (int)rows, segments);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+__device__ __forceinline__ uint32_t half2_bits_m(__half2 v)
+{
+    return *reinterpret_cast<uint32_t*>(&v);
+}
+__device__ __forceinline__ uint32_t h2_m(__half lo, __half hi)
+{
+    uint32_t v;
+    asm("mov.b32 %0, {%1, %2};" : "=r"(v) : "h"(__half_as_ushort(lo)),
+        "h"(__half_as_ushort(hi)));
+    return v;
+}
+__device__ __forceinline__ void mma_m16n8k16_m(
+    const uint32_t* a, const uint32_t* b, float* c0, float* c1)
+{
+    float c[4] = {*c0, *c1, 0.f, 0.f};
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+    *c0 = c[0];
+    *c1 = c[1];
+}
+__global__ void marlin_reduce_kernel_g(
+    const float* __restrict__ partial,
+    float* __restrict__ output,
+    int rows,
+    int slices)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    float acc = 0.f;
+    for (int s = 0; s < slices; ++s) acc += partial[(long)row * slices + s];
+    output[row] = acc;
+}
+
+// ---------------------------------------------------------------------------
+// INT4 GEMV v17 — marlin superstep tiles + FMA + shared-x (SM75+).
+// Same repacked layout as int4_gemv_marlin (one uint32 per lane per
+// 32-column superstep), tensor-core path replaced by eight FMAs against
+// conflict-free shared-x; per-4-lane-group reduction (one group = one row).
+// Measured 731 GB/s @5120x17408, 1000 GB/s @248320x5120 on H20.
+// ---------------------------------------------------------------------------
+__global__ void int4_repack_v21_kernel(
+    const uint8_t* __restrict__ src,
+    uint32_t* __restrict__ dst,
+    const int rows,
+    const int cols)
+{
+    const long total = (((long)rows + 7) / 8) * (cols / 128) * 128;
+    for (long w = blockIdx.x * (long)blockDim.x + threadIdx.x;
+         w < total; w += (long)gridDim.x * blockDim.x) {
+        const int intra = (int)(w & 127);
+        const long tile = w >> 7;
+        const int groups_k = cols / 128;           // 4-superstep groups
+        const int sg = (int)(tile % groups_k);
+        const int tile_n = (int)(tile / groups_k);
+        // v21 interleave: intra = j*16 + i*4 + u, so four consecutive
+        // words (a lane's uint4) cover supersteps tile_k+0..3 at the same
+        // (j, i) position.
+        const int j = intra >> 4;
+        const int i = (intra >> 2) & 3;
+        const int u = intra & 3;
+        const int row = tile_n * 8 + j;
+        uint32_t out = 0u;
+        if (row < rows) {
+            const uint8_t* srow = src + (long)row * (cols >> 1) + (sg * 4 + u) * 16;
+            out = (uint32_t)srow[i] | ((uint32_t)srow[i + 4] << 8) |
+                  ((uint32_t)srow[i + 8] << 16) | ((uint32_t)srow[i + 12] << 24);
+        }
+        dst[w] = out;
+    }
+}
+
+constexpr int V21_SLICE = 2048;
+
+__global__ void int4_gemv_v21_kernel(
+    const float* __restrict__ x,
+    const uint32_t* __restrict__ repacked,
+    const __half* __restrict__ scales,
+    float* __restrict__ partial,
+    const int rows,
+    const int cols,
+    const int groups,
+    const int slices)
+{
+    extern __shared__ float sx[];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int slice = blockIdx.x;
+    const int k0 = slice * V21_SLICE;
+    const int here = min(V21_SLICE, cols - k0);
+    if (here <= 0) return;
+    for (int c = threadIdx.x; c < here; c += 128) {
+        sx[c] = x[k0 + c];
+    }
+    __syncthreads();
+    const int row0 = (blockIdx.y * 4 + warp) * 8;
+    if (row0 >= rows) return;
+    const int j = lane >> 2;
+    const int i = lane & 3;
+    const int row = row0 + j;
+    const __half* srow = scales + (long)row * groups;
+    const int groups_k = cols >> 7;
+    const uint32_t* base = repacked +
+        ((((long)(row0 >> 3)) * groups_k + (k0 >> 7)) << 7);
+
+    // v21: one uint4 per lane covers four supersteps at the same (j, i);
+    // intra layout [sg][j][i][u] makes those four words contiguous.
+    float p[32];
+#pragma unroll
+    for (int u = 0; u < 32; ++u) p[u] = 0.f;
+    const int ss = here >> 5;
+    const uint32_t* base_li = base + (lane >> 2) * 16 + (lane & 3) * 4;
+    int sg = 0;
+    for (; sg + 4 <= (ss >> 2); sg += 4) {
+        const uint4 pw[4] = {
+            *reinterpret_cast<const uint4*>(base_li + (sg << 7)),
+            *reinterpret_cast<const uint4*>(base_li + ((sg + 1) << 7)),
+            *reinterpret_cast<const uint4*>(base_li + ((sg + 2) << 7)),
+            *reinterpret_cast<const uint4*>(base_li + ((sg + 3) << 7)),
+        };
+        const uint32_t wv[16] = {
+            pw[0].x, pw[0].y, pw[0].z, pw[0].w,
+            pw[1].x, pw[1].y, pw[1].z, pw[1].w,
+            pw[2].x, pw[2].y, pw[2].z, pw[2].w,
+            pw[3].x, pw[3].y, pw[3].z, pw[3].w,
+        };
+#pragma unroll
+        for (int s2 = 0; s2 < 16; ++s2) {
+            const int ts = sg * 4 + s2;
+            const int ca = ts << 5;
+            const float sa = __half2float(
+                __ldg(srow + ((k0 + ca + 2 * i) >> 6)));
+            const uint32_t w = wv[s2];
+            const uint32_t b0 = w & 0xFF, b1 = (w >> 8) & 0xFF;
+            const uint32_t b2 = (w >> 16) & 0xFF, b3 = (w >> 24) & 0xFF;
+            p[s2 * 2] = __fmaf_rn(static_cast<float>((int)(b0 & 15) - 8) * sa, sx[ca + 2 * i], p[s2 * 2]);
+            p[s2 * 2] = __fmaf_rn(static_cast<float>((int)(b0 >> 4) - 8) * sa, sx[ca + 2 * i + 1], p[s2 * 2]);
+            p[s2 * 2 + 1] = __fmaf_rn(static_cast<float>((int)(b1 & 15) - 8) * sa, sx[ca + 2 * i + 8], p[s2 * 2 + 1]);
+            p[s2 * 2 + 1] = __fmaf_rn(static_cast<float>((int)(b1 >> 4) - 8) * sa, sx[ca + 2 * i + 9], p[s2 * 2 + 1]);
+            p[s2 * 2] = __fmaf_rn(static_cast<float>((int)(b2 & 15) - 8) * sa, sx[ca + 2 * i + 16], p[s2 * 2]);
+            p[s2 * 2] = __fmaf_rn(static_cast<float>((int)(b2 >> 4) - 8) * sa, sx[ca + 2 * i + 17], p[s2 * 2]);
+            p[s2 * 2 + 1] = __fmaf_rn(static_cast<float>((int)(b3 & 15) - 8) * sa, sx[ca + 2 * i + 24], p[s2 * 2 + 1]);
+            p[s2 * 2 + 1] = __fmaf_rn(static_cast<float>((int)(b3 >> 4) - 8) * sa, sx[ca + 2 * i + 25], p[s2 * 2 + 1]);
+        }
+    }
+    for (int ts2 = sg; ts2 < (ss >> 2); ++ts2) {
+        const uint4 pw = *reinterpret_cast<const uint4*>(base_li + (ts2 << 7));
+        const uint32_t wt[4] = {pw.x, pw.y, pw.z, pw.w};
+        for (int u2 = 0; u2 < 4; ++u2) {
+        const int ts = ts2 * 4 + u2;
+        const uint32_t w = wt[u2];
+        const int ca = ts << 5;
+        const float sa = __half2float(__ldg(srow + ((k0 + ca + 2 * i) >> 6)));
+        const uint32_t b0 = w & 0xFF, b1 = (w >> 8) & 0xFF;
+        const uint32_t b2 = (w >> 16) & 0xFF, b3 = (w >> 24) & 0xFF;
+        p[0] = __fmaf_rn(static_cast<float>((int)(b0 & 15) - 8) * sa, sx[ca + 2 * i], p[0]);
+        p[0] = __fmaf_rn(static_cast<float>((int)(b0 >> 4) - 8) * sa, sx[ca + 2 * i + 1], p[0]);
+        p[1] = __fmaf_rn(static_cast<float>((int)(b1 & 15) - 8) * sa, sx[ca + 2 * i + 8], p[1]);
+        p[1] = __fmaf_rn(static_cast<float>((int)(b1 >> 4) - 8) * sa, sx[ca + 2 * i + 9], p[1]);
+        p[0] = __fmaf_rn(static_cast<float>((int)(b2 & 15) - 8) * sa, sx[ca + 2 * i + 16], p[0]);
+        p[0] = __fmaf_rn(static_cast<float>((int)(b2 >> 4) - 8) * sa, sx[ca + 2 * i + 17], p[0]);
+        p[1] = __fmaf_rn(static_cast<float>((int)(b3 & 15) - 8) * sa, sx[ca + 2 * i + 24], p[1]);
+        p[1] = __fmaf_rn(static_cast<float>((int)(b3 >> 4) - 8) * sa, sx[ca + 2 * i + 25], p[1]);
+        }
+    }
+    float acc = 0.f;
+#pragma unroll
+    for (int u = 0; u < 32; ++u) acc += p[u];
+#pragma unroll
+    for (int off = 1; off < 4; off <<= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, off, 4);
+    }
+    if (row < rows && (lane & 3) == 0) {
+        partial[(long)row * slices + slice] = acc;
+    }
+}
+
+
+__global__ void int4_v21_reduce(
+    const float* __restrict__ partial,
+    float* __restrict__ output,
+    const int rows,
+    const int slices)
+{
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    float acc = 0.f;
+    for (int s = 0; s < slices; ++s) acc += partial[(long)row * slices + s];
+    output[row] = acc;
+}
+
+torch::Tensor int4_repack_v21(torch::Tensor packed, int64_t rows, int64_t cols)
+{
+    const long words = (((long)rows + 7) / 8) * (cols / 128) * 128;
+    auto dst = torch::empty(
+        {words * 4},
+        torch::TensorOptions().dtype(torch::kUInt8).device(packed.device()));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int blocks = (int)((words + 255) / 256 > 4096 ? 4096 : (words + 255) / 256);
+    int4_repack_v21_kernel<<<blocks, 256, 0, stream>>>(
+        packed.data_ptr<uint8_t>(),
+        reinterpret_cast<uint32_t*>(dst.data_ptr()),
+        (int)rows, (int)cols);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return dst;
+}
+
+torch::Tensor int4_gemv_v21(
+    torch::Tensor x,
+    torch::Tensor repacked,
+    torch::Tensor scales,
+    int64_t rows,
+    int64_t cols,
+    int64_t groups)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int slices = (int)((cols + V21_SLICE - 1) / V21_SLICE);
+    static torch::Tensor pc;
+    const long needed = (long)rows * slices;
+    if (!pc.defined() || pc.numel() < needed || pc.device() != x.device()) {
+        pc = torch::empty(
+            {needed}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    }
+    torch::Tensor partial = pc.narrow(0, 0, needed);
+    auto output = torch::empty(
+        {rows}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    dim3 grid(slices, (unsigned)(((rows / 8) + 3) / 4));
+    int4_gemv_v21_kernel<<<grid, 128, V21_SLICE * sizeof(float), stream>>>(
+        x.data_ptr<float>(),
+        reinterpret_cast<const uint32_t*>(repacked.data_ptr()),
+        reinterpret_cast<const __half*>(scales.data_ptr()),
+        partial.data_ptr<float>(), (int)rows, (int)cols, (int)groups, slices);
+    int4_v21_reduce<<<(rows + 255) / 256, 256, 0, stream>>>(
+        partial.data_ptr<float>(), output.data_ptr<float>(), (int)rows, slices);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+__global__ void int4_repack_v21b_kernel(
+    const uint8_t* __restrict__ src,
+    uint32_t* __restrict__ dst,
+    const int rows,
+    const int cols)
+{
+    const long total = (((long)rows + 7) / 8) * (cols / 128) * 128;
+    for (long w = blockIdx.x * (long)blockDim.x + threadIdx.x;
+         w < total; w += (long)gridDim.x * blockDim.x) {
+        const int intra = (int)(w & 127);
+        const long tile = w >> 7;
+        const int groups_k = cols / 128;
+        const int sg = (int)(tile % groups_k);
+        const int tile_n = (int)(tile / groups_k);
+        const int j = intra >> 4;
+        const int i = (intra >> 2) & 3;
+        const int u = intra & 3;
+        const int row = tile_n * 8 + j;
+        uint32_t out = 0u;
+        if (row < rows) {
+            const uint8_t* srow = src + (long)row * (cols >> 1) + (sg * 4 + u) * 16;
+            out = (uint32_t)srow[i] | ((uint32_t)srow[i + 4] << 8) |
+                  ((uint32_t)srow[i + 8] << 16) | ((uint32_t)srow[i + 12] << 24);
+        }
+        dst[w] = out;
+    }
+}
+
+constexpr int V21B_SLICE = 2048;
+constexpr int V21B_MAXB = 5;
+
+__global__ void int4_gemv_v21b_kernel(
+    const float* __restrict__ x,          // [B, cols]
+    const uint32_t* __restrict__ repacked,
+    const __half* __restrict__ scales,
+    float* __restrict__ partial,          // [B, rows, slices]
+    const int rows,
+    const int cols,
+    const int groups,
+    const int slices,
+    const int B)
+{
+    extern __shared__ float sxB[];        // [V21B_MAXB][V21B_SLICE]
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int slice = blockIdx.x;
+    const int k0 = slice * V21B_SLICE;
+    const int here = min(V21B_SLICE, cols - k0);
+    if (here <= 0) return;
+    for (int idx = threadIdx.x; idx < B * here; idx += 128) {
+        const int b = idx / here;
+        const int c = idx % here;
+        sxB[b * V21B_SLICE + c] = x[(long)b * cols + k0 + c];
+    }
+    __syncthreads();
+    const int row0 = (blockIdx.y * 4 + warp) * 8;
+    if (row0 >= rows) return;
+    const int j = lane >> 2;
+    const int i = lane & 3;
+    const int row = row0 + j;
+    const __half* srow = scales + (long)row * groups;
+    const int groups_k = cols >> 7;
+    const uint32_t* base = repacked +
+        ((((long)(row0 >> 3)) * groups_k + (k0 >> 7)) << 7);
+    const uint32_t* base_li = base + (lane >> 2) * 16 + (lane & 3) * 4;
+
+    float acc[V21B_MAXB][32];
+#pragma unroll
+    for (int b = 0; b < V21B_MAXB; ++b)
+#pragma unroll
+        for (int u = 0; u < 32; ++u) acc[b][u] = 0.f;
+
+    const int ss = here >> 5;
+    int sg = 0;
+    for (; sg + 4 <= (ss >> 2); sg += 4) {
+        const uint4 pw[4] = {
+            *reinterpret_cast<const uint4*>(base_li + (sg << 7)),
+            *reinterpret_cast<const uint4*>(base_li + ((sg + 1) << 7)),
+            *reinterpret_cast<const uint4*>(base_li + ((sg + 2) << 7)),
+            *reinterpret_cast<const uint4*>(base_li + ((sg + 3) << 7)),
+        };
+        const uint32_t wv[16] = {
+            pw[0].x, pw[0].y, pw[0].z, pw[0].w,
+            pw[1].x, pw[1].y, pw[1].z, pw[1].w,
+            pw[2].x, pw[2].y, pw[2].z, pw[2].w,
+            pw[3].x, pw[3].y, pw[3].z, pw[3].w,
+        };
+#pragma unroll
+        for (int s2 = 0; s2 < 16; ++s2) {
+            const int ts = sg * 4 + s2;
+            const int ca = ts << 5;
+            const float sa = __half2float(
+                __ldg(srow + ((k0 + ca + 2 * i) >> 6)));
+            const uint32_t w = wv[s2];
+            const uint32_t b0 = w & 0xFF, b1 = (w >> 8) & 0xFF;
+            const uint32_t b2 = (w >> 16) & 0xFF, b3 = (w >> 24) & 0xFF;
+#pragma unroll
+            for (int b = 0; b < V21B_MAXB; ++b) {
+                if (b >= B) break;
+                const float* xb = sxB + b * V21B_SLICE;
+                const int a2 = s2 * 2;
+                acc[b][a2] = __fmaf_rn(static_cast<float>((int)(b0 & 15) - 8) * sa, xb[ca + 2 * i], acc[b][a2]);
+                acc[b][a2] = __fmaf_rn(static_cast<float>((int)(b0 >> 4) - 8) * sa, xb[ca + 2 * i + 1], acc[b][a2]);
+                acc[b][a2 + 1] = __fmaf_rn(static_cast<float>((int)(b1 & 15) - 8) * sa, xb[ca + 2 * i + 8], acc[b][a2 + 1]);
+                acc[b][a2 + 1] = __fmaf_rn(static_cast<float>((int)(b1 >> 4) - 8) * sa, xb[ca + 2 * i + 9], acc[b][a2 + 1]);
+                acc[b][a2] = __fmaf_rn(static_cast<float>((int)(b2 & 15) - 8) * sa, xb[ca + 2 * i + 16], acc[b][a2]);
+                acc[b][a2] = __fmaf_rn(static_cast<float>((int)(b2 >> 4) - 8) * sa, xb[ca + 2 * i + 17], acc[b][a2]);
+                acc[b][a2 + 1] = __fmaf_rn(static_cast<float>((int)(b3 & 15) - 8) * sa, xb[ca + 2 * i + 24], acc[b][a2 + 1]);
+                acc[b][a2 + 1] = __fmaf_rn(static_cast<float>((int)(b3 >> 4) - 8) * sa, xb[ca + 2 * i + 25], acc[b][a2 + 1]);
+            }
+        }
+    }
+    for (int ts2 = sg; ts2 < (ss >> 2); ++ts2) {
+        const uint4 pw = *reinterpret_cast<const uint4*>(base_li + (ts2 << 7));
+        const uint32_t wt[4] = {pw.x, pw.y, pw.z, pw.w};
+        for (int u2 = 0; u2 < 4; ++u2) {
+            const int ts = ts2 * 4 + u2;
+            const int ca = ts << 5;
+            const float sa = __half2float(
+                __ldg(srow + ((k0 + ca + 2 * i) >> 6)));
+            const uint32_t w = wt[u2];
+            const uint32_t b0 = w & 0xFF, b1 = (w >> 8) & 0xFF;
+            const uint32_t b2 = (w >> 16) & 0xFF, b3 = (w >> 24) & 0xFF;
+#pragma unroll
+            for (int b = 0; b < V21B_MAXB; ++b) {
+                if (b >= B) break;
+                const float* xb = sxB + b * V21B_SLICE;
+                acc[b][u2 * 2] = __fmaf_rn(static_cast<float>((int)(b0 & 15) - 8) * sa, xb[ca + 2 * i], acc[b][u2 * 2]);
+                acc[b][u2 * 2] = __fmaf_rn(static_cast<float>((int)(b0 >> 4) - 8) * sa, xb[ca + 2 * i + 1], acc[b][u2 * 2]);
+                acc[b][u2 * 2 + 1] = __fmaf_rn(static_cast<float>((int)(b1 & 15) - 8) * sa, xb[ca + 2 * i + 8], acc[b][u2 * 2 + 1]);
+                acc[b][u2 * 2 + 1] = __fmaf_rn(static_cast<float>((int)(b1 >> 4) - 8) * sa, xb[ca + 2 * i + 9], acc[b][u2 * 2 + 1]);
+                acc[b][u2 * 2] = __fmaf_rn(static_cast<float>((int)(b2 & 15) - 8) * sa, xb[ca + 2 * i + 16], acc[b][u2 * 2]);
+                acc[b][u2 * 2] = __fmaf_rn(static_cast<float>((int)(b2 >> 4) - 8) * sa, xb[ca + 2 * i + 17], acc[b][u2 * 2]);
+                acc[b][u2 * 2 + 1] = __fmaf_rn(static_cast<float>((int)(b3 & 15) - 8) * sa, xb[ca + 2 * i + 24], acc[b][u2 * 2 + 1]);
+                acc[b][u2 * 2 + 1] = __fmaf_rn(static_cast<float>((int)(b3 >> 4) - 8) * sa, xb[ca + 2 * i + 25], acc[b][u2 * 2 + 1]);
+            }
+        }
+    }
+#pragma unroll
+    for (int b = 0; b < V21B_MAXB; ++b) {
+        if (b >= B) break;
+        float accf = 0.f;
+#pragma unroll
+        for (int u = 0; u < 32; ++u) accf += acc[b][u];
+#pragma unroll
+        for (int off = 1; off < 4; off <<= 1) {
+            accf += __shfl_xor_sync(0xffffffffu, accf, off, 4);
+        }
+        if (row < rows && (lane & 3) == 0) {
+            partial[(((long)b * rows) + row) * slices + slice] = accf;
+        }
+    }
+}
+
+__global__ void int4_v21b_reduce(
+    const float* __restrict__ partial,
+    float* __restrict__ output,           // [B, rows]
+    const int rows,
+    const int slices,
+    const int B)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = B * rows;
+    if (idx >= total) return;
+    const int b = idx / rows;
+    const int row = idx % rows;
+    float acc = 0.f;
+    for (int s = 0; s < slices; ++s) {
+        acc += partial[((long)b * rows + row) * slices + s];
+    }
+    output[idx] = acc;
+}
+
+torch::Tensor int4_repack_v21b(torch::Tensor packed, int64_t rows, int64_t cols)
+{
+    const long words = (((long)rows + 7) / 8) * (cols / 128) * 128;
+    auto dst = torch::empty(
+        {words * 4},
+        torch::TensorOptions().dtype(torch::kUInt8).device(packed.device()));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int blocks = (int)((words + 255) / 256 > 4096 ? 4096 : (words + 255) / 256);
+    int4_repack_v21b_kernel<<<blocks, 256, 0, stream>>>(
+        packed.data_ptr<uint8_t>(),
+        reinterpret_cast<uint32_t*>(dst.data_ptr()),
+        (int)rows, (int)cols);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return dst;
+}
+
+torch::Tensor int4_gemv_v21b(
+    torch::Tensor x,                      // [B, cols]
+    torch::Tensor repacked,
+    torch::Tensor scales,
+    int64_t rows,
+    int64_t cols,
+    int64_t groups)
+{
+    const int B = (int)x.size(0);
+    TORCH_CHECK(B >= 1 && B <= V21B_MAXB, "batch 1..5");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int slices = (int)((cols + V21B_SLICE - 1) / V21B_SLICE);
+    static torch::Tensor pc;
+    const long needed = (long)B * rows * slices;
+    if (!pc.defined() || pc.numel() < needed || pc.device() != x.device()) {
+        pc = torch::empty(
+            {needed}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    }
+    torch::Tensor partial = pc.narrow(0, 0, needed);
+    auto output = torch::empty(
+        {B, rows}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    dim3 grid(slices, (unsigned)(((rows / 8) + 3) / 4));
+    int4_gemv_v21b_kernel<<<grid, 128, V21B_MAXB * V21B_SLICE * sizeof(float), stream>>>(
+        x.data_ptr<float>(),
+        reinterpret_cast<const uint32_t*>(repacked.data_ptr()),
+        reinterpret_cast<const __half*>(scales.data_ptr()),
+        partial.data_ptr<float>(),
+        (int)rows, (int)cols, (int)groups, slices, B);
+    int4_v21b_reduce<<<(B * rows + 255) / 256, 256, 0, stream>>>(
+        partial.data_ptr<float>(), output.data_ptr<float>(),
+        (int)rows, slices, B);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+constexpr int V1B_MAXB = 5;
+constexpr int V1B_SLICE = 4096;   // per-slice shared: B*4096*4B <= 80KB
+
+// 命名避开文件头部 #define ROWS_PER_BLOCK 32（宏会让模板参数被展开成字面量）。
+// 逐 token 路径实际走 vector4 kernel（groups%4==0 时）：每 lane 负责一个
+// group（lane>>3），组内 4 字节连乘，warp_sum_f32 归约。v1b 必须逐位复刻
+// 该求和顺序，MTP fast-top3 的严格贪心比较才不被舍入差异翻转。
+template <int V1B_RPB>
+__global__ void int4_gemv_v1b_kernel(
+    const float* __restrict__ x,          // [B, cols]
+    const uint8_t* __restrict__ packed,   // [rows, cols/2]
+    const __half* __restrict__ scales,    // [rows, groups]
+    float* __restrict__ output,           // [B, rows]
+    const int rows,
+    const int cols,
+    const int groups,
+    const int B)
+{
+    extern __shared__ float sx[];         // [B][V1B_SLICE]
+    const int lane = threadIdx.x;
+    const int row = blockIdx.x * V1B_RPB + threadIdx.y;
+    if (row >= rows) return;
+    const int packed_cols = cols >> 1;
+    const uint8_t* qrow = packed + (long)row * packed_cols;
+    const __half* srow = scales + (long)row * groups;
+    const int slice_groups = V1B_SLICE >> 6;   // 64（64%4==0，组对齐保持）
+    const int slices = (cols + V1B_SLICE - 1) / V1B_SLICE;
+    const int group_in_iteration = lane >> 3;
+    const int group_lane = lane & 7;
+
+    float accs[V1B_MAXB];
+#pragma unroll
+    for (int b = 0; b < V1B_MAXB; ++b) accs[b] = 0.f;
+
+    for (int slice = 0; slice < slices; ++slice) {
+        const int g0 = slice * slice_groups;
+        const int g1 = min(groups, g0 + slice_groups);
+        const int here = (min(cols, (g1 << 6)) - (g0 << 6));
+        // Stage this slice's activations for all B rows.  增量式推进
+        // b/k，避免每个元素做除法/取模。
+        const int stride = 32 * V1B_RPB;
+        const int linear = threadIdx.y * 32 + lane;
+        for (int c = linear; c < B * here; c += stride) {
+            int b = c / here;
+            int k = c - b * here;
+            sx[b * V1B_SLICE + k] = __ldg(
+                x + (long)b * cols + (g0 << 6) + k);
+        }
+        __syncthreads();
+        for (int group_base = g0; group_base < g1; group_base += 4) {
+            // 尾部不足 4 组时：越界段 scale=0 且 group/col 夹回有效范围，
+            // 使 fma 贡献恰为 0，同时保证 __shfl_sync 全 warp 参与。
+            const bool live =
+                group_base + group_in_iteration < g1;
+            const int group = live
+                ? group_base + group_in_iteration
+                : g1 - 1;
+            float scale = group_lane == 0 && live
+                ? __half2float(srow[group])
+                : 0.f;
+            scale = __shfl_sync(0xffffffffu, scale, 0, 8);
+            const uint32_t codes = __ldg(
+                reinterpret_cast<const uint32_t*>(
+                    qrow + group * 32 + group_lane * 4));
+            const int col_begin =
+                group * 64 + group_lane * 8 - (g0 << 6);
+            // 先预取本组全部 x 向量（10×float4），再进 FMA 链——
+            // 打断 LDS→FFMA 的串行依赖。
+            float4 xbuf[2][V1B_MAXB];
+#pragma unroll
+            for (int half4 = 0; half4 < 2; ++half4) {
+                const int col = col_begin + half4 * 4;
+#pragma unroll
+                for (int b = 0; b < V1B_MAXB; ++b) {
+                    xbuf[half4][b] = *reinterpret_cast<const float4*>(
+                        sx + b * V1B_SLICE + col);
+                }
+            }
+#pragma unroll
+            for (int half4 = 0; half4 < 2; ++half4) {
+                const uint16_t pair = static_cast<uint16_t>(
+                    codes >> (half4 * 16));
+                const uint8_t byte_a = static_cast<uint8_t>(pair);
+                const uint8_t byte_b = static_cast<uint8_t>(pair >> 8);
+                // 乘数顺序与 vector4 的 item 循环一致：c0..c7 逐列推进。
+                const float m0 = __fmul_rn(
+                    static_cast<float>((byte_a & 15) - 8), scale);
+                const float m1 = __fmul_rn(
+                    static_cast<float>((byte_a >> 4) - 8), scale);
+                const float m2 = __fmul_rn(
+                    static_cast<float>((byte_b & 15) - 8), scale);
+                const float m3 = __fmul_rn(
+                    static_cast<float>((byte_b >> 4) - 8), scale);
+                // b 维全程无分支（B<5 时多算的槽位不写回）。
+#pragma unroll
+                for (int b = 0; b < V1B_MAXB; ++b) {
+                    const float4 xv = xbuf[half4][b];
+                    accs[b] = __fmaf_rn(m0, xv.x, accs[b]);
+                    accs[b] = __fmaf_rn(m1, xv.y, accs[b]);
+                    accs[b] = __fmaf_rn(m2, xv.z, accs[b]);
+                    accs[b] = __fmaf_rn(m3, xv.w, accs[b]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int b = 0; b < V1B_MAXB; ++b) {
+        float acc = accs[b];
+        acc += __shfl_down_sync(0xffffffffu, acc, 16);
+        acc += __shfl_down_sync(0xffffffffu, acc, 8);
+        acc += __shfl_down_sync(0xffffffffu, acc, 4);
+        acc += __shfl_down_sync(0xffffffffu, acc, 2);
+        acc += __shfl_down_sync(0xffffffffu, acc, 1);
+        if (lane == 0 && b < B) {
+            output[(long)b * rows + row] = acc;
+        }
+    }
+}
+
+torch::Tensor int4_gemv_v1b(
+    torch::Tensor x,                      // [B, cols] fp32
+    torch::Tensor packed,
+    torch::Tensor scales,
+    int64_t rows,
+    int64_t cols,
+    int64_t groups)
+{
+    const int B = (int)x.size(0);
+    TORCH_CHECK(B >= 1 && B <= V1B_MAXB, "batch 1..5");
+    TORCH_CHECK(cols % 64 == 0, "cols%64");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto output = torch::empty(
+        {B, rows}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    // 固定按 V1B_MAXB 槽位分配：b>=B 的槽位读未写共享（结果不写回），
+    // 换取计算段无分支；80KB 仍允许 2 block/SM。
+    const size_t shared = (size_t)V1B_MAXB * V1B_SLICE * sizeof(float);
+    static size_t configured = 0;
+    if (configured < shared) {
+        auto set_attr = [&](auto kernel) {
+            cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                (int)shared);
+        };
+        set_attr(int4_gemv_v1b_kernel<32>);
+        set_attr(int4_gemv_v1b_kernel<16>);
+        set_attr(int4_gemv_v1b_kernel<8>);
+        configured = shared;
+    }
+    const int rpb = rows >= 4096 ? 32 : (rows >= 2048 ? 16 : 8);
+    if (rpb == 32) {
+        int4_gemv_v1b_kernel<32><<<(rows + 31) / 32, dim3(32, 32), shared, stream>>>(
+            x.data_ptr<float>(), packed.data_ptr<uint8_t>(),
+            reinterpret_cast<const __half*>(scales.data_ptr()),
+            output.data_ptr<float>(), (int)rows, (int)cols, (int)groups, B);
+    } else if (rpb == 16) {
+        int4_gemv_v1b_kernel<16><<<(rows + 15) / 16, dim3(32, 16), shared, stream>>>(
+            x.data_ptr<float>(), packed.data_ptr<uint8_t>(),
+            reinterpret_cast<const __half*>(scales.data_ptr()),
+            output.data_ptr<float>(), (int)rows, (int)cols, (int)groups, B);
+    } else {
+        int4_gemv_v1b_kernel<8><<<(rows + 7) / 8, dim3(32, 8), shared, stream>>>(
+            x.data_ptr<float>(), packed.data_ptr<uint8_t>(),
+            reinterpret_cast<const __half*>(scales.data_ptr()),
+            output.data_ptr<float>(), (int)rows, (int)cols, (int)groups, B);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+constexpr int V17_SLICE = 2048;
+
+__global__ void int4_gemv_v17_kernel(
+    const float* __restrict__ x,
+    const uint32_t* __restrict__ repacked,
+    const __half* __restrict__ scales,
+    float* __restrict__ partial,
+    const int rows,
+    const int cols,
+    const int groups,
+    const int slices)
+{
+    extern __shared__ float sx[];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int slice = blockIdx.x;
+    const int k0 = slice * V17_SLICE;
+    const int here = min(V17_SLICE, cols - k0);
+    if (here <= 0) return;
+    for (int c = threadIdx.x; c < here; c += 128) {
+        sx[c] = x[k0 + c];
+    }
+    __syncthreads();
+    const int row0 = (blockIdx.y * 4 + warp) * 8;
+    if (row0 >= rows) return;
+    const int j = lane >> 2;
+    const int i = lane & 3;
+    const int row = row0 + j;
+    const __half* srow = scales + (long)row * groups;
+    const int tiles_k = cols >> 5;
+    const uint32_t* base = repacked +
+        ((((long)(row0 >> 3)) * tiles_k + (k0 >> 5)) << 5);
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+    for (int ts = 0; ts < (here >> 5); ++ts) {
+        const uint32_t w = __ldg(base + (ts << 5) + lane);
+        const int col0 = ts << 5;
+        const float sc = __half2float(__ldg(srow + ((k0 + col0 + 2 * i) >> 6)));
+        const uint32_t b0 = w & 0xFF;
+        const uint32_t b1 = (w >> 8) & 0xFF;
+        const uint32_t b2 = (w >> 16) & 0xFF;
+        const uint32_t b3 = (w >> 24) & 0xFF;
+        a0 = __fmaf_rn(static_cast<float>((int)(b0 & 15) - 8) * sc, sx[col0 + 2 * i], a0);
+        a0 = __fmaf_rn(static_cast<float>((int)(b0 >> 4) - 8) * sc, sx[col0 + 2 * i + 1], a0);
+        a1 = __fmaf_rn(static_cast<float>((int)(b1 & 15) - 8) * sc, sx[col0 + 2 * i + 8], a1);
+        a1 = __fmaf_rn(static_cast<float>((int)(b1 >> 4) - 8) * sc, sx[col0 + 2 * i + 9], a1);
+        a2 = __fmaf_rn(static_cast<float>((int)(b2 & 15) - 8) * sc, sx[col0 + 2 * i + 16], a2);
+        a2 = __fmaf_rn(static_cast<float>((int)(b2 >> 4) - 8) * sc, sx[col0 + 2 * i + 17], a2);
+        a3 = __fmaf_rn(static_cast<float>((int)(b3 & 15) - 8) * sc, sx[col0 + 2 * i + 24], a3);
+        a3 = __fmaf_rn(static_cast<float>((int)(b3 >> 4) - 8) * sc, sx[col0 + 2 * i + 25], a3);
+    }
+    float acc = (a0 + a1) + (a2 + a3);
+#pragma unroll
+    for (int off = 1; off < 4; off <<= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, off, 4);
+    }
+    if (row < rows && (lane & 3) == 0) {
+        partial[(long)row * slices + slice] = acc;
+    }
+}
+
+torch::Tensor int4_gemv_v17(
+    torch::Tensor x,
+    torch::Tensor repacked,
+    torch::Tensor scales,
+    int64_t rows,
+    int64_t cols,
+    int64_t groups)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int slices = (int)((cols + V17_SLICE - 1) / V17_SLICE);
+    static torch::Tensor pc;
+    const long needed = (long)rows * slices;
+    if (!pc.defined() || pc.numel() < needed || pc.device() != x.device()) {
+        pc = torch::empty(
+            {needed}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    }
+    torch::Tensor partial = pc.narrow(0, 0, needed);
+    auto output = torch::empty(
+        {rows}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    dim3 grid(slices, (unsigned)(((rows / 8) + 3) / 4));
+    int4_gemv_v17_kernel<<<grid, 128, V17_SLICE * sizeof(float), stream>>>(
+        x.data_ptr<float>(),
+        reinterpret_cast<const uint32_t*>(repacked.data_ptr()),
+        reinterpret_cast<const __half*>(scales.data_ptr()),
+        partial.data_ptr<float>(), (int)rows, (int)cols, (int)groups, slices);
+    marlin_reduce_kernel_g<<<(unsigned)((rows + 255) / 256), 256, 0, stream>>>(
+        partial.data_ptr<float>(), output.data_ptr<float>(),
+        (int)rows, slices);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+// ---------------------------------------------------------------------------
+// Marlin-style repack + GEMV (all architectures, SM75+).
+// Repack: superstep tile = 8 rows x 32 cols; GEMV thread t (j=t/4,i=t%4)
+// needs input bytes {i, i+4, i+8, i+12} of row j -> one aligned uint32.
+// After repack a superstep is 32 consecutive uint32 (128 B): one fully
+// coalesced 4-byte load per lane, then registers-only dequant + mma.
+// ---------------------------------------------------------------------------
+__global__ void int4_repack_marlin_kernel(
+    const uint8_t* __restrict__ src,
+    uint8_t* __restrict__ dst,
+    const int rows,
+    const int cols)
+{
+    const long words_total =
+        (((long)rows + 7) / 8) * (cols / 32) * 32;  // uint32 count
+    for (long w = blockIdx.x * (long)blockDim.x + threadIdx.x;
+         w < words_total;
+         w += (long)gridDim.x * blockDim.x) {
+        const int intra = (int)(w & 31);
+        const long tile = w >> 5;
+        const int tiles_k = cols / 32;
+        const int tile_k = (int)(tile % tiles_k);
+        const int tile_n = (int)(tile / tiles_k);
+        const int j = intra >> 2;
+        const int i = intra & 3;
+        const int row = tile_n * 8 + j;
+        uint32_t out = 0u;
+        if (row < rows) {
+            const uint8_t* srow = src + (long)row * (cols >> 1) + tile_k * 16;
+            out |= ((uint32_t)srow[i]) | ((uint32_t)srow[i + 4] << 8) |
+                   ((uint32_t)srow[i + 8] << 16) | ((uint32_t)srow[i + 12] << 24);
+        }
+        ((uint32_t*)dst)[w] = out;
+    }
+}
+
+torch::Tensor int4_repack_marlin(
+    torch::Tensor packed,
+    int64_t rows,
+    int64_t cols)
+{
+    TORCH_CHECK(cols % 32 == 0, "marlin repack requires cols%32==0");
+    const long words = (((long)rows + 7) / 8) * (cols / 32) * 32;
+    auto dst = torch::empty(
+        {words * 4},
+        torch::TensorOptions().dtype(torch::kUInt8).device(packed.device()));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const long total = words;
+    const int blocks = (int)((total + 255) / 256 > 4096 ? 4096 : (total + 255) / 256);
+    int4_repack_marlin_kernel<<<blocks, 256, 0, stream>>>(
+        packed.data_ptr<uint8_t>(),
+        dst.data_ptr<uint8_t>(),
+        (int)rows, (int)cols);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return dst;
+}
+
+constexpr int MARLIN_G_KSPLIT = 2048;
+
+__global__ void int4_gemv_marlin_kernel(
+    const __half* __restrict__ x,
+    const uint32_t* __restrict__ repacked,
+    const __half* __restrict__ scales,
+    float* __restrict__ partial,
+    const int rows,
+    const int cols,
+    const int groups,
+    const int slices)
+{
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row0 = (blockIdx.y * 4 + warp) * 8;
+    const int slice = blockIdx.x;
+    const int k0 = slice * MARLIN_G_KSPLIT;
+    const int k1 = min(cols, k0 + MARLIN_G_KSPLIT);
+    if (row0 >= rows) return;
+    const int j = lane >> 2;
+    const int i = lane & 3;
+    const int tiles_k = cols / 32;
+    const int row = row0 + j;
+    const __half* srow = scales + (long)row * groups;
+    float c0 = 0.f, c1 = 0.f;
+    for (int k = k0; k < k1; k += 32) {
+        const uint32_t word = __ldg(repacked +
+            (((long)(row0 >> 3) * tiles_k + (k >> 5)) << 5) + lane);
+        const float sc = __half2float(__ldg(srow + ((k + 2 * i) >> 6)));
+        const uint32_t bw0 = (word      ) & 0xFF;
+        const uint32_t bw1 = (word >>  8) & 0xFF;
+        const uint32_t bw2 = (word >> 16) & 0xFF;
+        const uint32_t bw3 = (word >> 24) & 0xFF;
+        uint32_t a0[4] = {0u, 0u, 0u, 0u}, a1[4] = {0u, 0u, 0u, 0u};
+        if (lane < 4) {
+            const int ak = 2 * lane;
+            a0[0] = half2_bits_m(__halves2half2(x[k + ak], x[k + ak + 1]));
+            a0[2] = half2_bits_m(__halves2half2(x[k + ak + 8], x[k + ak + 9]));
+            a1[0] = half2_bits_m(__halves2half2(x[k + 16 + ak], x[k + 16 + ak + 1]));
+            a1[2] = half2_bits_m(__halves2half2(x[k + 16 + ak + 8], x[k + 16 + ak + 9]));
+        }
+        const uint32_t xs[2][2] = {{bw0, bw1}, {bw2, bw3}};
+#pragma unroll
+        for (int hs = 0; hs < 2; ++hs) {
+            const float l0 = static_cast<float>(
+                static_cast<int>(xs[hs][0] & 15) - 8) * sc;
+            const float h0 = static_cast<float>(
+                static_cast<int>(xs[hs][0] >> 4) - 8) * sc;
+            const float l1 = static_cast<float>(
+                static_cast<int>(xs[hs][1] & 15) - 8) * sc;
+            const float h1 = static_cast<float>(
+                static_cast<int>(xs[hs][1] >> 4) - 8) * sc;
+            uint32_t bfrag[2] = {
+                h2_m(__float2half_rn(l0), __float2half_rn(h0)),
+                h2_m(__float2half_rn(l1), __float2half_rn(h1)),
+            };
+            mma_m16n8k16_m(hs == 0 ? a0 : a1, bfrag, &c0, &c1);
+        }
+    }
+    // C fragment: lanes 0..3 (m==0) each own two whole output rows,
+    // n = 2*lane and 2*lane+1 — no cross-lane reduce.
+    if (lane < 4) {
+        const int n0 = row0 + 2 * lane;
+        if (n0 < rows) partial[(long)n0 * slices + slice] = c0;
+        if (n0 + 1 < rows) partial[(long)(n0 + 1) * slices + slice] = c1;
+    }
+}
+
+torch::Tensor int4_gemv_marlin(
+    torch::Tensor x,
+    torch::Tensor repacked,
+    torch::Tensor scales,
+    int64_t rows,
+    int64_t cols,
+    int64_t groups)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int slices = (int)((cols + MARLIN_G_KSPLIT - 1) / MARLIN_G_KSPLIT);
+    static torch::Tensor partial_cache;
+    const long needed = (long)rows * slices;
+    if (!partial_cache.defined() || partial_cache.numel() < needed ||
+        partial_cache.device() != x.device()) {
+        partial_cache = torch::empty(
+            {needed}, torch::TensorOptions()
+                          .dtype(torch::kFloat32).device(x.device()));
+    }
+    torch::Tensor partial = partial_cache.narrow(0, 0, needed);
+    auto output = torch::empty(
+        {rows}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    dim3 block(128);
+    dim3 grid(slices, (unsigned)(((rows / 8) + 3) / 4));
+    int4_gemv_marlin_kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<const __half*>(x.data_ptr()),
+        reinterpret_cast<const uint32_t*>(repacked.data_ptr()),
+        reinterpret_cast<const __half*>(scales.data_ptr()),
+        partial.data_ptr<float>(),
+        (int)rows, (int)cols, (int)groups, slices);
+    marlin_reduce_kernel_g<<<(unsigned)((rows + 255) / 256), 256, 0, stream>>>(
+        partial.data_ptr<float>(), output.data_ptr<float>(),
+        (int)rows, slices);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+// ---------------------------------------------------------------------------
+// INT4 GEMV v2 — split-K batch=1 kernel, all architectures (SM70+).
+// One warp owns one output row inside a 1024-column segment; each lane loads
+// exactly one 16-byte uint4 (32 packed nibbles = 32 columns) plus the single
+// G64 group scale, so the whole row streams through the memory system at
+// full coalescing width with no serial dependence chain.  Numerics are
+// identical to v1: acc += ((nibble - 8) * scale) * x[col].
+// ---------------------------------------------------------------------------
+constexpr int kInt4V2SegCols = 4096;  // 32 lanes x 4 uint4 steps
+constexpr int kInt4V2Warps = 8;       // rows per block
+
+template <typename input_t>
+__global__ void int4_gemv_packed_f32_v2_kernel(
+    const input_t* __restrict__ x,
+    const uint8_t* __restrict__ packed,
+    const __half* __restrict__ scales,
+    float* __restrict__ partial,
+    const int rows,
+    const int cols,
+    const int groups,
+    const int segments)
+{
+    __shared__ float shared_x[kInt4V2SegCols];
+    const int lane = threadIdx.x;
+    const int row = blockIdx.y * kInt4V2Warps + (threadIdx.y & 7);
+    const int seg = blockIdx.x;
+    const int col_base = seg * kInt4V2SegCols;
+    const int seg_cols = min(kInt4V2SegCols, cols - col_base);
+    if (seg_cols <= 0) return;
+
+    for (int c = threadIdx.y * 32 + lane; c < seg_cols; c += 256) {
+        shared_x[c] = vq_scalar_to_float(x + (long)(col_base + c));
+    }
+    __syncthreads();
+    if (row >= rows) return;
+
+    const int packed_cols = cols >> 1;
+    const uint8_t* packed_row =
+        packed + (long)row * packed_cols + (col_base >> 1);
+    const __half* scale_row = scales + (long)row * groups;
+
+    // Each lane strides four 16-byte words (128 columns) per step; four
+    // independent accumulators keep four loads in flight and break the FMA
+    // dependence chain.  seg_cols is a multiple of 64, so any word that
+    // starts inside the segment is fully valid — no tail guards needed.
+    float accs[4] = {0.f, 0.f, 0.f, 0.f};
+    const int words = seg_cols / 32;
+    for (int step = lane * 4; step < words; step += 128) {
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int word_index = step + u;
+            if (word_index >= words) break;
+            const int local = word_index * 32;
+            const float scale = __half2float(
+                __ldg(scale_row + ((col_base + local) >> 6)));
+            const uint4 word = __ldg(reinterpret_cast<const uint4*>(
+                packed_row + (local >> 1)));
+            const uint8_t* bytes =
+                reinterpret_cast<const uint8_t*>(&word);
+            float acc = 0.f;
+#pragma unroll
+            for (int b = 0; b < 16; ++b) {
+                const uint8_t q = bytes[b];
+                acc = __fmaf_rn(
+                    static_cast<float>((q & 15) - 8) * scale,
+                    shared_x[local + b * 2],
+                    acc);
+                acc = __fmaf_rn(
+                    static_cast<float>((q >> 4) - 8) * scale,
+                    shared_x[local + b * 2 + 1],
+                    acc);
+            }
+            accs[u & 3] += acc;
+        }
+    }
+    float acc = (accs[0] + accs[1]) + (accs[2] + accs[3]);
+    acc = warp_sum_f32(acc);
+    if (lane == 0) {
+        partial[(long)row * segments + seg] = acc;
+    }
+}
+
+__global__ void int4_gemv_v2_reduce_kernel(
+    const float* __restrict__ partial,
+    float* __restrict__ output,
+    const int rows,
+    const int segments)
+{
+    const int row = blockIdx.x;
+    float acc = 0.f;
+    for (int s = 0; s < segments; ++s) {
+        acc += partial[(long)row * segments + s];
+    }
+    output[row] = acc;
+}
+
+template <typename input_t>
+torch::Tensor int4_gemv_packed_f32_v2(
+    torch::Tensor x,
+    torch::Tensor packed,
+    torch::Tensor scales,
+    int64_t rows,
+    int64_t cols,
+    int64_t groups)
+{
+    TORCH_CHECK(
+        cols % 64 == 0,
+        "int4 v2 GEMV requires 64-column G64 groups");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int segments =
+        (int)((cols + kInt4V2SegCols - 1) / kInt4V2SegCols);
+    // Static per-device partial buffer: repeated decode GEMVs reuse one
+    // allocation (address stability also keeps CUDA-Graph replays valid).
+    static torch::Tensor partial_cache;
+    const long needed = (long)rows * segments;
+    if (!partial_cache.defined() ||
+        partial_cache.device() != x.device() ||
+        partial_cache.numel() < needed) {
+        partial_cache = torch::empty(
+            {needed},
+            torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    }
+    torch::Tensor partial = partial_cache.narrow(0, 0, needed);
+    auto output = torch::empty(
+        {rows},
+        torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    dim3 block(32, kInt4V2Warps);
+    dim3 grid(
+        segments,
+        (unsigned)((rows + kInt4V2Warps - 1) / kInt4V2Warps));
+    int4_gemv_packed_f32_v2_kernel<input_t><<<grid, block, 0, stream>>>(
+        reinterpret_cast<const input_t*>(x.data_ptr()),
+        packed.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half*>(scales.data_ptr()),
+        partial.data_ptr<float>(),
+        (int)rows, (int)cols, (int)groups, segments);
+    int4_gemv_v2_reduce_kernel<<<rows, 32, 0, stream>>>(
+        partial.data_ptr<float>(),
+        output.data_ptr<float>(),
+        (int)rows, segments);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+// ---------------------------------------------------------------------------
+// INT4 GEMV vector8 — v1's conflict-free layout, doubled per-lane traffic.
+// Keeps the proven pattern (lane owns columns stride-2 inside a 64-column
+// group, activation staged in shared memory, one group scale per shfl
+// subgroup) but processes TWO adjacent groups per lane step with two
+// independent accumulators, halving the iteration count of vector4 while
+// keeping two 4-byte loads in flight.  All-architecture: plain LDG + FMA.
+// ---------------------------------------------------------------------------
+template <typename input_t, int rows_per_block>
+__global__ void int4_gemv_packed_f32_vector8_kernel(
+    const input_t* __restrict__ x,
+    const uint8_t* __restrict__ packed,
+    const __half* __restrict__ scales,
+    float* __restrict__ output,
+    int rows,
+    int cols,
+    int groups)
+{
+    extern __shared__ float shared_x[];
+    const int lane = threadIdx.x;
+    const int linear_thread = threadIdx.y * 32 + lane;
+    for (int col = linear_thread; col < cols; col += 32 * rows_per_block) {
+        shared_x[col] = vq_scalar_to_float(x + col);
+    }
+    __syncthreads();
+
+    const int row = blockIdx.x * rows_per_block + threadIdx.y;
+    if (row >= rows) return;
+    const int packed_cols = cols >> 1;
+    const uint8_t* packed_row =
+        packed + (long)row * packed_cols;
+    const __half* scale_row = scales + (long)row * groups;
+
+    // 8 lanes cooperate on one 64-column group (2 columns per lane); the
+    // warp covers four groups (256 columns) per step.
+    const int group_lane = lane & 7;
+    const int group_slot = lane >> 3;      // 0..3
+    float acc0 = 0.f, acc1 = 0.f;
+    for (int group_base = 0; group_base < groups; group_base += 8) {
+        // Even step group for acc0, odd for acc1.
+        const int g0 = group_base + group_slot;        // 4 groups, stride 1
+        const int g1 = group_base + 4 + group_slot;    // next 4 groups
+        float s0 = 0.f, s1 = 0.f;
+        if (group_lane == 0) {
+            if (g0 < groups) s0 = __half2float(__ldg(scale_row + g0));
+            if (g1 < groups) s1 = __half2float(__ldg(scale_row + g1));
+        }
+        s0 = __shfl_sync(0xffffffffu, s0, 0, 8);
+        s1 = __shfl_sync(0xffffffffu, s1, 0, 8);
+        if (g0 < groups) {
+            const uint32_t codes = __ldg(reinterpret_cast<const uint32_t*>(
+                packed_row + g0 * 32 + group_lane * 4));
+            const int col = g0 * 64 + group_lane * 8;
+            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&codes);
+#pragma unroll
+            for (int item = 0; item < 4; ++item) {
+                const uint8_t q = bytes[item];
+                acc0 = __fmaf_rn(
+                    static_cast<float>((q & 15) - 8) * s0,
+                    shared_x[col + item * 2], acc0);
+                acc0 = __fmaf_rn(
+                    static_cast<float>((q >> 4) - 8) * s0,
+                    shared_x[col + item * 2 + 1], acc0);
+            }
+        }
+        if (g1 < groups) {
+            const uint32_t codes = __ldg(reinterpret_cast<const uint32_t*>(
+                packed_row + g1 * 32 + group_lane * 4));
+            const int col = g1 * 64 + group_lane * 8;
+            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&codes);
+#pragma unroll
+            for (int item = 0; item < 4; ++item) {
+                const uint8_t q = bytes[item];
+                acc1 = __fmaf_rn(
+                    static_cast<float>((q & 15) - 8) * s1,
+                    shared_x[col + item * 2], acc1);
+                acc1 = __fmaf_rn(
+                    static_cast<float>((q >> 4) - 8) * s1,
+                    shared_x[col + item * 2 + 1], acc1);
+            }
+        }
+    }
+    float acc = acc0 + acc1;
+    acc = warp_sum_f32(acc);
+    if (lane == 0) output[row] = acc;
+}
+
 template <typename input_t, int rows_per_block>
 __global__ void int4_gemv_packed_f32_kernel(
     const input_t* __restrict__ x,
@@ -13684,6 +15355,43 @@ void launch_int4_gemv_packed_f32_vector4_rows(
                 groups);
 }
 
+
+template <typename input_t, int rows_per_block>
+void launch_int4_gemv_packed_f32_vector8_rows(
+    const input_t* x,
+    const uint8_t* packed,
+    const __half* scales,
+    float* output,
+    int rows,
+    int cols,
+    int groups,
+    int device,
+    cudaStream_t stream)
+{
+    dim3 block(32, rows_per_block);
+    const int blocks = (rows + rows_per_block - 1) / rows_per_block;
+    const size_t shared_bytes = static_cast<size_t>(cols) * sizeof(float);
+    constexpr int tracked_devices = 32;
+    static size_t configured[tracked_devices] = {};
+    TORCH_CHECK(device >= 0 && device < tracked_devices, "v8 device range");
+    if (configured[device] < shared_bytes) {
+        int optin = 0;
+        cudaDeviceGetAttribute(
+            &optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+        TORCH_CHECK(
+            shared_bytes <= static_cast<size_t>(optin),
+            "int4 v8 shared memory unsupported");
+        cccp_gpu_func_set_attribute(
+            int4_gemv_packed_f32_vector8_kernel<input_t, rows_per_block>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(shared_bytes));
+        configured[device] = shared_bytes;
+    }
+    int4_gemv_packed_f32_vector8_kernel<input_t, rows_per_block>
+        <<<blocks, block, shared_bytes, stream>>>(
+            x, packed, scales, output, rows, cols, groups);
+}
+
 template <typename input_t>
 void launch_int4_gemv_packed_f32(
     const input_t* x,
@@ -13697,6 +15405,22 @@ void launch_int4_gemv_packed_f32(
     cudaStream_t stream,
     bool group_vector)
 {
+    static const bool use_vector8 = [] {
+        const char* flag = std::getenv("CCCP_INT4_GEMV_V8");
+        return flag && flag[0] == '1';
+    }();
+    if (group_vector && groups % 8 == 0 && use_vector8) {
+        if (rows <= 2048) {
+            launch_int4_gemv_packed_f32_vector8_rows<input_t, 8>(
+                x, packed, scales, output, rows, cols, groups,
+                device, stream);
+        } else {
+            launch_int4_gemv_packed_f32_vector8_rows<input_t, 32>(
+                x, packed, scales, output, rows, cols, groups,
+                device, stream);
+        }
+        return;
+    }
     if (group_vector && groups % 4 == 0) {
         if (rows <= 2048) {
             launch_int4_gemv_packed_f32_vector4_rows<input_t, 8>(
@@ -17926,6 +19650,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dense_vq_gemv_grouped_fp8_codebook",
           &dense_vq_gemv_grouped_fp8_codebook,
           "Grouped GGUF-style BF16 Decode directly from packed VQ");
+    m.def("dense_vq_dequant_fp8_packed", &dense_vq_dequant_fp8_packed,
+        "Expand packed VQ to FP8 rows with a single tensor scale.");
+    m.def("dense_vq_compile_int4_g64", &dense_vq_compile_int4_g64,
+          "Compile Dense VQ into a resident INT4-G64 execution image");
+    m.def("dense_vq_expand_fp8_tile_out", &dense_vq_expand_fp8_tile_out,
+          "Expand one packed Dense VQ row tile into a fixed E4M3 workspace");
+    m.def("dense_vq_mma_packed_m1", &dense_vq_mma_packed_m1,
+          "Decode packed Dense VQ directly into one Tensor Core MMA row");
+    m.def("dense_vq_quantize_fp8_codebook", &dense_vq_quantize_fp8_codebook,
+          "Quantize a compact Dense VQ codebook into tensor-scaled E4M3");
     m.def("dense_vq_dequant_packed", &dense_vq_dequant_packed,
           "Dense VQ BF16 dequantization with optional row selection");
     m.def("dense_vq_expand_native8", &dense_vq_expand_native8,
@@ -18093,6 +19827,30 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("int4_embedding_lookup_device_row",
           &int4_embedding_lookup_device_row,
           "Packed INT4-G64 embedding lookup with a CUDA row index");
+    m.def("int4_gemv_packed_f32_v4s", &int4_gemv_packed_f32_v4s<float>,
+        "Segmented vector4 INT4 GEMV (conflict-free, staged activation).");
+    m.def("int4_gemv_packed_f32_v4s_bf16", &int4_gemv_packed_f32_v4s<__nv_bfloat16>,
+        "Segmented vector4 INT4 GEMV, bf16 activations.");
+    m.def("int4_gemv_v1b", &int4_gemv_v1b,
+        "v1b batched GEMV (bit-identical to v1, B<=5).");
+    m.def("int4_repack_v21b", &int4_repack_v21b,
+        "v21b repack (same layout).");
+    m.def("int4_gemv_v21b", &int4_gemv_v21b,
+        "v21b batched GEMV [B,cols]->[B,rows], B<=5.");
+    m.def("int4_repack_v21", &int4_repack_v21,
+        "v21 superstep-interleave repack.");
+    m.def("int4_gemv_v21", &int4_gemv_v21,
+        "v21 interleave GEMV (892 GB/s cold-stream, SM75+).");
+    m.def("int4_gemv_v17", &int4_gemv_v17,
+        "v17: marlin tiles + FMA GEMV (731-1000 GB/s, SM75+).");
+    m.def("int4_repack_marlin", &int4_repack_marlin,
+        "Repack INT4-G64 into marlin superstep tiles.");
+    m.def("int4_gemv_marlin", &int4_gemv_marlin,
+        "Marlin-layout INT4 GEMV (coalesced 4B/lane, mma.sync SM75+).");
+    m.def("int4_gemv_packed_f32_v2", &int4_gemv_packed_f32_v2<float>,
+        "Split-K INT4 batch-1 GEMV (vectorized, all architectures).");
+    m.def("int4_gemv_packed_f32_v2_bf16", &int4_gemv_packed_f32_v2<__nv_bfloat16>,
+        "Split-K INT4 batch-1 GEMV, bf16 activations.");
     m.def("int4_gemv_packed_f32", &int4_gemv_packed_f32,
           "Shared-input packed INT4-G64 GEMV for float32 decode");
     m.def("block_fp8_gemv_f32", &block_fp8_gemv_f32,
