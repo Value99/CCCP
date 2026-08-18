@@ -2523,6 +2523,32 @@ if _EXT is not None:
             return None
         return _EXT.hadamard_bf16(x)
 
+    def int4_gemv_v2_fused(
+        rows: torch.Tensor,
+        payload: torch.Tensor,
+        scales: torch.Tensor,
+        cols: int,
+        groups: int,
+        group_vector: bool = True,
+    ) -> torch.Tensor | None:
+        """Split-K INT4 GEMV: one uint4 per lane, 1024-column segments."""
+        if rows.dtype == torch.bfloat16:
+            return _EXT.int4_gemv_packed_f32_v2_bf16(
+                rows.contiguous(),
+                payload.contiguous(),
+                scales.contiguous(),
+                int(payload.numel() * 2 // cols),
+                int(cols),
+                int(groups),
+            )
+        return _EXT.int4_gemv_packed_f32_v2(
+            rows.float().contiguous(),
+            payload.contiguous(),
+            scales.contiguous(),
+            int(payload.numel() * 2 // cols),
+            int(cols),
+            int(groups),
+        )
     def int4_gemv_fused(
         x: torch.Tensor,
         packed: torch.Tensor,

@@ -12611,6 +12611,138 @@ torch::Tensor int4_embedding_lookup_device_row(
 }
 
 template <typename input_t, int rows_per_block>
+
+// ---------------------------------------------------------------------------
+// INT4 GEMV v2 — split-K batch=1 kernel, all architectures (SM70+).
+// One warp owns one output row inside a 1024-column segment; each lane loads
+// exactly one 16-byte uint4 (32 packed nibbles = 32 columns) plus the single
+// G64 group scale, so the whole row streams through the memory system at
+// full coalescing width with no serial dependence chain.  Numerics are
+// identical to v1: acc += ((nibble - 8) * scale) * x[col].
+// ---------------------------------------------------------------------------
+constexpr int kInt4V2SegCols = 1024;  // 32 lanes x 32 columns
+constexpr int kInt4V2Warps = 8;       // rows per block
+
+template <typename input_t>
+__global__ void int4_gemv_packed_f32_v2_kernel(
+    const input_t* __restrict__ x,
+    const uint8_t* __restrict__ packed,
+    const __half* __restrict__ scales,
+    float* __restrict__ partial,
+    const int rows,
+    const int cols,
+    const int groups,
+    const int segments)
+{
+    __shared__ float shared_x[kInt4V2SegCols];
+    const int lane = threadIdx.x;
+    const int row = blockIdx.y * kInt4V2Warps + (threadIdx.y & 7);
+    const int seg = blockIdx.x;
+    const int col_base = seg * kInt4V2SegCols;
+    const int seg_cols = min(kInt4V2SegCols, cols - col_base);
+    if (seg_cols <= 0) return;
+
+    for (int c = threadIdx.y * 32 + lane; c < seg_cols; c += 256) {
+        shared_x[c] = vq_scalar_to_float(x + (long)(col_base + c));
+    }
+    __syncthreads();
+    if (row >= rows) return;
+
+    const int packed_cols = cols >> 1;
+    const uint8_t* packed_row =
+        packed + (long)row * packed_cols + (col_base >> 1);
+    const __half* scale_row = scales + (long)row * groups;
+
+    // Lane owns columns [lane*32, lane*32+32) of the segment.  col_base is a
+    // multiple of 1024, hence of the 64-column group, and lane*32 is either
+    // a group start or its exact half — one scale per lane suffices.
+    const int local = lane * 32;
+    if (local < seg_cols) {
+        const int col0 = col_base + local;
+        const int local_nibbles = min(32, seg_cols - local);
+        const float scale =
+            __half2float(__ldg(scale_row + (col0 >> 6)));
+        const uint4 word = __ldg(reinterpret_cast<const uint4*>(
+            packed_row + (local >> 1)));
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&word);
+        // seg_cols is a multiple of 64 and local is a multiple of 32, so a
+        // lane whose window starts inside the segment always owns 32 valid
+        // columns — no per-element tail guards are needed.
+        (void)local_nibbles;
+        float acc = 0.f;
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&word);
+#pragma unroll
+        for (int b = 0; b < 16; ++b) {
+            const uint8_t q = bytes[b];
+            acc = __fmaf_rn(
+                static_cast<float>((q & 15) - 8) * scale,
+                shared_x[local + b * 2],
+                acc);
+            acc = __fmaf_rn(
+                static_cast<float>((q >> 4) - 8) * scale,
+                shared_x[local + b * 2 + 1],
+                acc);
+        }
+        acc = warp_sum_f32(acc);
+        if (lane == 0) {
+            partial[(long)row * segments + seg] = acc;
+        }
+    }
+}
+
+__global__ void int4_gemv_v2_reduce_kernel(
+    const float* __restrict__ partial,
+    float* __restrict__ output,
+    const int rows,
+    const int segments)
+{
+    const int row = blockIdx.x;
+    float acc = 0.f;
+    for (int s = 0; s < segments; ++s) {
+        acc += partial[(long)row * segments + s];
+    }
+    output[row] = acc;
+}
+
+template <typename input_t>
+torch::Tensor int4_gemv_packed_f32_v2(
+    torch::Tensor x,
+    torch::Tensor packed,
+    torch::Tensor scales,
+    int64_t rows,
+    int64_t cols,
+    int64_t groups)
+{
+    TORCH_CHECK(
+        cols % 64 == 0,
+        "int4 v2 GEMV requires 64-column G64 groups");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int segments =
+        (int)((cols + kInt4V2SegCols - 1) / kInt4V2SegCols);
+    auto partial = torch::empty(
+        {(long)rows * segments},
+        torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    auto output = torch::empty(
+        {rows},
+        torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    dim3 block(32, kInt4V2Warps);
+    dim3 grid(
+        segments,
+        (unsigned)((rows + kInt4V2Warps - 1) / kInt4V2Warps));
+    int4_gemv_packed_f32_v2_kernel<input_t><<<grid, block, 0, stream>>>(
+        reinterpret_cast<const input_t*>(x.data_ptr()),
+        packed.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half*>(scales.data_ptr()),
+        partial.data_ptr<float>(),
+        (int)rows, (int)cols, (int)groups, segments);
+    int4_gemv_v2_reduce_kernel<<<rows, 32, 0, stream>>>(
+        partial.data_ptr<float>(),
+        output.data_ptr<float>(),
+        (int)rows, segments);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
 __global__ void int4_gemv_packed_f32_kernel(
     const input_t* __restrict__ x,
     const uint8_t* __restrict__ packed,
@@ -18506,6 +18638,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("int4_embedding_lookup_device_row",
           &int4_embedding_lookup_device_row,
           "Packed INT4-G64 embedding lookup with a CUDA row index");
+    m.def("int4_gemv_packed_f32_v2", &int4_gemv_packed_f32_v2<float>,
+        "Split-K INT4 batch-1 GEMV (vectorized, all architectures).");
+    m.def("int4_gemv_packed_f32_v2_bf16", &int4_gemv_packed_f32_v2<__nv_bfloat16>,
+        "Split-K INT4 batch-1 GEMV, bf16 activations.");
     m.def("int4_gemv_packed_f32", &int4_gemv_packed_f32,
           "Shared-input packed INT4-G64 GEMV for float32 decode");
     m.def("block_fp8_gemv_f32", &block_fp8_gemv_f32,

@@ -537,6 +537,19 @@ class DenseVQLinear(nn.Module):
             from .kernels import Int4Weight
 
             if rows.shape[0] == 1:
+                import os
+                if os.environ.get("CCCP_INT4_GEMV_V2", "0") == "1":
+                    from .fusedext import int4_gemv_v2_fused
+                    result = int4_gemv_v2_fused(
+                        rows.contiguous(),
+                        self.payload,
+                        self.gpu_scales,
+                        self.cols,
+                        64,
+                        group_vector=True,
+                    )
+                    if result is not None:
+                        return result
                 result = int4_gemv_fused(
                     rows.contiguous(),
                     self.payload,
