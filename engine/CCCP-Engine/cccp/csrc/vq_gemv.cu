@@ -13224,6 +13224,7 @@ torch::Tensor int4_gemv_v21b(
     return output;
 }
 
+constexpr int V1B_MAXB = 5;
 constexpr int V1B_SLICE = 4096;   // per-slice shared: B*4096*4B <= 80KB
 
 template <int ROWS_PER_BLOCK>
