@@ -42,3 +42,4 @@ class ModelOperatorConfig:
                 values.get("routed_scaling", 1.0)
             ),
         )
+

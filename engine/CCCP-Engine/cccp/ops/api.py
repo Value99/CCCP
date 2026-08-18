@@ -1192,29 +1192,16 @@ def attention_step(kind: str, device_type: str, **kwargs):
         query = kwargs.get("query")
         if not isinstance(query, torch.Tensor):
             query = kwargs.get("query_nope")
-        if (
-            normalized_kind == "compressed_kv_decode"
-            and isinstance(query, torch.Tensor)
-            and query.ndim >= 3
-        ):
-            # The TP MLA executor stores query_nope as
-            # [local_heads, token_batch, head_dim].  The leading dimension is
-            # the number of heads, not the request batch.  Treating it as the
-            # batch made otherwise-valid Kimi TP captures (for example 24
-            # local heads and one token) miss the registered decode operator.
-            batch_size = int(query.shape[1])
-        else:
-            batch_size = (
-                int(query.shape[0])
-                if isinstance(query, torch.Tensor)
-                and query.ndim >= 3
-                else 1
-            )
         request = OperatorRequest(
             operation=f"attention_step:{normalized_kind}",
             device_type=normalized_device,
             activation="none",
-            batch_size=batch_size,
+            batch_size=(
+                int(query.shape[0])
+                if isinstance(query, torch.Tensor)
+                and query.ndim >= 3
+                else 1
+            ),
         )
         implementation = REGISTRY.resolve(request).implementation
         _ATTENTION_IMPLEMENTATIONS[key] = implementation
@@ -1782,44 +1769,6 @@ def projection_dequant(
     return output
 
 
-def projection_expand_native8(
-    metadata: torch.Tensor,
-    output_gu: torch.Tensor,
-    output_down: torch.Tensor,
-) -> torch.Tensor:
-    """Public packed-to-E4M3/INT8 projection expansion operation."""
-    _ensure_builtins()
-    if metadata.ndim != 2 or metadata.shape[0] not in (10, 15):
-        raise ValueError(
-            "native8 projection expansion requires [10,E] or [15,E] metadata"
-        )
-    dtype_name = (
-        "e4m3" if output_gu.dtype == torch.float8_e4m3fn else "int8"
-    )
-    request = OperatorRequest(
-        operation="projection_expand_native8",
-        device_type=metadata.device.type,
-        packed_formats=tuple(f"p{bits}" for bits in range(8, 17)),
-        code_dims=(4, 8, 16),
-        codebook_sizes=(
-            256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536
-        ),
-        activation="none",
-        top_k=1,
-        batch_size=int(output_gu.shape[0]) if output_gu.ndim == 3 else 1,
-        dtype=dtype_name,
-    )
-    output = REGISTRY.call(
-        request,
-        metadata=metadata,
-        output_gu=output_gu,
-        output_down=output_down,
-    )
-    if output is None:
-        raise RuntimeError("native8 projection expansion rejected input")
-    return output
-
-
 def packed_route_slots(
     route_ids: torch.Tensor,
     directory: torch.Tensor,
@@ -2043,6 +1992,41 @@ def dense_vq_gemv_packed(
         return None
 
 
+def dense_vq_mma_packed_m1(
+    value: torch.Tensor,
+    payload: torch.Tensor,
+    codebook: torch.Tensor,
+    *,
+    rows: int,
+    blocks: int,
+    bits: int,
+) -> torch.Tensor | None:
+    """Run one-token packed VQ through the direct Tensor Core prototype."""
+    _ensure_builtins()
+    request = OperatorRequest(
+        operation="dense_vq_mma",
+        device_type=payload.device.type,
+        packed_formats=(f"p{int(bits)}",),
+        code_dims=(int(codebook.shape[-1]),),
+        codebook_sizes=(int(codebook.shape[-2]),),
+        activation="none",
+        top_k=1,
+        batch_size=int(value.shape[0]),
+    )
+    try:
+        return REGISTRY.call(
+            request,
+            value=value,
+            payload=payload,
+            codebook=codebook,
+            rows=int(rows),
+            blocks=int(blocks),
+            bits=int(bits),
+        )
+    except LookupError:
+        return None
+
+
 def dense_vq_dequant_packed(
     payload: torch.Tensor,
     codebook: torch.Tensor,
@@ -2073,6 +2057,104 @@ def dense_vq_dequant_packed(
             blocks=int(blocks),
             bits=int(bits),
             row_ids=row_ids,
+        )
+    except LookupError:
+        return None
+
+
+def dense_vq_dequant_fp8_packed(
+    payload: torch.Tensor,
+    codebook: torch.Tensor,
+    *,
+    rows: int,
+    blocks: int,
+    bits: int,
+    row_ids: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Convert packed Dense-VQ rows directly to E4M3 and tensor scale.
+
+    This is the common CUDA primitive for resident FP8 images and bounded
+    row/tile conversion.  No full-size BF16 intermediate is materialized.
+    """
+    _ensure_builtins()
+    request = OperatorRequest(
+        operation="dense_vq_dequant_fp8",
+        device_type=payload.device.type,
+        packed_formats=(f"p{int(bits)}",),
+        code_dims=(int(codebook.shape[-1]),),
+        codebook_sizes=(int(codebook.shape[-2]),),
+        activation="none",
+        top_k=1,
+        batch_size=1 if row_ids is None else max(1, int(row_ids.numel())),
+    )
+    try:
+        return REGISTRY.call(
+            request,
+            payload=payload,
+            codebook=codebook,
+            rows=int(rows),
+            blocks=int(blocks),
+            bits=int(bits),
+            row_ids=row_ids,
+        )
+    except LookupError:
+        return None
+
+
+def dense_vq_quantize_fp8_codebook(
+    codebook: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Quantize one compact FP32 VQ codebook for tiled E4M3 execution."""
+    _ensure_builtins()
+    request = OperatorRequest(
+        operation="dense_vq_codebook_fp8",
+        device_type=codebook.device.type,
+        code_dims=(int(codebook.shape[-1]),),
+        codebook_sizes=(int(codebook.shape[-2]),),
+        activation="none",
+        top_k=1,
+        batch_size=1,
+    )
+    try:
+        return REGISTRY.call(request, codebook=codebook)
+    except LookupError:
+        return None
+
+
+def dense_vq_expand_fp8_tile(
+    payload: torch.Tensor,
+    fp8_codebook: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    rows: int,
+    blocks: int,
+    bits: int,
+    row_start: int,
+    row_count: int,
+) -> torch.Tensor | None:
+    """Expand a contiguous packed VQ row tile into fixed E4M3 storage."""
+    _ensure_builtins()
+    request = OperatorRequest(
+        operation="dense_vq_expand_fp8_tile",
+        device_type=payload.device.type,
+        packed_formats=(f"p{int(bits)}",),
+        code_dims=(int(fp8_codebook.shape[-1]),),
+        codebook_sizes=(int(fp8_codebook.shape[-2]),),
+        activation="none",
+        top_k=1,
+        batch_size=int(row_count),
+    )
+    try:
+        return REGISTRY.call(
+            request,
+            payload=payload,
+            fp8_codebook=fp8_codebook,
+            output=output,
+            rows=int(rows),
+            blocks=int(blocks),
+            bits=int(bits),
+            row_start=int(row_start),
+            row_count=int(row_count),
         )
     except LookupError:
         return None

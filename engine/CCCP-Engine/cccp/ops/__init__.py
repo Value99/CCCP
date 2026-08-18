@@ -14,7 +14,11 @@ from .api import (
     dense_grouped_gemv,
     dense_gemv,
     dense_vq_dequant_packed,
+    dense_vq_dequant_fp8_packed,
+    dense_vq_expand_fp8_tile,
+    dense_vq_quantize_fp8_codebook,
     dense_vq_gemv_packed,
+    dense_vq_mma_packed_m1,
     head_rmsnorm_rope,
     create_tensor_parallel,
     gated_activation,
@@ -29,7 +33,6 @@ from .api import (
     packed_moe_topk,
     packed_moe_topk_grouped,
     projection_dequant,
-    projection_expand_native8,
     packed_moe_selected_topk,
     packed_moe_selected_rows,
     packed_moe_operator_name,
@@ -64,6 +67,10 @@ from .paged_sparse import (
 )
 from .config import ModelOperatorConfig
 from .registry import OperatorRegistry, REGISTRY
+from .sdpa import (
+    native_gqa_sdpa,
+    register_transformers_native_gqa_attention,
+)
 from .spec import OperatorCapability, OperatorRequest
 from .fixed_graph import FixedAddressCudaGraph
 from .tensor_parallel import (
@@ -82,9 +89,11 @@ from .tensor_parallel import (
     shard_linear_input,
     shard_linear_output,
 )
+from .vq_fp8 import DenseVQFP8TileMMA
 
 __all__ = [
     "DecodeControl",
+    "DenseVQFP8TileMMA",
     "ModelOperatorConfig",
     "OperatorCapability",
     "OperatorRegistry",
@@ -94,6 +103,8 @@ __all__ = [
     "cuda_architecture_features",
     "FixedAddressCudaGraph",
     "REGISTRY",
+    "native_gqa_sdpa",
+    "register_transformers_native_gqa_attention",
     "attention_step",
     "causal_latent_prefill",
     "block_scaled_gemm",
@@ -108,7 +119,11 @@ __all__ = [
     "dense_grouped_gemv",
     "dense_gemv",
     "dense_vq_dequant_packed",
+    "dense_vq_dequant_fp8_packed",
+    "dense_vq_expand_fp8_tile",
+    "dense_vq_quantize_fp8_codebook",
     "dense_vq_gemv_packed",
+    "dense_vq_mma_packed_m1",
     "head_rmsnorm_rope",
     "create_tensor_parallel",
     "gated_activation",
@@ -123,7 +138,6 @@ __all__ = [
     "packed_moe_topk",
     "packed_moe_topk_grouped",
     "projection_dequant",
-    "projection_expand_native8",
     "packed_moe_selected_topk",
     "packed_moe_selected_rows",
     "packed_moe_operator_name",

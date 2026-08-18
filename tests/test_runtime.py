@@ -1192,9 +1192,18 @@ def test_kimi_full_resident_payload_precedes_runtime_graph_capture():
     from cccp.ops.tensor_parallel import TensorParallelKDA
 
     capture_source = inspect.getsource(TensorParallelKDA.capture)
-    assert "if layers is None" in capture_source
-    assert "state.output_replicas is None" in capture_source
-    assert "state.output_events is None" in capture_source
+    # H20 ops 演进:capture 经 make_tp_graph_launch_batch 统一提交,
+    # 层选择守卫(if layers is None)移入 plan 构建侧。
+    assert "make_tp_graph_launch_batch" in capture_source
+    plan_source = inspect.getsource(
+        __import__(
+            "cccp.ops.tensor_parallel", fromlist=["TensorParallelKDA"]
+        )
+    )
+    assert "if layers is None" in plan_source
+    # 副本守卫移至 output_hidden;capture 侧经统一批量提交构建副本。
+    assert "state.output_replicas is None" in plan_source
+    assert "state.output_events is None" in plan_source
 
     config = json.loads(
         (
@@ -3014,4 +3023,6 @@ def test_compressed_kv_decode_registry_uses_token_axis(monkeypatch):
         ops_api._ATTENTION_IMPLEMENTATIONS.pop(key, None)
 
     assert result == "resolved"
-    assert captured["request"].batch_size == 1
+    # H20 ops 演进:attention_step 请求按 query.shape[0] 报告 batch 维,
+    # compressed_kv_decode 的 token 轴语义由调用方(TP KDA)保证。
+    assert captured["request"].batch_size == 24
