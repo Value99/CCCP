@@ -639,6 +639,7 @@ class DenseVQLinear(nn.Module):
                     )
                 return result
             batch = int(rows.shape[0])
+            import os  # local: env switch for v21b batch path
             if 2 <= batch <= 5 and rows.is_cuda and os.environ.get(
                 "CCCP_INT4_GEMV_V21B", "1"
             ) != "0":
