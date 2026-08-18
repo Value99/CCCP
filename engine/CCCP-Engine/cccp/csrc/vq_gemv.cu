@@ -13057,6 +13057,10 @@ __global__ void int4_repack_v21b_kernel(
 constexpr int V21B_SLICE = 2048;
 constexpr int V21B_MAXB = 5;
 
+// 与 v21 相同的 SLICE 模板化(小矩阵 512):v21b 必须与 v21 的 k 分组树
+// 完全一致才保持 bit 一等(第二十二轮实证:分组不一致时 7e-7 差异会
+// 翻转 MTP fast-top3 接受判定)。
+template <int SLICE>
 __global__ void int4_gemv_v21b_kernel(
     const float* __restrict__ x,          // [B, cols]
     const uint32_t* __restrict__ repacked,
@@ -13068,17 +13072,17 @@ __global__ void int4_gemv_v21b_kernel(
     const int slices,
     const int B)
 {
-    extern __shared__ float sxB[];        // [V21B_MAXB][V21B_SLICE]
+    extern __shared__ float sxB[];        // [V21B_MAXB][SLICE]
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int slice = blockIdx.x;
-    const int k0 = slice * V21B_SLICE;
-    const int here = min(V21B_SLICE, cols - k0);
+    const int k0 = slice * SLICE;
+    const int here = min(SLICE, cols - k0);
     if (here <= 0) return;
     for (int idx = threadIdx.x; idx < B * here; idx += 128) {
         const int b = idx / here;
         const int c = idx % here;
-        sxB[b * V21B_SLICE + c] = x[(long)b * cols + k0 + c];
+        sxB[b * SLICE + c] = x[(long)b * cols + k0 + c];
     }
     __syncthreads();
     const int row0 = (blockIdx.y * 4 + warp) * 8;
@@ -13125,7 +13129,7 @@ __global__ void int4_gemv_v21b_kernel(
 #pragma unroll
             for (int b = 0; b < V21B_MAXB; ++b) {
                 if (b >= B) break;
-                const float* xb = sxB + b * V21B_SLICE;
+                const float* xb = sxB + b * SLICE;
                 const int a2 = s2 * 2;
                 acc[b][a2] = __fmaf_rn(static_cast<float>((int)(b0 & 15) - 8) * sa, xb[ca + 2 * i], acc[b][a2]);
                 acc[b][a2] = __fmaf_rn(static_cast<float>((int)(b0 >> 4) - 8) * sa, xb[ca + 2 * i + 1], acc[b][a2]);
@@ -13152,7 +13156,7 @@ __global__ void int4_gemv_v21b_kernel(
 #pragma unroll
             for (int b = 0; b < V21B_MAXB; ++b) {
                 if (b >= B) break;
-                const float* xb = sxB + b * V21B_SLICE;
+                const float* xb = sxB + b * SLICE;
                 acc[b][u2 * 2] = __fmaf_rn(static_cast<float>((int)(b0 & 15) - 8) * sa, xb[ca + 2 * i], acc[b][u2 * 2]);
                 acc[b][u2 * 2] = __fmaf_rn(static_cast<float>((int)(b0 >> 4) - 8) * sa, xb[ca + 2 * i + 1], acc[b][u2 * 2]);
                 acc[b][u2 * 2 + 1] = __fmaf_rn(static_cast<float>((int)(b1 & 15) - 8) * sa, xb[ca + 2 * i + 8], acc[b][u2 * 2 + 1]);
@@ -13226,7 +13230,19 @@ torch::Tensor int4_gemv_v21b(
     const int B = (int)x.size(0);
     TORCH_CHECK(B >= 1 && B <= V21B_MAXB, "batch 1..5");
     auto stream = at::cuda::getCurrentCUDAStream();
-    const int slices = (int)((cols + V21B_SLICE - 1) / V21B_SLICE);
+    // 与 int4_gemv_v21 完全一致的 slice 选择规则,保证 draft(v21)与
+    // verify(v21b)的 k 分组树逐位同构。
+    static const int slice_env_b = [] {
+        const char* flag = std::getenv("CCCP_INT4_V21_KSLICE");
+        if (flag && flag[0] == '5') return 512;
+        if (flag && flag[0] == '2') return 2048;
+        return 0;  // auto
+    }();
+    const bool small_b = slice_env_b
+        ? (slice_env_b == 512)
+        : (cols <= 5120);
+    const int slice_cols = small_b ? V21_SMALL_SLICE : V21B_SLICE;
+    const int slices = (int)((cols + slice_cols - 1) / slice_cols);
     static torch::Tensor pc;
     const long needed = (long)B * rows * slices;
     if (!pc.defined() || pc.numel() < needed || pc.device() != x.device()) {
@@ -13237,12 +13253,23 @@ torch::Tensor int4_gemv_v21b(
     auto output = torch::empty(
         {B, rows}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
     dim3 grid(slices, (unsigned)(((rows / 8) + 3) / 4));
-    int4_gemv_v21b_kernel<<<grid, 128, V21B_MAXB * V21B_SLICE * sizeof(float), stream>>>(
-        x.data_ptr<float>(),
-        reinterpret_cast<const uint32_t*>(repacked.data_ptr()),
-        reinterpret_cast<const __half*>(scales.data_ptr()),
-        partial.data_ptr<float>(),
-        (int)rows, (int)cols, (int)groups, slices, B);
+    const size_t shared =
+        (size_t)V21B_MAXB * slice_cols * sizeof(float);
+    if (small_b) {
+        int4_gemv_v21b_kernel<V21_SMALL_SLICE><<<grid, 128, shared, stream>>>(
+            x.data_ptr<float>(),
+            reinterpret_cast<const uint32_t*>(repacked.data_ptr()),
+            reinterpret_cast<const __half*>(scales.data_ptr()),
+            partial.data_ptr<float>(),
+            (int)rows, (int)cols, (int)groups, slices, B);
+    } else {
+        int4_gemv_v21b_kernel<V21B_SLICE><<<grid, 128, shared, stream>>>(
+            x.data_ptr<float>(),
+            reinterpret_cast<const uint32_t*>(repacked.data_ptr()),
+            reinterpret_cast<const __half*>(scales.data_ptr()),
+            partial.data_ptr<float>(),
+            (int)rows, (int)cols, (int)groups, slices, B);
+    }
     int4_v21b_reduce<<<(B * rows + 255) / 256, 256, 0, stream>>>(
         partial.data_ptr<float>(), output.data_ptr<float>(),
         (int)rows, slices, B);

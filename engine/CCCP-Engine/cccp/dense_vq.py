@@ -647,6 +647,33 @@ class DenseVQLinear(nn.Module):
                 # GEMV loops (v21b), keeping memory-bound traffic at 1x.
                 # v1b: bit-identical to per-token v1 (keeps MTP greedy
                 # acceptance) while streaming the weight rows once for B.
+                # VERIFY=v21b(+V21=1): superstep-interleave 批扫,更快但
+                # 需 draft 侧同为 v21 数值。
+                if (
+                    os.environ.get("CCCP_INT4_GEMV_VERIFY", "v1b") == "v21b"
+                    and os.environ.get("CCCP_INT4_GEMV_V21", "0") == "1"
+                ):
+                    from .fusedext import (
+                        int4_gemv_v21b_fused,
+                        int4_repack_v21_fused,
+                    )
+
+                    repacked = getattr(self, "_v21b_payload", None)
+                    if repacked is None:
+                        repacked = int4_repack_v21_fused(
+                            self.payload, self.cols
+                        )
+                        self._v21b_payload = repacked
+                    result = int4_gemv_v21b_fused(
+                        rows.float(),
+                        repacked,
+                        self.gpu_scales,
+                        self.cols,
+                        64,
+                        group_vector=True,
+                    )
+                    if result is not None:
+                        return result
                 from .fusedext import int4_gemv_v1b_fused
 
                 result = int4_gemv_v1b_fused(
@@ -1057,19 +1084,45 @@ class DenseVQLinearGroup(nn.Module):
                 and rows.is_cuda
                 and os.environ.get("CCCP_INT4_GEMV_V21B", "1") != "0"
             ):
-                # MTP verify 批路径:int4 权重单次流扫(v1b,bit 一致于逐
-                # token v1)。替代整矩阵 LUT 反量化+GEMM——后者每次调用
-                # 物化 4× 权重字节的 fp16 矩阵,是 verify 280ms/轮的主因。
-                from .fusedext import int4_gemv_v1b_fused
+                # MTP verify 批路径:int4 权重单次流扫,替代整矩阵 LUT
+                # 反量化+GEMM(每次调用物化 4× 权重字节,verify 280ms/轮
+                # 主因)。默认 v1b(bit 一致于逐 token v1);VERIFY=v21b 时
+                # 走 superstep-interleave 批扫(需 V21=1 使 draft 同源,
+                # k 分组树与 v21 逐位对齐,repack 缓存 +1 份权重)。
+                if (
+                    os.environ.get("CCCP_INT4_GEMV_VERIFY", "v1b") == "v21b"
+                    and os.environ.get("CCCP_INT4_GEMV_V21", "0") == "1"
+                ):
+                    from .fusedext import (
+                        int4_gemv_v21b_fused,
+                        int4_repack_v21_fused,
+                    )
 
-                combined = int4_gemv_v1b_fused(
-                    rows.float(),
-                    self.payload,
-                    self.gpu_scales,
-                    self.cols,
-                    64,
-                    group_vector=True,
-                )
+                    repacked = getattr(self, "_v21b_payload", None)
+                    if repacked is None:
+                        repacked = int4_repack_v21_fused(
+                            self.payload, self.cols
+                        )
+                        self._v21b_payload = repacked
+                    combined = int4_gemv_v21b_fused(
+                        rows.float(),
+                        repacked,
+                        self.gpu_scales,
+                        self.cols,
+                        64,
+                        group_vector=True,
+                    )
+                else:
+                    from .fusedext import int4_gemv_v1b_fused
+
+                    combined = int4_gemv_v1b_fused(
+                        rows.float(),
+                        self.payload,
+                        self.gpu_scales,
+                        self.cols,
+                        64,
+                        group_vector=True,
+                    )
                 if combined is None:
                     combined = Int4Weight(
                         self.payload,

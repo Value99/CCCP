@@ -76,7 +76,7 @@ def _run_turn(
             "suffix_tokens": stats.suffix_tokens,
             "prefill_ms": stats.prefill_ms,
         },
-        "speculative": dict(engine.spec_stats or {}),
+        "speculative": dict(getattr(engine, "spec_stats", None) or {}),
     }
 
 
