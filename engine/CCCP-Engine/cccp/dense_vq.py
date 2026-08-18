@@ -38,14 +38,6 @@ def _packing_bits(value: str) -> int:
     return bits
 
 
-def _dense_vq_dtype_tag(bits: int) -> int:
-    tags = {8: 0, 16: 1, 12: 2, 14: 3, 10: 4, 9: 5, 11: 6, 13: 7, 15: 8}
-    try:
-        return tags[int(bits)]
-    except KeyError as error:
-        raise ValueError(f"unsupported Dense VQ packed width p{bits}") from error
-
-
 @dataclass(frozen=True)
 class DenseVQTensorSpec:
     name: str
@@ -57,82 +49,6 @@ class DenseVQTensorSpec:
     cols: int
     bits: int
     layout_name: str
-
-
-@dataclass(frozen=True)
-class DenseVQGPUPlan:
-    """One of the only two supported Dense VQ GPU residency modes.
-
-    ``resident`` expands the compact archive once into the accelerator's
-    native Tensor Core weight format. ``compact`` keeps the manifest VQ
-    indices and codebooks resident and reconstructs the active projection at
-    execution time. Model adapters provide architecture-sized runtime bytes;
-    this public planner contains no model-family branches.
-    """
-
-    mode: str
-    free_bytes: int
-    weight_bytes: int
-    fixed_bytes: int
-    runtime_bytes: int
-
-    @property
-    def required_bytes(self) -> int:
-        return self.weight_bytes + self.fixed_bytes + self.runtime_bytes
-
-
-def plan_dense_vq_gpu_execution(
-    *,
-    free_bytes: int,
-    resident_weight_bytes: int,
-    compact_weight_bytes: int,
-    fixed_bytes: int,
-    runtime_bytes: int,
-    resident_supported: bool,
-    forced_mode: str = "auto",
-) -> DenseVQGPUPlan:
-    """Select native-resident or compact-VQ execution without fallbacks."""
-
-    mode = str(forced_mode or "auto").strip().lower()
-    if mode not in {"auto", "resident", "compact"}:
-        raise ValueError(
-            "Dense VQ GPU mode must be auto, resident or compact"
-        )
-    candidates = {
-        "resident": DenseVQGPUPlan(
-            mode="resident",
-            free_bytes=int(free_bytes),
-            weight_bytes=int(resident_weight_bytes),
-            fixed_bytes=int(fixed_bytes),
-            runtime_bytes=int(runtime_bytes),
-        ),
-        "compact": DenseVQGPUPlan(
-            mode="compact",
-            free_bytes=int(free_bytes),
-            weight_bytes=int(compact_weight_bytes),
-            fixed_bytes=int(fixed_bytes),
-            runtime_bytes=int(runtime_bytes),
-        ),
-    }
-    if mode == "auto":
-        mode = (
-            "resident"
-            if resident_supported
-            and candidates["resident"].required_bytes <= int(free_bytes)
-            else "compact"
-        )
-    if mode == "resident" and not resident_supported:
-        raise RuntimeError(
-            "native-resident Dense VQ requires NVIDIA FP8 Tensor Cores"
-        )
-    selected = candidates[mode]
-    if selected.required_bytes > int(free_bytes):
-        raise RuntimeError(
-            f"Dense VQ {mode} mode requires "
-            f"{selected.required_bytes / 2**30:.2f} GiB but only "
-            f"{int(free_bytes) / 2**30:.2f} GiB is free"
-        )
-    return selected
 
 
 class DenseVQArchive:
@@ -317,29 +233,6 @@ class DenseVQLinear(nn.Module):
             persistent=False,
         )
         self.register_buffer(
-            "compact_codebook_fp8",
-            torch.empty(
-                0,
-                dtype=torch.float8_e4m3fn,
-                device=weight.raw.device,
-            ),
-            persistent=False,
-        )
-        self.register_buffer(
-            "compact_decode_metadata",
-            torch.empty(0, dtype=torch.int64, device=weight.raw.device),
-            persistent=False,
-        )
-        self.register_buffer(
-            "compact_codebook_scale",
-            torch.empty(
-                0,
-                dtype=torch.float32,
-                device=weight.raw.device,
-            ),
-            persistent=False,
-        )
-        self.register_buffer(
             "cpu_prefill_weight",
             torch.empty(0, dtype=torch.bfloat16),
             persistent=False,
@@ -413,18 +306,36 @@ class DenseVQLinear(nn.Module):
         self.layout = "q4_0"
         return True
 
-    def compile_gpu_fp8(self) -> bool:
-        """Compile one VQ matrix into native tensor-scaled E4M3 storage.
+    def compile_gpu_int4(self) -> bool:
+        if self.payload.device.type != "cuda" or self.layout == "int4_g64":
+            return self.layout == "int4_g64"
+        from .fusedext import dense_vq_compile_int4_g64_fused
 
-        This format is intentionally separate from the portable block-FP8
-        GEMV representation.  It is consumed by the vendor Tensor Core
-        ``scaled_mm`` path on GPUs which advertise native FP8 support.  The
-        tensor scale selects the fast H20/Blackwell cuBLAS path; row-wise
-        scaled GEMM is deliberately excluded because it benchmarks slower
-        than BF16 at batch one on the supported runtime.
+        packed, scales = dense_vq_compile_int4_g64_fused(
+            self.payload,
+            self.codebook,
+            self.rows,
+            self.blocks,
+            self.bits,
+        )
+        self.payload = packed
+        self.gpu_scales = scales
+        self.codebook = torch.empty(
+            0, dtype=torch.float32, device=self.payload.device
+        )
+        self.layout = "int4_g64"
+        return True
+
+    def compile_gpu_bf16(self) -> bool:
+        """Expand one VQ matrix once into an exact resident BF16 image.
+
+        This path is intentionally capacity-driven by the architecture loader.
+        It is useful on high-memory accelerators because every subsequent
+        projection goes through the vendor GEMM/GEMV implementation and no
+        longer pays codebook lookup or weight-reconstruction overhead.
         """
-        if self.payload.device.type != "cuda" or self.layout == "fp8_tensor":
-            return self.layout == "fp8_tensor"
+        if self.payload.device.type != "cuda" or self.layout == "bf16":
+            return self.layout == "bf16"
         from .ops import dense_vq_dequant_packed
 
         dense = dense_vq_dequant_packed(
@@ -436,14 +347,51 @@ class DenseVQLinear(nn.Module):
         )
         if dense is None or tuple(dense.shape) != (self.rows, self.cols):
             return False
-        weight_scale = (
-            dense.float().abs().amax().clamp_min(1.0e-12) / 448.0
-        ).reshape(1, 1).contiguous()
-        quantized = (
-            dense / weight_scale.to(torch.bfloat16)
-        ).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
+        self.payload = dense.contiguous()
+        self.codebook = torch.empty(
+            0, dtype=torch.float32, device=self.payload.device
+        )
+        self.gpu_scales = torch.empty(
+            0, dtype=torch.float16, device=self.payload.device
+        )
+        self.layout = "bf16"
+        return True
+
+    def compile_gpu_fp8(self) -> bool:
+        """Compile packed VQ directly into tensor-scaled E4M3 storage.
+
+        This format is intentionally separate from the portable block-FP8
+        GEMV representation.  It is consumed by the vendor Tensor Core
+        ``scaled_mm`` path on GPUs which advertise native FP8 support.  The
+        tensor scale selects the fast H20/Blackwell cuBLAS path; row-wise
+        scaled GEMM is deliberately excluded because it benchmarks slower
+        than BF16 at batch one on the supported runtime.  Conversion happens
+        from packed indices through a compact FP8 codebook; a full temporary
+        BF16 matrix is never allocated.
+        """
+        if self.payload.device.type != "cuda" or self.layout == "fp8_tensor":
+            return self.layout == "fp8_tensor"
+        from .ops import dense_vq_dequant_fp8_packed
+
+        compiled = dense_vq_dequant_fp8_packed(
+            self.payload,
+            self.codebook,
+            rows=self.rows,
+            blocks=self.blocks,
+            bits=self.bits,
+        )
+        if compiled is None:
+            return False
+        quantized, weight_scale = compiled
+        if (
+            tuple(quantized.shape) != (self.rows, self.cols)
+            or quantized.dtype != torch.float8_e4m3fn
+            or tuple(weight_scale.shape) != (1, 1)
+            or weight_scale.dtype != torch.float32
+        ):
+            return False
         self.payload = quantized
-        self.gpu_scales = weight_scale
+        self.gpu_scales = weight_scale.contiguous()
         self.codebook = torch.empty(
             0, dtype=torch.float32, device=self.payload.device
         )
@@ -456,42 +404,6 @@ class DenseVQLinear(nn.Module):
             (1, 1), dtype=torch.float32, device=self.payload.device
         )
         self.layout = "fp8_tensor"
-        return True
-
-    def compile_gpu_compact(self) -> bool:
-        """Prepare the E4M3 codebook used by both compact GPU schedules.
-
-        Decode consumes packed indices and this codebook directly. Prefill
-        expands only the projection currently entering Tensor Core GEMM.
-        """
-        if self.payload.device.type != "cuda" or self.layout != "row-major":
-            return False
-        if self.compact_codebook_fp8.numel():
-            return True
-        if torch.cuda.get_device_capability(self.payload.device) < (8, 9):
-            return False
-        scale = (
-            self.codebook.abs().amax().clamp_min(1.0e-12) / 448.0
-        ).reshape(1, 1).contiguous()
-        quantized = (
-            self.codebook / scale
-        ).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
-        self.compact_codebook_fp8 = quantized
-        self.compact_codebook_scale = scale
-        self.compact_decode_metadata = torch.tensor(
-            [[
-                int(self.payload.data_ptr()),
-                int(self.compact_codebook_fp8.data_ptr()),
-                0,
-                self.rows,
-                self.blocks,
-                int(self.compact_codebook_fp8.shape[1]),
-                _dense_vq_dtype_tag(self.bits),
-                int(self.compact_codebook_scale.data_ptr()),
-            ]],
-            dtype=torch.int64,
-            device=self.payload.device,
-        )
         return True
 
     def _gpu_fp8(self, rows: torch.Tensor) -> torch.Tensor:
@@ -616,31 +528,58 @@ class DenseVQLinear(nn.Module):
         return F.linear(rows.float(), dense)
 
     def _gpu(self, rows: torch.Tensor) -> torch.Tensor:
+        if self.layout == "bf16":
+            return F.linear(rows.to(torch.bfloat16), self.payload)
         if self.layout == "fp8_tensor":
             return self._gpu_fp8(rows)
-        if not self.compact_codebook_fp8.numel():
-            raise RuntimeError(
-                f"Dense VQ compact execution was not prepared for {self.name}"
-            )
+        if self.layout == "int4_g64":
+            from .fusedext import int4_gemv_fused
+            from .kernels import Int4Weight
+
+            if rows.shape[0] == 1:
+                result = int4_gemv_fused(
+                    rows.contiguous(),
+                    self.payload,
+                    self.gpu_scales,
+                    self.cols,
+                    64,
+                    group_vector=True,
+                )
+                if result is None:
+                    raise RuntimeError(
+                        f"CUDA Dense VQ INT4 GEMV unavailable for {self.name}"
+                    )
+                return result
+            return Int4Weight(
+                self.payload,
+                self.gpu_scales,
+                self.cols,
+                64,
+                half=True,
+            ).matmul_T(rows)
+        from .ops import dense_vq_dequant_packed, dense_vq_gemv_packed
         if rows.shape[0] == 1:
-            from .fusedext import dense_vq_gemv_grouped_fp8_codebook_fused
-
-            return dense_vq_gemv_grouped_fp8_codebook_fused(
-                rows,
-                self.compact_decode_metadata,
-                self.rows,
+            result = dense_vq_gemv_packed(
+                rows.float().contiguous(),
+                self.payload,
+                self.codebook,
+                rows=self.rows,
+                blocks=self.blocks,
+                bits=self.bits,
             )
-        from .ops.dense_vq_mma import dense_vq_transient_fp8_gemm
-
-        return dense_vq_transient_fp8_gemm(
-            x_rows=rows.contiguous(),
-            payload=self.payload,
-            codebook_fp8=self.compact_codebook_fp8,
-            codebook_scale=self.compact_codebook_scale,
+            if result is None:
+                raise RuntimeError(f"CUDA packed Dense VQ GEMV unavailable for {self.name}")
+            return result
+        dense = dense_vq_dequant_packed(
+            self.payload,
+            self.codebook,
             rows=self.rows,
             blocks=self.blocks,
             bits=self.bits,
         )
+        if dense is None:
+            raise RuntimeError(f"CUDA packed Dense VQ Prefill unavailable for {self.name}")
+        return F.linear(rows.to(torch.bfloat16), dense)
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         if value.shape[-1] != self.cols:
@@ -705,7 +644,7 @@ class DenseVQLinearGroup(nn.Module):
         supported = (
             {"q4_0"}
             if device_type == "cpu"
-            else {"fp8_tensor", "row-major"}
+            else {"bf16", "int4_g64", "fp8_tensor"}
         )
         if first.layout not in supported:
             raise ValueError(
@@ -721,14 +660,6 @@ class DenseVQLinearGroup(nn.Module):
         self.rows = sum(self.row_counts)
         self._cpu_executor = None
         self.cpu_members = nn.ModuleList()
-        self.gpu_members = nn.ModuleList()
-        compact_decode_metadata = torch.empty(
-            0, dtype=torch.int64, device=first.payload.device
-        )
-        compact_prefill_scale = torch.empty(
-            0, dtype=torch.float32, device=first.payload.device
-        )
-        compact_prefill_codebook_names: tuple[str, ...] = ()
         if device_type == "cpu":
             from .cpuext import make_resident_projection_cpu
             from .kernels import BlockFP8Weight
@@ -788,53 +719,6 @@ class DenseVQLinearGroup(nn.Module):
                 for item in linears
             )
             combined_payload = torch.cat(payloads, dim=0).contiguous()
-        elif self.layout == "row-major":
-            if any(
-                not item.compact_decode_metadata.numel()
-                for item in linears
-            ):
-                raise RuntimeError(
-                    "compact Dense VQ group was not prepared for Decode"
-                )
-            self.gpu_members.extend(linears)
-            metadata_rows: list[list[int]] = []
-            output_offset = 0
-            for item in linears:
-                metadata_rows.append([
-                    int(item.payload.data_ptr()),
-                    int(item.compact_codebook_fp8.data_ptr()),
-                    output_offset,
-                    item.rows,
-                    item.blocks,
-                    int(item.compact_codebook_fp8.shape[1]),
-                    _dense_vq_dtype_tag(item.bits),
-                    int(item.compact_codebook_scale.data_ptr()),
-                ])
-                output_offset += item.rows
-            compact_decode_metadata = torch.tensor(
-                metadata_rows,
-                dtype=torch.int64,
-                device=first.payload.device,
-            )
-            compact_prefill_scale = torch.stack(tuple(
-                item.compact_codebook_scale.reshape(()) for item in linears
-            )).amax().reshape(1, 1)
-            codebook_names: list[str] = []
-            for index, item in enumerate(linears):
-                name = f"compact_prefill_codebook_{index}"
-                normalized = (
-                    item.compact_codebook_fp8.to(torch.bfloat16)
-                    * (
-                        item.compact_codebook_scale / compact_prefill_scale
-                    ).to(torch.bfloat16)
-                ).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
-                self.register_buffer(name, normalized, persistent=False)
-                codebook_names.append(name)
-            compact_prefill_codebook_names = tuple(codebook_names)
-            combined_payload = torch.empty(
-                0, dtype=torch.uint8, device=first.payload.device
-            )
-            common_scale = None
         else:
             common_scale = None
             combined_payload = torch.cat(
@@ -844,22 +728,19 @@ class DenseVQLinearGroup(nn.Module):
             "payload", combined_payload, persistent=False
         )
         self.register_buffer(
-            "compact_decode_metadata",
-            compact_decode_metadata,
-            persistent=False,
-        )
-        self.register_buffer(
-            "compact_prefill_scale",
-            compact_prefill_scale,
-            persistent=False,
-        )
-        self._compact_prefill_codebook_names = compact_prefill_codebook_names
-        self.register_buffer(
             "cpu_prefill_weight",
             torch.empty(0, dtype=torch.bfloat16),
             persistent=False,
         )
-        if self.layout == "fp8_tensor":
+        if self.layout == "int4_g64":
+            self.register_buffer(
+                "gpu_scales",
+                torch.cat(
+                    tuple(item.gpu_scales for item in linears), dim=0
+                ).contiguous(),
+                persistent=False,
+            )
+        elif self.layout == "fp8_tensor":
             self.register_buffer(
                 "gpu_scales", common_scale.contiguous(), persistent=False
             )
@@ -966,6 +847,8 @@ class DenseVQLinearGroup(nn.Module):
                     tuple(member._cpu(rows) for member in self.cpu_members),
                     dim=-1,
                 )
+        elif self.layout == "bf16":
+            combined = F.linear(rows.to(torch.bfloat16), self.payload)
         elif self.layout == "fp8_tensor":
             from .fusedext import dense_fp8_quantize_rows_fused
 
@@ -1007,39 +890,29 @@ class DenseVQLinearGroup(nn.Module):
                 out_dtype=torch.bfloat16,
                 use_fast_accum=True,
             )
-        elif self.layout == "row-major":
-            if rows.shape[0] == 1:
-                from .fusedext import (
-                    dense_vq_gemv_grouped_fp8_codebook_fused,
-                )
-
-                combined = dense_vq_gemv_grouped_fp8_codebook_fused(
-                    rows,
-                    self.compact_decode_metadata,
-                    self.rows,
-                )
-            else:
-                from .ops.dense_vq_mma import (
-                    dense_vq_transient_fp8_grouped_gemm,
-                )
-
-                members = tuple(self.gpu_members)
-                combined = dense_vq_transient_fp8_grouped_gemm(
-                    x_rows=rows.contiguous(),
-                    payloads=tuple(member.payload for member in members),
-                    codebooks_fp8=tuple(
-                        getattr(self, name)
-                        for name in self._compact_prefill_codebook_names
-                    ),
-                    common_codebook_scale=self.compact_prefill_scale,
-                    row_counts=self.row_counts,
-                    blocks=tuple(member.blocks for member in members),
-                    bits=tuple(member.bits for member in members),
-                )
         else:
-            raise RuntimeError(
-                f"unsupported Dense VQ projection group layout {self.layout}"
-            )
+            from .fusedext import int4_gemv_fused
+            from .kernels import Int4Weight
+
+            if rows.shape[0] == 1:
+                combined = int4_gemv_fused(
+                    rows.contiguous(),
+                    self.payload,
+                    self.gpu_scales,
+                    self.cols,
+                    64,
+                    group_vector=True,
+                )
+                if combined is None:
+                    raise RuntimeError("grouped Dense VQ INT4 GEMV unavailable")
+            else:
+                combined = Int4Weight(
+                    self.payload,
+                    self.gpu_scales,
+                    self.cols,
+                    64,
+                    half=True,
+                ).matmul_T(rows)
         return combined.reshape(*shape[:-1], self.rows).to(value.dtype)
 
     def project(self, index: int, value: torch.Tensor) -> torch.Tensor:
@@ -1211,152 +1084,6 @@ class DenseBF16Linear(nn.Module):
             source, source.dtype == torch.float32
         )
         return result.reshape(*shape[:-1], self.out_features).to(value.dtype)
-
-
-class DenseFP8Linear(nn.Module):
-    """Bias-free fixed Linear stored permanently as tensor-scaled E4M3.
-
-    This execution object is independent of Dense VQ caches and expert LRU.
-    Architecture adapters may use it for small fixed attachments such as an
-    MTP drafter whenever native FP8 Tensor Cores are available.
-    """
-
-    def __init__(self, source: nn.Linear) -> None:
-        super().__init__()
-        if (
-            source.bias is not None
-            or not source.weight.is_cuda
-            or source.weight.dtype != torch.bfloat16
-            or torch.version.hip is not None
-            or torch.cuda.get_device_capability(source.weight.device) < (8, 9)
-        ):
-            raise ValueError(
-                "Dense FP8 Linear requires NVIDIA SM89+ BF16/no-bias weights"
-            )
-        self.in_features = int(source.in_features)
-        self.out_features = int(source.out_features)
-        scale = (
-            source.weight.float().abs().amax().clamp_min(1.0e-12) / 448.0
-        ).reshape(1, 1).contiguous()
-        weight = (
-            source.weight / scale.to(torch.bfloat16)
-        ).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
-        self.register_buffer("weight", weight, persistent=False)
-        self.register_buffer("weight_scale", scale, persistent=False)
-
-    def forward(self, value: torch.Tensor) -> torch.Tensor:
-        from .fusedext import dense_fp8_quantize_rows_fused
-
-        shape = value.shape
-        rows = value.reshape(-1, self.in_features).to(
-            torch.bfloat16
-        ).contiguous()
-        quantized = torch.empty_like(rows, dtype=torch.float8_e4m3fn)
-        input_scale = torch.empty(
-            (1, 1), dtype=torch.float32, device=rows.device
-        )
-        if dense_fp8_quantize_rows_fused(
-            rows, quantized, input_scale
-        ) is None:
-            raise RuntimeError("fixed Dense FP8 activation quantizer unavailable")
-        result = torch._scaled_mm(
-            quantized,
-            self.weight.t(),
-            scale_a=input_scale,
-            scale_b=self.weight_scale,
-            out_dtype=torch.bfloat16,
-            use_fast_accum=True,
-        )
-        return result.reshape(*shape[:-1], self.out_features).to(value.dtype)
-
-
-class DenseFP8LinearGroup(nn.Module):
-    """One resident FP8 GEMM for fixed projections sharing an activation."""
-
-    def __init__(self, linears: tuple[nn.Linear, ...]) -> None:
-        super().__init__()
-        if len(linears) < 2:
-            raise ValueError("Dense FP8 group needs at least two Linears")
-        first = linears[0]
-        self.cols = int(first.in_features)
-        if any(
-            item.bias is not None
-            or not item.weight.is_cuda
-            or item.weight.dtype != torch.bfloat16
-            or item.in_features != self.cols
-            or item.weight.device != first.weight.device
-            for item in linears
-        ):
-            raise ValueError("Dense FP8 projection group mismatch")
-        if (
-            torch.version.hip is not None
-            or torch.cuda.get_device_capability(first.weight.device) < (8, 9)
-        ):
-            raise ValueError("Dense FP8 projection group requires NVIDIA SM89+")
-        self.row_counts = tuple(int(item.out_features) for item in linears)
-        self.row_offsets = tuple(
-            sum(self.row_counts[:index]) for index in range(len(linears))
-        )
-        self.rows = sum(self.row_counts)
-        source = torch.cat(
-            tuple(item.weight for item in linears), dim=0
-        ).contiguous()
-        scale = (
-            source.float().abs().amax().clamp_min(1.0e-12) / 448.0
-        ).reshape(1, 1).contiguous()
-        weight = (
-            source / scale.to(torch.bfloat16)
-        ).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
-        self.register_buffer("weight", weight, persistent=False)
-        self.register_buffer("weight_scale", scale, persistent=False)
-        self._cached_input: torch.Tensor | None = None
-        self._cached_parts: tuple[torch.Tensor, ...] = ()
-        self._remaining: set[int] = set()
-
-    def view(self, index: int) -> nn.Module:
-        if not 0 <= int(index) < len(self.row_counts):
-            raise IndexError("Dense FP8 group index is out of range")
-        return _DenseVQLinearGroupView(self, int(index))
-
-    def project(self, index: int, value: torch.Tensor) -> torch.Tensor:
-        from .fusedext import dense_fp8_quantize_rows_fused
-
-        index = int(index)
-        if self._cached_input is not value or index not in self._remaining:
-            shape = value.shape
-            rows = value.reshape(-1, self.cols).to(
-                torch.bfloat16
-            ).contiguous()
-            quantized = torch.empty_like(rows, dtype=torch.float8_e4m3fn)
-            input_scale = torch.empty(
-                (1, 1), dtype=torch.float32, device=rows.device
-            )
-            if dense_fp8_quantize_rows_fused(
-                rows, quantized, input_scale
-            ) is None:
-                raise RuntimeError(
-                    "grouped fixed Dense FP8 activation quantizer unavailable"
-                )
-            combined = torch._scaled_mm(
-                quantized,
-                self.weight.t(),
-                scale_a=input_scale,
-                scale_b=self.weight_scale,
-                out_dtype=torch.bfloat16,
-                use_fast_accum=True,
-            ).reshape(*shape[:-1], self.rows).to(value.dtype)
-            self._cached_input = value
-            self._cached_parts = tuple(
-                combined.narrow(-1, offset, rows)
-                for offset, rows in zip(self.row_offsets, self.row_counts)
-            )
-            self._remaining = set(range(len(self.row_counts)))
-        result = self._cached_parts[index]
-        self._remaining.remove(index)
-        if not self._remaining:
-            self._cached_input = None
-            self._cached_parts = ()
-        return result
 
 
 class DenseBF16LinearGroup(nn.Module):
@@ -1591,8 +1318,6 @@ __all__ = [
     "DenseBF16Linear",
     "DenseBF16LinearGroup",
     "DenseBF16SwiGLU",
-    "DenseFP8Linear",
-    "DenseFP8LinearGroup",
     "DenseVQEmbedding",
     "DenseVQLinear",
     "DenseVQLinearGroup",

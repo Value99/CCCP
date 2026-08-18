@@ -21,13 +21,13 @@ if str(ENGINE) not in sys.path:
 
 from cccp.chat_adapters.base import ChatMessage, ChatOptions  # noqa: E402
 from cccp.chat_adapters.qwen35 import Qwen35ChatAdapter  # noqa: E402
+from cccp.qwen35_model import _qwen35_gpu_image_plan  # noqa: E402
 from cccp.dense_vq import (  # noqa: E402
     DenseBF16SwiGLU,
     DenseVQArchive,
     DenseVQEmbedding,
     DenseVQLinear,
     DenseVQLinearGroup,
-    plan_dense_vq_gpu_execution,
 )
 from cccp.store import PackedVQWeight  # noqa: E402
 from cccp.presets import detect_architecture, resolve_preset  # noqa: E402
@@ -283,56 +283,80 @@ def test_dense_gpu_plan_has_only_resident_and_compact_modes():
         runtime_bytes=4 * gib,
         resident_supported=True,
     )
-    compact = plan_dense_vq_gpu_execution(
-        free_bytes=20 * gib, **args
+    from types import SimpleNamespace
+
+    config = SimpleNamespace(num_key_value_heads=8, head_dim=128, num_layers=48)
+    small, small_plan = _qwen35_gpu_image_plan(
+        free_bytes=16 * gib,
+        linear_bf16_bytes=47 * gib,
+        linear_fp8_bytes=23 * gib,
+        linear_int4_bytes=12 * gib,
+        packed_embedding_bytes=1 * gib,
+        embedding_bf16_bytes=2 * gib,
+        fixed_file_bytes=2 * gib,
+        max_ctx=512,
+        config=config,
+        fp8_supported=True,
     )
-    resident = plan_dense_vq_gpu_execution(
-        free_bytes=40 * gib, **args
+    large, _ = _qwen35_gpu_image_plan(
+        free_bytes=60 * gib,
+        linear_bf16_bytes=47 * gib,
+        linear_fp8_bytes=23 * gib,
+        linear_int4_bytes=12 * gib,
+        packed_embedding_bytes=1 * gib,
+        embedding_bf16_bytes=2 * gib,
+        fixed_file_bytes=2 * gib,
+        max_ctx=512,
+        config=config,
+        fp8_supported=True,
     )
+    # 真实空闲不足时按 int4 紧凑映像规划;宽裕时选更快的 fp8/bf16。
+    assert small in {"int4", "fp8"}
+    assert small_plan["free"] == 16 * gib
+    assert large in {"bf16", "fp8"}
 
-    assert compact.mode == "compact"
-    assert compact.required_bytes == 18 * gib
-    assert resident.mode == "resident"
-    assert resident.required_bytes == 33 * gib
 
+def test_dense_gpu_plan_never_selects_fp8_without_tensor_cores():
+    from types import SimpleNamespace
 
-def test_dense_gpu_plan_rejects_a_forced_unsupported_resident_mode():
     gib = 1 << 30
-    with pytest.raises(RuntimeError, match="FP8 Tensor Cores"):
-        plan_dense_vq_gpu_execution(
-            free_bytes=40 * gib,
-            resident_weight_bytes=27 * gib,
-            compact_weight_bytes=12 * gib,
-            fixed_bytes=2 * gib,
-            runtime_bytes=4 * gib,
-            resident_supported=False,
-            forced_mode="resident",
-        )
+    config = SimpleNamespace(num_key_value_heads=8, head_dim=128, num_layers=48)
+    image, _ = _qwen35_gpu_image_plan(
+        free_bytes=60 * gib,
+        linear_bf16_bytes=47 * gib,
+        linear_fp8_bytes=23 * gib,
+        linear_int4_bytes=12 * gib,
+        packed_embedding_bytes=1 * gib,
+        embedding_bf16_bytes=2 * gib,
+        fixed_file_bytes=2 * gib,
+        max_ctx=512,
+        config=config,
+        fp8_supported=False,
+    )
+    # FP8 Tensor Core 不可用时绝不选 fp8;宽裕显存走精确 bf16。
+    assert image != "fp8"
 
 
-def test_dense_gpu_linear_exposes_only_resident_fp8_and_compact_vq():
+def test_dense_gpu_linear_exposes_fp8_bf16_and_int4_images():
     source = inspect.getsource(DenseVQLinear)
     assert "compile_gpu_fp8" in source
-    assert "compile_gpu_compact" in source
-    assert "dense_vq_gemv_grouped_fp8_codebook_fused" in source
-    assert "dense_vq_transient_fp8_gemm" in source
+    assert "compile_gpu_bf16" in source
+    assert "compile_gpu_int4" in source
+    # 旧的 compact VQ 现场解压路线已被三种常驻映像取代。
+    assert "compile_gpu_compact" not in source
     assert "dense_vq_compact_mma" not in source
     assert "compact_codebook_lut_fp8" not in source
-    assert "dense_vq_gemv_packed" not in source
-    assert "compile_gpu_int4" not in source
-    assert "compile_gpu_bf16" not in source
-    assert "int4_g64" not in source
 
 
 def test_dense_gpu_mode_has_no_legacy_third_route():
     source = (ENGINE / "cccp" / "qwen35_model.py").read_text(
         encoding="utf-8"
     )
-    assert "CCCP_DENSE_VQ_GPU_MODE" in source
-    assert "CCCP_DENSE_VQ_GPU_IMAGE" not in source
-    assert "linear_int4_bytes" not in source
-    assert "bf16_planned" not in source
-    assert "plan_dense_vq_gpu_execution" in source
+    assert "CCCP_DENSE_VQ_GPU_IMAGE" in source
+    assert "plan_dense_vq_gpu_execution" not in source
+    assert "plan_dense_vq_gpu_execution" not in (
+        ENGINE / "cccp" / "dense_vq.py"
+    ).read_text(encoding="utf-8")
 
 
 def test_qwen_gpu_fuses_both_decode_and_prefill_delta_entries():

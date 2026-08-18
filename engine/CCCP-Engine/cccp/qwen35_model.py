@@ -21,7 +21,6 @@ from .dense_vq import (
     DenseVQLinearGroup,
     DenseVQPoolStats,
     DenseVQSwiGLU,
-    plan_dense_vq_gpu_execution,
 )
 
 
@@ -38,9 +37,27 @@ class Qwen35DecodeSnapshot:
     linear_states: tuple[dict[str, object] | None, ...]
 
 
-def _qwen35_runtime_bytes(config, max_ctx: int) -> int:
-    """Return Qwen-owned KV/state allowance for the public VQ planner."""
+def _qwen35_gpu_image_plan(
+    *,
+    free_bytes: int,
+    linear_bf16_bytes: int,
+    packed_embedding_bytes: int,
+    fixed_file_bytes: int,
+    max_ctx: int,
+    config,
+    linear_fp8_bytes: int = 0,
+    linear_int4_bytes: int = 0,
+    embedding_bf16_bytes: int = 0,
+    fp8_supported: bool = False,
+) -> tuple[str, dict[str, int]]:
+    """Choose the fastest execution image that fits real free VRAM.
 
+    The planner has no model-name branches.  It derives the exact Linear and
+    Embedding footprints from manifest shapes and derives the KV allowance
+    from the architecture config.  Compact INT4 remains the universal path;
+    exact resident BF16 is selected only when the complete image plus runtime
+    state and a fragmentation margin fit before loading starts.
+    """
     layer_types = list(getattr(config, "layer_types", ()) or ())
     full_attention_layers = sum(
         1 for item in layer_types if "full_attention" in str(item)
@@ -59,7 +76,56 @@ def _qwen35_runtime_bytes(config, max_ctx: int) -> int:
         * 2  # key + value
         * 2  # BF16
     )
-    return max(4 * _GIB, kv_bytes + 3 * _GIB)
+    # Covers recurrent states, activations, allocator fragmentation and the
+    # transient source matrix that exists while a projection is expanded.
+    runtime_bytes = max(4 * _GIB, kv_bytes + 3 * _GIB)
+    bf16_planned_bytes = (
+        int(linear_bf16_bytes)
+        + int(embedding_bf16_bytes or packed_embedding_bytes)
+        + int(fixed_file_bytes)
+        + int(runtime_bytes)
+    )
+    fp8_planned_bytes = (
+        int(linear_fp8_bytes)
+        + int(embedding_bf16_bytes or packed_embedding_bytes)
+        + int(fixed_file_bytes)
+        + int(runtime_bytes)
+    )
+    int4_planned_bytes = (
+        int(linear_int4_bytes)
+        + int(packed_embedding_bytes)
+        + int(fixed_file_bytes)
+        + int(runtime_bytes)
+    )
+    if (
+        fp8_supported
+        and int(linear_fp8_bytes) > 0
+        and int(free_bytes) >= fp8_planned_bytes
+    ):
+        image = "fp8"
+        planned_bytes = fp8_planned_bytes
+    elif int(free_bytes) >= bf16_planned_bytes:
+        image = "bf16"
+        planned_bytes = bf16_planned_bytes
+    else:
+        image = "int4"
+        planned_bytes = int4_planned_bytes
+    details = {
+        "free": int(free_bytes),
+        "linear_bf16": int(linear_bf16_bytes),
+        "packed_embedding": int(packed_embedding_bytes),
+        "embedding_bf16": int(embedding_bf16_bytes or packed_embedding_bytes),
+        "linear_fp8": int(linear_fp8_bytes),
+        "linear_int4": int(linear_int4_bytes),
+        "fixed": int(fixed_file_bytes),
+        "kv": int(kv_bytes),
+        "runtime": int(runtime_bytes),
+        "planned": int(planned_bytes),
+        "bf16_planned": int(bf16_planned_bytes),
+        "fp8_planned": int(fp8_planned_bytes),
+        "int4_planned": int(int4_planned_bytes),
+    }
+    return image, details
 
 
 def _qwen35_native_fp8_available(device: torch.device) -> bool:
@@ -122,7 +188,7 @@ def _install_qwen35_projection_groups(
             if (
                 all(isinstance(item, DenseVQLinear) for item in linears)
                 and all(
-                    item.layout in {"q4_0", "fp8_tensor", "row-major"}
+                    item.layout in {"q4_0", "bf16", "int4_g64", "fp8_tensor"}
                     for item in linears
                 )
             ):
@@ -431,9 +497,6 @@ class Qwen35DenseVQModel:
         self.device = torch.device(device)
         self.archive = DenseVQArchive(self.root)
         self.store = self.archive
-        from .presets import detect_architecture
-
-        self.architecture = detect_architecture(self.archive.manifest)
         self.cfg = dict(self.archive.manifest.get("config") or {})
         self.max_ctx = min(
             int(max_ctx),
@@ -447,7 +510,7 @@ class Qwen35DenseVQModel:
         )
         self.effective_tp_size = 1
         self.packed_operator_name = "dense_vq.p8-p16.linear+embedding"
-        self._gpu_mode = "none"
+        self._gpu_image = "none"
         self._decode_graph = None
         self._decode_graph_token = None
         self._decode_graph_position = None
@@ -472,6 +535,7 @@ class Qwen35DenseVQModel:
 
     def _configuration(self):
         from transformers import AutoConfig
+        from .ops.sdpa import register_transformers_native_gqa_attention
 
         outer = AutoConfig.from_pretrained(
             self.root,
@@ -481,11 +545,12 @@ class Qwen35DenseVQModel:
         config = getattr(outer, "text_config", outer)
         config.max_position_embeddings = self.max_ctx
         config.use_cache = True
-        # Qwen's verified fast path is Transformers SDPA.  The generic native
-        # GQA adapter is slower for the short fixed verification batches used
-        # by MTP and changes their numerical ordering enough to reduce Top-3
-        # acceptance.  Keep one stable attention implementation here.
-        config._attn_implementation = "sdpa"
+        # The common CCCP adapter keeps native grouped-query attention active
+        # with StaticCache masks.  Selection is capability based and is shared
+        # by CUDA and CPU; no model-name branch lives in the operator itself.
+        config._attn_implementation = (
+            register_transformers_native_gqa_attention()
+        )
         return config
 
     def preload(self) -> None:
@@ -528,10 +593,13 @@ class Qwen35DenseVQModel:
 
         count = len(self.archive.specs)
         compiled = 0
-        gpu_mode = "none"
-        gpu_plan = None
+        gpu_image = "none"
+        gpu_plan: dict[str, int] = {}
         if self.device.type == "cuda":
+            linear_bf16_bytes = 0
             linear_fp8_bytes = 0
+            linear_int4_bytes = 0
+            packed_embedding_bytes = 0
             embedding_bf16_bytes = 0
             for name, spec in self.archive.specs.items():
                 parent, attribute = _resolve_module(
@@ -539,8 +607,19 @@ class Qwen35DenseVQModel:
                 )
                 original = getattr(parent, attribute)
                 if isinstance(original, torch.nn.Linear):
+                    linear_bf16_bytes += spec.rows * spec.cols * 2
                     linear_fp8_bytes += spec.rows * spec.cols + 4
+                    linear_int4_bytes += (
+                        (spec.rows * spec.cols) // 2
+                        + spec.rows * ((spec.cols + 63) // 64) * 2
+                    )
                 elif isinstance(original, torch.nn.Embedding):
+                    code_dim = int(
+                        self.archive.layouts[spec.layout_name]["dim"]
+                    )
+                    packed_embedding_bytes += (
+                        spec.rows * (spec.cols // code_dim) * spec.bits
+                    ) // 8
                     embedding_bf16_bytes += spec.rows * spec.cols * 2
                 else:
                     raise TypeError(
@@ -548,30 +627,63 @@ class Qwen35DenseVQModel:
                         f"{type(original).__name__}"
                     )
             free_bytes, _total_bytes = torch.cuda.mem_get_info(self.device)
-            image_probe = os.environ.get(
-                "CCCP_DENSE_VQ_GPU_MODE", "auto"
-            ).strip().lower()
-            gpu_plan = plan_dense_vq_gpu_execution(
+            gpu_image, gpu_plan = _qwen35_gpu_image_plan(
                 free_bytes=int(free_bytes),
-                resident_weight_bytes=(
-                    linear_fp8_bytes + embedding_bf16_bytes
-                ),
-                compact_weight_bytes=self.archive.packed_bytes,
-                fixed_bytes=self.archive.dense_file_bytes,
-                runtime_bytes=_qwen35_runtime_bytes(config, self.max_ctx),
-                resident_supported=_qwen35_native_fp8_available(self.device),
-                forced_mode=image_probe,
+                linear_bf16_bytes=linear_bf16_bytes,
+                packed_embedding_bytes=packed_embedding_bytes,
+                fixed_file_bytes=self.archive.dense_file_bytes,
+                max_ctx=self.max_ctx,
+                config=config,
+                linear_fp8_bytes=linear_fp8_bytes,
+                linear_int4_bytes=linear_int4_bytes,
+                embedding_bf16_bytes=embedding_bf16_bytes,
+                fp8_supported=_qwen35_native_fp8_available(self.device),
             )
-            gpu_mode = gpu_plan.mode
+            if (
+                gpu_image == "int4"
+                and int(free_bytes) < int(gpu_plan["int4_planned"])
+            ):
+                raise RuntimeError(
+                    "Dense VQ INT4 image exceeds planned free VRAM; choose "
+                    "CPU or a device with more VRAM"
+                )
+            image_probe = os.environ.get(
+                "CCCP_DENSE_VQ_GPU_IMAGE", "auto"
+            ).strip().lower()
+            if image_probe not in {"", "auto", "fp8", "bf16", "int4"}:
+                raise ValueError(
+                    "CCCP_DENSE_VQ_GPU_IMAGE must be auto, fp8, bf16 or int4"
+                )
+            if image_probe in {"fp8", "bf16", "int4"}:
+                required_key = f"{image_probe}_planned"
+                if int(free_bytes) < int(gpu_plan[required_key]):
+                    raise RuntimeError(
+                        f"forced Dense VQ {image_probe.upper()} image exceeds "
+                        "planned free VRAM; choose CPU or a device with more VRAM"
+                    )
+                if image_probe == "fp8" and not _qwen35_native_fp8_available(
+                    self.device
+                ):
+                    raise RuntimeError(
+                        "forced Dense VQ FP8 image requires native NVIDIA "
+                        "FP8 scaled GEMM"
+                    )
+                gpu_image = image_probe
+                gpu_plan["planned"] = int(gpu_plan[required_key])
             print(
                 "[cccp-dense-vq-plan] "
-                f"mode={gpu_mode}; "
+                f"image={gpu_image}; "
                 f"selection={image_probe or 'auto'}; "
-                f"free={gpu_plan.free_bytes / _GIB:.2f}GiB; "
-                f"weights={gpu_plan.weight_bytes / _GIB:.2f}GiB; "
-                f"fixed_upper={gpu_plan.fixed_bytes / _GIB:.2f}GiB; "
-                f"runtime_reserve={gpu_plan.runtime_bytes / _GIB:.2f}GiB; "
-                f"required={gpu_plan.required_bytes / _GIB:.2f}GiB",
+                f"free={gpu_plan['free'] / _GIB:.2f}GiB; "
+                f"bf16_linear={gpu_plan['linear_bf16'] / _GIB:.2f}GiB; "
+                f"fp8_linear={gpu_plan['linear_fp8'] / _GIB:.2f}GiB; "
+                f"int4_linear={gpu_plan['linear_int4'] / _GIB:.2f}GiB; "
+                f"packed_embedding={gpu_plan['packed_embedding'] / _GIB:.2f}GiB; "
+                f"bf16_embedding={gpu_plan['embedding_bf16'] / _GIB:.2f}GiB; "
+                f"fixed_upper={gpu_plan['fixed'] / _GIB:.2f}GiB; "
+                f"kv={gpu_plan['kv'] / _GIB:.2f}GiB; "
+                f"runtime_reserve={gpu_plan['runtime'] / _GIB:.2f}GiB; "
+                f"required={gpu_plan['planned'] / _GIB:.2f}GiB",
                 flush=True,
             )
         for index, name in enumerate(sorted(self.archive.specs), 1):
@@ -586,7 +698,7 @@ class Qwen35DenseVQModel:
                 )
                 if (
                     self.device.type == "cuda"
-                    and gpu_mode == "resident"
+                    and gpu_image in {"bf16", "fp8"}
                     and not replacement.compile_gpu_bf16()
                 ):
                     raise RuntimeError(
@@ -603,19 +715,21 @@ class Qwen35DenseVQModel:
                         )
                     compiled += 1
                 elif self.device.type == "cuda":
-                    if gpu_mode == "resident":
+                    if gpu_image == "fp8":
                         if not replacement.compile_gpu_fp8():
                             raise RuntimeError(
                                 "GPU Dense VQ FP8 compilation failed: " + name
                             )
-                        compiled += 1
-                    elif gpu_mode == "compact":
-                        if not replacement.compile_gpu_compact():
+                    elif gpu_image == "bf16":
+                        if not replacement.compile_gpu_bf16():
                             raise RuntimeError(
-                                "GPU Dense VQ compact preparation failed: "
-                                + name
+                                "GPU Dense VQ BF16 expansion failed: " + name
                             )
-                        compiled += 1
+                    elif gpu_image == "int4" and not replacement.compile_gpu_int4():
+                        raise RuntimeError(
+                            f"GPU Dense VQ INT4 compilation failed: {name}"
+                        )
+                    compiled += 1
             else:
                 raise TypeError(
                     f"Dense VQ tensor {name!r} targets unsupported module "
@@ -740,27 +854,37 @@ class Qwen35DenseVQModel:
                 flush=True,
             )
         elif self.device.type == "cuda":
-            if gpu_mode == "resident":
-                image_bytes = gpu_plan.weight_bytes
+            if gpu_image == "fp8":
+                image_bytes = (
+                    gpu_plan["linear_fp8"] + gpu_plan["embedding_bf16"]
+                )
                 self.packed_operator_name = (
-                    "dense_vq.resident.fp8-tensor.native-scaled-mm"
+                    "dense_vq.fp8-tensor.native-scaled-mm"
                 )
                 print(
-                    f"[cccp-dense-vq] GPU resident 原生 FP8 执行映像完成："
-                    f"{compiled} 个 Linear；权重逐矩阵缩放；"
+                    f"[cccp-dense-vq] GPU 原生 FP8 常驻执行映像完成："
+                    f"{compiled} 个 Linear；packed VQ→E4M3 融合转换；"
+                    "无整矩阵 BF16 中间态；"
                     "Decode 激活由融合 kernel 动态缩放",
                     flush=True,
                 )
-            else:
-                image_bytes = gpu_plan.weight_bytes
-                self.packed_operator_name = (
-                    "dense_vq.compact.decode-direct-dot."
-                    "prefill-grouped-transient-fp8-gemm"
+            elif gpu_image == "bf16":
+                image_bytes = (
+                    gpu_plan["linear_bf16"] + gpu_plan["embedding_bf16"]
                 )
+                self.packed_operator_name = "dense_vq.bf16-resident.vendor-gemm"
                 print(
-                    "[cccp-dense-vq] GPU compact VQ 执行映像完成："
-                    "索引与 E4M3 码本常驻；Decode 直接融合点积；"
-                    "Prefill 同输入投影合并展开后进入 FP8 Tensor Core GEMM",
+                    f"[cccp-dense-vq] GPU BF16 常驻执行映像完成："
+                    f"{compiled} 个 Linear；运行期使用厂商 GEMM/GEMV；"
+                    f"VQ 只在加载期展开",
+                    flush=True,
+                )
+            elif gpu_image == "int4":
+                image_bytes = self.archive.packed_bytes
+                self.packed_operator_name = "dense_vq.int4-g64.compact"
+                print(
+                    f"[cccp-dense-vq] GPU INT4-G64 执行映像完成："
+                    f"{compiled} 个 Linear；运行期不再解包 VQ 码本",
                     flush=True,
                 )
             print(
@@ -772,14 +896,13 @@ class Qwen35DenseVQModel:
                 "[cccp-dense-vq] GPU 同输入投影合并="
                 f"{projection_groups} 组 / "
                 f"{grouped_projections} 个原始 Linear；"
-                "Decode 每组一次 packed VQ 直接点积；"
-                "Prefill 每组一次瞬时 FP8 GEMM",
+                "每组一次 GEMM/GEMV",
                 flush=True,
             )
             self.pool.gpu_storage_bytes = int(image_bytes)
             self.pool.gpu_arena_bytes = int(image_bytes)
             self.pool.bytes = int(image_bytes)
-        self._gpu_mode = gpu_mode
+        self._gpu_image = gpu_image
         self._new_cache(config)
         self._loaded = True
         gc.collect()
@@ -797,7 +920,7 @@ class Qwen35DenseVQModel:
         if (
             self.device.type == "cuda"
             and torch.version.hip is None
-            and self._gpu_mode in {"resident", "compact"}
+            and self._gpu_image in {"bf16", "fp8", "int4"}
         ):
             from transformers.cache_utils import StaticCache
 
@@ -856,7 +979,7 @@ class Qwen35DenseVQModel:
         return bool(
             self.device.type == "cuda"
             and torch.version.hip is None
-            and self._gpu_mode in {"resident", "compact"}
+            and self._gpu_image in {"bf16", "fp8", "int4"}
             and os.environ.get("CCCP_QWEN35_TOKEN_GRAPH", "1") != "0"
         )
 
@@ -901,11 +1024,11 @@ class Qwen35DenseVQModel:
         self._decode_graph_logits = logits
         self.pos += 1
         self.packed_operator_name = (
-            f"dense_vq.{self._gpu_mode}.native-token-graph"
+            f"dense_vq.{self._gpu_image}-resident.native-token-graph"
         )
         print(
             "[cccp-qwen35] decode_executor=native-token-graph; "
-            f"mode={self._gpu_mode}; launches=1/token; "
+            f"image={self._gpu_image}; launches=1/token; "
             "static-kv=enabled; eager-fallback=forbidden",
             flush=True,
         )
