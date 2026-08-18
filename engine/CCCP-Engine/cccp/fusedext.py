@@ -2561,34 +2561,63 @@ if _EXT is not None:
         payload: torch.Tensor,
         scales: torch.Tensor,
         cols: int,
-        groups: int,
+        group_size: int,
         group_vector: bool = True,
     ) -> torch.Tensor | None:
-        """v21b: batched (2..5 rows) GEMV, one weight stream."""
+        """v21b: batched (2..5 rows) GEMV, one weight stream.
+
+        第 5 参是 group size(引擎传 64);groups=cols//group_size 在此推导。
+        旧实现把它当 groups 数直传——C++ 用 scales+row*groups 定行基址,
+        cols>4096 的矩阵从第 1 行起 scale 全错位(输出有限但内容乱码,
+        finite 检查测不出;即第十九轮 v21\"MTP 不兼容\"的真因)。
+        """
+        if (
+            not rows.is_cuda
+            or rows.dtype not in (torch.float32, torch.bfloat16)
+            or payload.dtype != torch.uint8
+            or scales.dtype != torch.float16
+            or group_size != 64
+            or cols <= 0
+            or cols % 64
+        ):
+            return None
         return _EXT.int4_gemv_v21b(
             rows.float().contiguous(),
             payload.contiguous(),
             scales.contiguous(),
             int(payload.numel() * 2 // cols),
             int(cols),
-            int(groups),
+            int(cols // group_size),
         )
     def int4_gemv_v21_fused(
         rows: torch.Tensor,
         payload: torch.Tensor,
         scales: torch.Tensor,
         cols: int,
-        groups: int,
+        group_size: int,
         group_vector: bool = True,
     ) -> torch.Tensor | None:
-        """v21: superstep-interleave layout + 16B/lane GEMV."""
+        """v21: superstep-interleave layout + 16B/lane GEMV.
+
+        第 5 参是 group size(引擎传 64);groups 在此推导,同 v21b 修复。
+        """
+        if (
+            not rows.is_cuda
+            or rows.dtype not in (torch.float32, torch.bfloat16)
+            or payload.dtype != torch.uint8
+            or scales.dtype != torch.float16
+            or group_size != 64
+            or cols <= 0
+            or cols % 64
+        ):
+            return None
         return _EXT.int4_gemv_v21(
             rows.float().contiguous(),
             payload.contiguous(),
             scales.contiguous(),
             int(payload.numel() * 2 // cols),
             int(cols),
-            int(groups),
+            int(cols // group_size),
         )
     def int4_gemv_v17_fused(
         rows: torch.Tensor,
