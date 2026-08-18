@@ -2556,6 +2556,53 @@ if _EXT is not None:
             int(cols),
             int(cols // group_size),
         )
+    def int4_gemv_v30_fused(
+        rows: torch.Tensor,
+        payload: torch.Tensor,
+        scales: torch.Tensor,
+        cols: int,
+        group_size: int,
+        group_vector: bool = True,
+    ) -> torch.Tensor | None:
+        """v30: llama.cpp MMVQ 式 Q8 激活 x Q4 权重 dp4a 批量 GEMV。
+
+        权重驻留 int4 原生布局(0.5B/权重,显存不增);激活逐 64 列组
+        量化到 int8(+fp32 组尺度),组内 int32 精确累加,整数路径绕开
+        CUDA-core 逐 nibble 浮点解包的计算段封顶。
+        """
+        if (
+            not rows.is_cuda
+            or rows.dtype not in (torch.float32, torch.bfloat16)
+            or payload.dtype != torch.uint8
+            or scales.dtype != torch.float16
+            or group_size != 64
+            or cols <= 0
+            or cols % 64
+        ):
+            return None
+        xf = rows.float().contiguous()
+        bsz = int(xf.shape[0])
+        n_groups = cols // group_size
+        if xf.shape[1] == cols:
+            q8, xs = _EXT.int4_v30_quant(xf)
+            q8 = q8.view(bsz, cols)
+        else:
+            xg = xf.view(bsz, n_groups, group_size)
+            amax = xg.abs().amax(dim=-1).clamp_min(1e-12)
+            q8 = (
+                xg / amax.view(bsz, n_groups, 1) * 127.0
+            ).round().clamp(-127, 127).to(torch.int8).reshape(bsz, cols)
+            q8 = q8.contiguous()
+            xs = (amax / 127.0).contiguous()
+        return _EXT.int4_gemv_v30(
+            q8,
+            xs,
+            payload.contiguous(),
+            scales.contiguous(),
+            int(payload.numel() * 2 // cols),
+            int(cols),
+            int(n_groups),
+        )
     def int4_gemv_v21b_fused(
         rows: torch.Tensor,
         payload: torch.Tensor,

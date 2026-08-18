@@ -13462,6 +13462,223 @@ torch::Tensor int4_gemv_v1b(
     return output;
 }
 
+// ── v30: llama.cpp MMVQ 思路移植 ─────────────────────────────────
+// Q8 激活(int8+每 64 列组 fp32 尺度)× int4_g64 权重(原生行主序,不
+// repack 不拷贝),dp4a 整数点积,组内 int32 精确累加,每 32 列×B 一次
+// 浮点尺度合成。对照 v21/vector4 的逐 nibble I2FP+FMUL(计算段 4211
+// cycles 的来源),整数路径把每权重字节的算术密度降 ~4x;权重驻留
+// 0.5B/权重,显存不增。通道对齐:字节 j 的 lo/hi nibble = 列 2j/2j+1,
+// Q8 激活按原生列序输出即天然对齐(第十六轮 dp4a 证伪的错位是 v21
+// 交织布局所致,此处不复存在)。
+// v30b: uint4 宽载(32 列/lane),尺度合成降频 4x,xs 驻 shared。
+constexpr int V30_MAXB = 6;
+
+template <int V30_RPB>
+__global__ void int4_gemv_v30_kernel(
+    const int32_t* __restrict__ xq,       // [B, cols] int8x4 打包
+    const float* __restrict__ xs,         // [B, groups]
+    const uint8_t* __restrict__ packed,   // [rows, cols/2]
+    const __half* __restrict__ scales,    // [rows, groups]
+    float* __restrict__ output,           // [B, rows]
+    const int rows,
+    const int cols,
+    const int groups,
+    const int B)
+{
+    extern __shared__ float sx8[];        // [V30_MAXB][groups]
+    const int lane = threadIdx.x;
+    const int row = blockIdx.x * V30_RPB + threadIdx.y;
+    const int stride = 32 * V30_RPB;
+    for (int i = threadIdx.y * 32 + lane; i < B * groups; i += stride) {
+        sx8[i] = __ldg(xs + i);
+    }
+    __syncthreads();
+    if (row >= rows) return;
+    const uint8_t* qrow = packed + (long)row * (cols >> 1);
+    const __half* srow = scales + (long)row * groups;
+    // 每_lane 负责一个组的 16 字节半段(32 列):warp 每迭代推进 16 组。
+    // pair(lane&~1)共享组 scale,width-2 shuffle 广播。
+    const int gsub = lane >> 1;
+    const int ghalf = lane & 1;
+
+    float accs[V30_MAXB];
+#pragma unroll
+    for (int b = 0; b < V30_MAXB; ++b) accs[b] = 0.f;
+
+    for (int g0 = 0; g0 < groups; g0 += 16)
+    {
+        const int g = g0 + gsub;
+        const bool live = g < groups;
+        float ws = (ghalf == 0 && live)
+            ? __half2float(__ldg(srow + g))
+            : 0.f;
+        ws = __shfl_sync(0xffffffffu, ws, lane & ~1, 2);
+        if (!live) continue;
+        const uint4 cw = *reinterpret_cast<const uint4*>(
+            qrow + g * 32 + ghalf * 16);
+        // 16 字节 → 8 个 int8x4 通道字;字节 k 的 lo/hi = 列 2k/2k+1。
+        uint32_t wv[8];
+        const uint32_t bytes[4] = {cw.x, cw.y, cw.z, cw.w};
+#pragma unroll
+        for (int h = 0; h < 4; ++h)
+        {
+            const uint32_t v = bytes[h];
+            const uint32_t k0 = v & 0xFF, k1 = (v >> 8) & 0xFF;
+            const uint32_t k2 = (v >> 16) & 0xFF, k3 = (v >> 24) & 0xFF;
+            wv[h * 2] =
+                (((k0 & 15) - 8) & 0xFF) |
+                ((((k0 >> 4) - 8) & 0xFF) << 8) |
+                (((k1 & 15) - 8) & 0xFF) << 16 |
+                ((((k1 >> 4) - 8) & 0xFF) << 24);
+            wv[h * 2 + 1] =
+                (((k2 & 15) - 8) & 0xFF) |
+                ((((k2 >> 4) - 8) & 0xFF) << 8) |
+                (((k3 & 15) - 8) & 0xFF) << 16 |
+                ((((k3 >> 4) - 8) & 0xFF) << 24);
+        }
+        const int cb4 = (g << 6) >> 2;    // 组起始列的 int8x4 槽号
+        const int cb8 = ghalf * 8;        // 半段 16 槽中的 8 个
+#pragma unroll
+        for (int b = 0; b < V30_MAXB; ++b)
+        {
+            if (b >= B) break;
+            const int32_t* xb = xq + (long)b * (cols >> 2);
+            const uint4 xv0 = *reinterpret_cast<const uint4*>(
+                xb + cb4 + cb8);
+            const uint4 xv1 = *reinterpret_cast<const uint4*>(
+                xb + cb4 + cb8 + 4);
+            const uint32_t xw[8] = {
+                xv0.x, xv0.y, xv0.z, xv0.w,
+                xv1.x, xv1.y, xv1.z, xv1.w,
+            };
+            int ai = 0;
+#pragma unroll
+            for (int h = 0; h < 8; ++h)
+            {
+                ai = __dp4a((int)wv[h], (int)xw[h], ai);
+            }
+            accs[b] += (float)ai * (ws * sx8[b * groups + g]);
+        }
+    }
+#pragma unroll
+    for (int b = 0; b < V30_MAXB; ++b)
+    {
+        if (b >= B) break;
+        float acc = accs[b];
+        acc += __shfl_down_sync(0xffffffffu, acc, 16);
+        acc += __shfl_down_sync(0xffffffffu, acc, 8);
+        acc += __shfl_down_sync(0xffffffffu, acc, 4);
+        acc += __shfl_down_sync(0xffffffffu, acc, 2);
+        acc += __shfl_down_sync(0xffffffffu, acc, 1);
+        if (lane == 0)
+        {
+            output[(long)b * rows + row] = acc;
+        }
+    }
+}
+
+// v30 配套:Q8 组量化单 kernel(替代 ~8 次 torch 小算子,省 ~50us/组)。
+__global__ void v30_quant_kernel(
+    const float* __restrict__ x,          // [B*groups, 64]
+    int8_t* __restrict__ q8,              // [B*groups*64]
+    float* __restrict__ xs)               // [B*groups]
+{
+    const long idx = blockIdx.x;
+    const int col = threadIdx.x;
+    const int lane = col & 31;
+    const int warp = col >> 5;
+    float a = fabsf(__ldg(x + idx * 64 + col));
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+    {
+        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    }
+    __shared__ float wmax[2];
+    if (lane == 0) wmax[warp] = a;
+    __syncthreads();
+    const float am = fmaxf(wmax[0], wmax[1]);
+    const float s = fmaxf(am, 1e-12f) / 127.f;
+    if (col == 0) xs[idx] = s;
+    const float v = __ldg(x + idx * 64 + col);
+    q8[idx * 64 + col] = (int8_t)rintf(
+        fminf(fmaxf(v / s, -127.f), 127.f));
+}
+
+std::vector<torch::Tensor> int4_v30_quant(torch::Tensor x)
+{
+    TORCH_CHECK(
+        x.device().is_cuda() && x.dtype() == torch::kFloat32 && x.dim() == 2,
+        "v30 quant expects 2D fp32 cuda");
+    const long total = x.numel();
+    TORCH_CHECK(total % 64 == 0, "cols%64");
+    const long n_groups = total / 64;
+    auto q8 = torch::empty(
+        {total}, torch::TensorOptions().dtype(torch::kInt8).device(x.device()));
+    auto xs = torch::empty(
+        {n_groups}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    v30_quant_kernel<<<(unsigned)n_groups, 64, 0, stream>>>(
+        x.data_ptr<float>(),
+        reinterpret_cast<int8_t*>(q8.data_ptr()),
+        xs.data_ptr<float>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {q8, xs};
+}
+
+torch::Tensor int4_gemv_v30(
+    torch::Tensor xq,                     // [B, cols] int8
+    torch::Tensor xs,                     // [B, groups] fp32
+    torch::Tensor packed,
+    torch::Tensor scales,
+    int64_t rows,
+    int64_t cols,
+    int64_t groups)
+{
+    const int B = (int)xq.size(0);
+    TORCH_CHECK(B >= 1 && B <= V30_MAXB, "batch 1..6");
+    TORCH_CHECK(cols % 64 == 0, "cols%64");
+    TORCH_CHECK(xq.dtype() == torch::kInt8 && xs.dtype() == torch::kFloat32,
+                "q8 activation dtype");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto output = torch::empty(
+        {B, rows}, torch::TensorOptions().dtype(torch::kFloat32).device(xq.device()));
+    const size_t shared = (size_t)V30_MAXB * (size_t)groups * sizeof(float);
+    static size_t configured30 = 0;
+    if (configured30 < shared) {
+        auto set30 = [&](auto kernel) {
+            cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                (int)shared);
+        };
+        set30(int4_gemv_v30_kernel<32>);
+        set30(int4_gemv_v30_kernel<16>);
+        set30(int4_gemv_v30_kernel<8>);
+        configured30 = shared;
+    }
+    const int rpb = rows >= 4096 ? 32 : (rows >= 2048 ? 16 : 8);
+    if (rpb == 32) {
+        int4_gemv_v30_kernel<32><<<(rows + 31) / 32, dim3(32, 32), shared, stream>>>(
+            reinterpret_cast<const int32_t*>(xq.data_ptr<int8_t>()),
+            xs.data_ptr<float>(), packed.data_ptr<uint8_t>(),
+            reinterpret_cast<const __half*>(scales.data_ptr()),
+            output.data_ptr<float>(), (int)rows, (int)cols, (int)groups, B);
+    } else if (rpb == 16) {
+        int4_gemv_v30_kernel<16><<<(rows + 15) / 16, dim3(32, 16), shared, stream>>>(
+            reinterpret_cast<const int32_t*>(xq.data_ptr<int8_t>()),
+            xs.data_ptr<float>(), packed.data_ptr<uint8_t>(),
+            reinterpret_cast<const __half*>(scales.data_ptr()),
+            output.data_ptr<float>(), (int)rows, (int)cols, (int)groups, B);
+    } else {
+        int4_gemv_v30_kernel<8><<<(rows + 7) / 8, dim3(32, 8), shared, stream>>>(
+            reinterpret_cast<const int32_t*>(xq.data_ptr<int8_t>()),
+            xs.data_ptr<float>(), packed.data_ptr<uint8_t>(),
+            reinterpret_cast<const __half*>(scales.data_ptr()),
+            output.data_ptr<float>(), (int)rows, (int)cols, (int)groups, B);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
 constexpr int V17_SLICE = 2048;
 
 __global__ void int4_gemv_v17_kernel(
@@ -19901,6 +20118,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Segmented vector4 INT4 GEMV, bf16 activations.");
     m.def("int4_gemv_v1b", &int4_gemv_v1b,
         "v1b batched GEMV (bit-identical to v1, B<=5).");
+    m.def("int4_gemv_v30", &int4_gemv_v30,
+        "v30 MMVQ-style Q8xQ4 dp4a batched GEMV, B<=6, native layout.");
+    m.def("int4_v30_quant", &int4_v30_quant,
+        "v30 per-64-col-group Q8 activation quantizer (single kernel).");
     m.def("int4_repack_v21b", &int4_repack_v21b,
         "v21b repack (same layout).");
     m.def("int4_gemv_v21b", &int4_gemv_v21b,
