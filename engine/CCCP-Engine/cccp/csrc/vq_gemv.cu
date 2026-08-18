@@ -12754,10 +12754,6 @@ torch::Tensor int4_gemv_packed_f32_v2(
     return output;
 }
 
-template <typename input_t, int rows_per_block>
-
-
-
 // ---------------------------------------------------------------------------
 // INT4 GEMV vector8 — v1's conflict-free layout, doubled per-lane traffic.
 // Keeps the proven pattern (lane owns columns stride-2 inside a 64-column
@@ -12845,6 +12841,7 @@ __global__ void int4_gemv_packed_f32_vector8_kernel(
     if (lane == 0) output[row] = acc;
 }
 
+template <typename input_t, int rows_per_block>
 __global__ void int4_gemv_packed_f32_kernel(
     const input_t* __restrict__ x,
     const uint8_t* __restrict__ packed,
