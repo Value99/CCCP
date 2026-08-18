@@ -905,6 +905,72 @@ if _EXT is not None:
             row_ids.contiguous(),
         )
         return result[0], result[1]
+    def dense_vq_mma_packed_m1_fused(
+        input: torch.Tensor,
+        payload: torch.Tensor,
+        codebook: torch.Tensor,
+        rows: int,
+        blocks: int,
+        bits: int,
+    ) -> torch.Tensor:
+        """Decode packed VQ inside a one-row Tensor Core MMA kernel."""
+        if codebook.dtype != torch.float16:
+            raise ValueError(
+                "Dense VQ direct MMA requires a persistent FP16 codebook"
+            )
+        return _EXT.dense_vq_mma_packed_m1(
+            input.float().contiguous(),
+            payload.contiguous().reshape(-1),
+            codebook.contiguous(),
+            int(rows),
+            int(blocks),
+            int(bits),
+        )
+    def dense_vq_compile_int4_g64_fused(
+        payload: torch.Tensor,
+        codebook: torch.Tensor,
+        rows: int,
+        blocks: int,
+        bits: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compile Dense VQ into the common resident INT4-G64 format."""
+        result = _EXT.dense_vq_compile_int4_g64(
+            payload.contiguous().reshape(-1),
+            codebook.float().contiguous(),
+            int(rows),
+            int(blocks),
+            int(bits),
+        )
+        return result[0], result[1]
+    def dense_vq_quantize_fp8_codebook_fused(
+        codebook: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Prepare the compact E4M3 codebook shared by every row tile."""
+        result = _EXT.dense_vq_quantize_fp8_codebook(
+            codebook.float().contiguous()
+        )
+        return result[0], result[1]
+    def dense_vq_expand_fp8_tile_out_fused(
+        payload: torch.Tensor,
+        fp8_codebook: torch.Tensor,
+        rows: int,
+        blocks: int,
+        bits: int,
+        row_start: int,
+        row_count: int,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode one contiguous VQ row tile into fixed E4M3 storage."""
+        return _EXT.dense_vq_expand_fp8_tile_out(
+            payload.contiguous().reshape(-1),
+            fp8_codebook.contiguous(),
+            int(rows),
+            int(blocks),
+            int(bits),
+            int(row_start),
+            int(row_count),
+            output,
+        )
     def dense_vq_dequant_packed_fused(
         payload: torch.Tensor,
         codebook: torch.Tensor,
@@ -3835,6 +3901,14 @@ else:
 
 
     def dense_vq_dequant_fp8_packed_fused(*args, **kwargs):
+        raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")
+    def dense_vq_mma_packed_m1_fused(*args, **kwargs):
+        raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")
+    def dense_vq_compile_int4_g64_fused(*args, **kwargs):
+        raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")
+    def dense_vq_quantize_fp8_codebook_fused(*args, **kwargs):
+        raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")
+    def dense_vq_expand_fp8_tile_out_fused(*args, **kwargs):
         raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")
     def dense_vq_dequant_packed_fused(*args, **kwargs):
         raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")

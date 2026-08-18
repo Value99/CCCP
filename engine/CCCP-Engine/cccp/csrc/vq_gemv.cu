@@ -3155,6 +3155,151 @@ std::vector<torch::Tensor> dense_vq_dequant_fp8_packed(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {output, scale};
 }
+
+std::vector<torch::Tensor> dense_vq_compile_int4_g64(
+    torch::Tensor packed,
+    torch::Tensor codebook,
+    int64_t rows,
+    int64_t blocks,
+    int64_t bits)
+{
+    TORCH_CHECK(
+        packed.is_cuda() && codebook.is_cuda() &&
+        packed.scalar_type() == at::kByte && packed.dim() == 1 &&
+        codebook.scalar_type() == at::kFloat && codebook.dim() == 2 &&
+        packed.is_contiguous() && codebook.is_contiguous(),
+        "Dense VQ INT4 compilation requires CUDA packed/codebook tensors");
+    const int tag = dense_vq_dtype_tag(static_cast<int>(bits));
+    const int vector = static_cast<int>(codebook.size(1));
+    const int64_t columns = blocks * vector;
+    const int64_t expected_bits = rows * blocks * bits;
+    TORCH_CHECK(
+        tag >= 0 && rows > 0 && blocks > 0 && vector > 0 &&
+        columns % 64 == 0 && expected_bits % 8 == 0 &&
+        packed.numel() == expected_bits / 8 &&
+        codebook.size(0) <= (int64_t{1} << bits),
+        "Dense VQ INT4 compilation metadata mismatch");
+    const int64_t groups = columns / 64;
+    auto output = torch::empty({rows, columns / 2}, packed.options());
+    auto scales = torch::empty(
+        {rows, groups}, packed.options().dtype(at::kHalf));
+    dense_vq_compile_int4_g64_kernel<<<
+        static_cast<unsigned>(rows), 256, 0,
+        at::cuda::getCurrentCUDAStream()>>>(
+            packed.data_ptr<uint8_t>(), codebook.data_ptr<float>(),
+            output.data_ptr<uint8_t>(),
+            reinterpret_cast<__half*>(scales.data_ptr<at::Half>()),
+            static_cast<int>(rows), static_cast<int>(blocks), vector, tag,
+            static_cast<int>(groups));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {output, scales};
+}
+
+
+torch::Tensor dense_vq_expand_fp8_tile_out(
+    torch::Tensor packed,
+    torch::Tensor fp8_codebook,
+    int64_t rows,
+    int64_t blocks,
+    int64_t bits,
+    int64_t row_start,
+    int64_t row_count,
+    torch::Tensor output)
+{
+    TORCH_CHECK(
+        packed.is_cuda() && fp8_codebook.is_cuda() && output.is_cuda(),
+        "Dense VQ FP8 tile operands must be CUDA tensors");
+    TORCH_CHECK(
+        packed.scalar_type() == at::kByte && packed.dim() == 1 &&
+        fp8_codebook.scalar_type() == at::ScalarType::Float8_e4m3fn &&
+        fp8_codebook.dim() == 2 &&
+        output.scalar_type() == at::ScalarType::Float8_e4m3fn &&
+        output.dim() == 2 && packed.is_contiguous() &&
+        fp8_codebook.is_contiguous() && output.is_contiguous(),
+        "Dense VQ FP8 tile operand layout mismatch");
+    const int tag = dense_vq_dtype_tag(static_cast<int>(bits));
+    const int vector = static_cast<int>(fp8_codebook.size(1));
+    const int64_t expected_bits = rows * blocks * bits;
+    TORCH_CHECK(
+        tag >= 0 && rows > 0 && blocks > 0 && vector > 0 &&
+        expected_bits % 8 == 0 && packed.numel() == expected_bits / 8 &&
+        fp8_codebook.size(0) > 0 &&
+        fp8_codebook.size(0) <= (int64_t{1} << bits) &&
+        row_start >= 0 && row_count > 0 && row_start + row_count <= rows &&
+        output.size(0) >= row_count && output.size(1) == blocks * vector,
+        "Dense VQ FP8 tile metadata/workspace mismatch");
+    const int device = packed.get_device();
+    TORCH_CHECK(
+        fp8_codebook.get_device() == device && output.get_device() == device,
+        "Dense VQ FP8 tile tensors must share one device");
+    const int64_t count = row_count * blocks;
+    dense_vq_expand_fp8_packed_kernel<<<
+        static_cast<unsigned>((count + 255) / 256), 256, 0,
+        at::cuda::getCurrentCUDAStream()>>>(
+            packed.data_ptr<uint8_t>(),
+            static_cast<const uint8_t*>(fp8_codebook.data_ptr()),
+            static_cast<uint8_t*>(output.data_ptr()),
+            row_count,
+            row_start,
+            blocks,
+            vector,
+            tag,
+            nullptr);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output.narrow(0, 0, row_count);
+}
+
+
+torch::Tensor dense_vq_mma_packed_m1(
+    torch::Tensor input,
+    torch::Tensor packed,
+    torch::Tensor codebook,
+    int64_t rows,
+    int64_t blocks,
+    int64_t bits)
+{
+#if defined(__HIP_PLATFORM_AMD__)
+    TORCH_CHECK(false, "Dense VQ direct MMA is unavailable on HIP");
+#else
+    TORCH_CHECK(
+        input.is_cuda() && packed.is_cuda() && codebook.is_cuda() &&
+        input.scalar_type() == at::kFloat && input.dim() == 2 &&
+        input.size(0) == 1 && input.is_contiguous() &&
+        packed.scalar_type() == at::kByte && packed.dim() == 1 &&
+        packed.is_contiguous() &&
+        codebook.scalar_type() == at::kHalf && codebook.dim() == 2 &&
+        codebook.is_contiguous(),
+        "Dense VQ direct MMA requires CUDA FP32 [1,C], packed uint8, "
+        "and FP16 codebook");
+    const int tag = dense_vq_dtype_tag(static_cast<int>(bits));
+    const int vector = static_cast<int>(codebook.size(1));
+    const int64_t columns = blocks * vector;
+    const int64_t expected_bits = rows * blocks * bits;
+    TORCH_CHECK(
+        tag >= 0 && rows > 0 && rows % 16 == 0 && blocks > 0 &&
+        vector > 0 && 16 % vector == 0 && columns % 16 == 0 &&
+        expected_bits % 8 == 0 &&
+        packed.numel() == expected_bits / 8 &&
+        input.size(1) == columns &&
+        codebook.size(0) <= (int64_t{1} << bits),
+        "Dense VQ direct MMA metadata mismatch");
+    auto output = torch::empty({1, rows}, input.options());
+    dense_vq_mma_packed_m1_kernel<<<
+        static_cast<unsigned>((rows + 15) / 16), 32, 0,
+        at::cuda::getCurrentCUDAStream()>>>(
+            input.data_ptr<float>(),
+            packed.data_ptr<uint8_t>(),
+            reinterpret_cast<const __half*>(codebook.data_ptr<at::Half>()),
+            output.data_ptr<float>(),
+            static_cast<int>(rows),
+            static_cast<int>(blocks),
+            vector,
+            tag);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+#endif
+}
+
 torch::Tensor dense_vq_dequant_packed(
     torch::Tensor packed,
     torch::Tensor codebook,
@@ -18048,6 +18193,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Grouped GGUF-style BF16 Decode directly from packed VQ");
     m.def("dense_vq_dequant_fp8_packed", &dense_vq_dequant_fp8_packed,
         "Expand packed VQ to FP8 rows with a single tensor scale.");
+    m.def("dense_vq_compile_int4_g64", &dense_vq_compile_int4_g64,
+          "Compile Dense VQ into a resident INT4-G64 execution image");
+    m.def("dense_vq_expand_fp8_tile_out", &dense_vq_expand_fp8_tile_out,
+          "Expand one packed Dense VQ row tile into a fixed E4M3 workspace");
+    m.def("dense_vq_mma_packed_m1", &dense_vq_mma_packed_m1,
+          "Decode packed Dense VQ directly into one Tensor Core MMA row");
+    m.def("dense_vq_quantize_fp8_codebook", &dense_vq_quantize_fp8_codebook,
+          "Quantize a compact Dense VQ codebook into tensor-scaled E4M3");
     m.def("dense_vq_dequant_packed", &dense_vq_dequant_packed,
           "Dense VQ BF16 dequantization with optional row selection");
     m.def("dense_vq_expand_native8", &dense_vq_expand_native8,
