@@ -12774,7 +12774,7 @@ __device__ __forceinline__ uint32_t h2_m(__half lo, __half hi)
 __device__ __forceinline__ void mma_m16n8k16_m(
     const uint32_t* a, const uint32_t* b, float* c0, float* c1)
 {
-    float c[4] = {*c0, 0.f, *c1, 0.f};
+    float c[4] = {*c0, *c1, 0.f, 0.f};
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
