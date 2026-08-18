@@ -12757,6 +12757,94 @@ torch::Tensor int4_gemv_packed_f32_v2(
 template <typename input_t, int rows_per_block>
 
 
+
+// ---------------------------------------------------------------------------
+// INT4 GEMV vector8 — v1's conflict-free layout, doubled per-lane traffic.
+// Keeps the proven pattern (lane owns columns stride-2 inside a 64-column
+// group, activation staged in shared memory, one group scale per shfl
+// subgroup) but processes TWO adjacent groups per lane step with two
+// independent accumulators, halving the iteration count of vector4 while
+// keeping two 4-byte loads in flight.  All-architecture: plain LDG + FMA.
+// ---------------------------------------------------------------------------
+template <typename input_t, int rows_per_block>
+__global__ void int4_gemv_packed_f32_vector8_kernel(
+    const input_t* __restrict__ x,
+    const uint8_t* __restrict__ packed,
+    const __half* __restrict__ scales,
+    float* __restrict__ output,
+    int rows,
+    int cols,
+    int groups)
+{
+    extern __shared__ float shared_x[];
+    const int lane = threadIdx.x;
+    const int linear_thread = threadIdx.y * 32 + lane;
+    for (int col = linear_thread; col < cols; col += 32 * rows_per_block) {
+        shared_x[col] = vq_scalar_to_float(x + col);
+    }
+    __syncthreads();
+
+    const int row = blockIdx.x * rows_per_block + threadIdx.y;
+    if (row >= rows) return;
+    const int packed_cols = cols >> 1;
+    const uint8_t* packed_row =
+        packed + (long)row * packed_cols;
+    const __half* scale_row = scales + (long)row * groups;
+
+    // 8 lanes cooperate on one 64-column group (2 columns per lane); the
+    // warp covers four groups (256 columns) per step.
+    const int group_lane = lane & 7;
+    const int group_slot = lane >> 3;      // 0..3
+    float acc0 = 0.f, acc1 = 0.f;
+    for (int group_base = 0; group_base < groups; group_base += 8) {
+        // Even step group for acc0, odd for acc1.
+        const int g0 = group_base + group_slot;        // 4 groups, stride 1
+        const int g1 = group_base + 4 + group_slot;    // next 4 groups
+        float s0 = 0.f, s1 = 0.f;
+        if (group_lane == 0) {
+            if (g0 < groups) s0 = __half2float(__ldg(scale_row + g0));
+            if (g1 < groups) s1 = __half2float(__ldg(scale_row + g1));
+        }
+        s0 = __shfl_sync(0xffffffffu, s0, 0, 8);
+        s1 = __shfl_sync(0xffffffffu, s1, 0, 8);
+        if (g0 < groups) {
+            const uint32_t codes = __ldg(reinterpret_cast<const uint32_t*>(
+                packed_row + g0 * 32 + group_lane * 4));
+            const int col = g0 * 64 + group_lane * 8;
+            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&codes);
+#pragma unroll
+            for (int item = 0; item < 4; ++item) {
+                const uint8_t q = bytes[item];
+                acc0 = __fmaf_rn(
+                    static_cast<float>((q & 15) - 8) * s0,
+                    shared_x[col + item * 2], acc0);
+                acc0 = __fmaf_rn(
+                    static_cast<float>((q >> 4) - 8) * s0,
+                    shared_x[col + item * 2 + 1], acc0);
+            }
+        }
+        if (g1 < groups) {
+            const uint32_t codes = __ldg(reinterpret_cast<const uint32_t*>(
+                packed_row + g1 * 32 + group_lane * 4));
+            const int col = g1 * 64 + group_lane * 8;
+            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&codes);
+#pragma unroll
+            for (int item = 0; item < 4; ++item) {
+                const uint8_t q = bytes[item];
+                acc1 = __fmaf_rn(
+                    static_cast<float>((q & 15) - 8) * s1,
+                    shared_x[col + item * 2], acc1);
+                acc1 = __fmaf_rn(
+                    static_cast<float>((q >> 4) - 8) * s1,
+                    shared_x[col + item * 2 + 1], acc1);
+            }
+        }
+    }
+    float acc = acc0 + acc1;
+    acc = warp_sum_f32(acc);
+    if (lane == 0) output[row] = acc;
+}
+
 __global__ void int4_gemv_packed_f32_kernel(
     const input_t* __restrict__ x,
     const uint8_t* __restrict__ packed,
@@ -14233,6 +14321,43 @@ void launch_int4_gemv_packed_f32_vector4_rows(
                 groups);
 }
 
+
+template <typename input_t, int rows_per_block>
+void launch_int4_gemv_packed_f32_vector8_rows(
+    const input_t* x,
+    const uint8_t* packed,
+    const __half* scales,
+    float* output,
+    int rows,
+    int cols,
+    int groups,
+    int device,
+    cudaStream_t stream)
+{
+    dim3 block(32, rows_per_block);
+    const int blocks = (rows + rows_per_block - 1) / rows_per_block;
+    const size_t shared_bytes = static_cast<size_t>(cols) * sizeof(float);
+    constexpr int tracked_devices = 32;
+    static size_t configured[tracked_devices] = {};
+    TORCH_CHECK(device >= 0 && device < tracked_devices, "v8 device range");
+    if (configured[device] < shared_bytes) {
+        int optin = 0;
+        cudaDeviceGetAttribute(
+            &optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+        TORCH_CHECK(
+            shared_bytes <= static_cast<size_t>(optin),
+            "int4 v8 shared memory unsupported");
+        cccp_gpu_func_set_attribute(
+            int4_gemv_packed_f32_vector8_kernel<input_t, rows_per_block>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(shared_bytes));
+        configured[device] = shared_bytes;
+    }
+    int4_gemv_packed_f32_vector8_kernel<input_t, rows_per_block>
+        <<<blocks, block, shared_bytes, stream>>>(
+            x, packed, scales, output, rows, cols, groups);
+}
+
 template <typename input_t>
 void launch_int4_gemv_packed_f32(
     const input_t* x,
@@ -14246,6 +14371,22 @@ void launch_int4_gemv_packed_f32(
     cudaStream_t stream,
     bool group_vector)
 {
+    static const bool use_vector8 = [] {
+        const char* flag = std::getenv("CCCP_INT4_GEMV_V8");
+        return flag && flag[0] == '1';
+    }();
+    if (group_vector && groups % 8 == 0 && use_vector8) {
+        if (rows <= 2048) {
+            launch_int4_gemv_packed_f32_vector8_rows<input_t, 8>(
+                x, packed, scales, output, rows, cols, groups,
+                device, stream);
+        } else {
+            launch_int4_gemv_packed_f32_vector8_rows<input_t, 32>(
+                x, packed, scales, output, rows, cols, groups,
+                device, stream);
+        }
+        return;
+    }
     if (group_vector && groups % 4 == 0) {
         if (rows <= 2048) {
             launch_int4_gemv_packed_f32_vector4_rows<input_t, 8>(
