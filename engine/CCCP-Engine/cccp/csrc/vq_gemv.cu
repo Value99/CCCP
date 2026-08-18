@@ -12803,6 +12803,203 @@ __global__ void marlin_reduce_kernel_g(
 // conflict-free shared-x; per-4-lane-group reduction (one group = one row).
 // Measured 731 GB/s @5120x17408, 1000 GB/s @248320x5120 on H20.
 // ---------------------------------------------------------------------------
+__global__ void int4_repack_v21_kernel(
+    const uint8_t* __restrict__ src,
+    uint32_t* __restrict__ dst,
+    const int rows,
+    const int cols)
+{
+    const long total = (((long)rows + 7) / 8) * (cols / 128) * 128;
+    for (long w = blockIdx.x * (long)blockDim.x + threadIdx.x;
+         w < total; w += (long)gridDim.x * blockDim.x) {
+        const int intra = (int)(w & 127);
+        const long tile = w >> 7;
+        const int groups_k = cols / 128;           // 4-superstep groups
+        const int sg = (int)(tile % groups_k);
+        const int tile_n = (int)(tile / groups_k);
+        // v21 interleave: intra = j*16 + i*4 + u, so four consecutive
+        // words (a lane's uint4) cover supersteps tile_k+0..3 at the same
+        // (j, i) position.
+        const int j = intra >> 4;
+        const int i = (intra >> 2) & 3;
+        const int u = intra & 3;
+        const int row = tile_n * 8 + j;
+        uint32_t out = 0u;
+        if (row < rows) {
+            const uint8_t* srow = src + (long)row * (cols >> 1) + (sg * 4 + u) * 16;
+            out = (uint32_t)srow[i] | ((uint32_t)srow[i + 4] << 8) |
+                  ((uint32_t)srow[i + 8] << 16) | ((uint32_t)srow[i + 12] << 24);
+        }
+        dst[w] = out;
+    }
+}
+
+constexpr int V21_SLICE = 2048;
+
+__global__ void int4_gemv_v21_kernel(
+    const float* __restrict__ x,
+    const uint32_t* __restrict__ repacked,
+    const __half* __restrict__ scales,
+    float* __restrict__ partial,
+    const int rows,
+    const int cols,
+    const int groups,
+    const int slices)
+{
+    extern __shared__ float sx[];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int slice = blockIdx.x;
+    const int k0 = slice * V21_SLICE;
+    const int here = min(V21_SLICE, cols - k0);
+    if (here <= 0) return;
+    for (int c = threadIdx.x; c < here; c += 128) {
+        sx[c] = x[k0 + c];
+    }
+    __syncthreads();
+    const int row0 = (blockIdx.y * 4 + warp) * 8;
+    if (row0 >= rows) return;
+    const int j = lane >> 2;
+    const int i = lane & 3;
+    const int row = row0 + j;
+    const __half* srow = scales + (long)row * groups;
+    const int groups_k = cols >> 7;
+    const uint32_t* base = repacked +
+        ((((long)(row0 >> 3)) * groups_k + (k0 >> 7)) << 7);
+
+    // v21: one uint4 per lane covers four supersteps at the same (j, i);
+    // intra layout [sg][j][i][u] makes those four words contiguous.
+    float p[32];
+#pragma unroll
+    for (int u = 0; u < 32; ++u) p[u] = 0.f;
+    const int ss = here >> 5;
+    const uint32_t* base_li = base + (lane >> 2) * 16 + (lane & 3) * 4;
+    int sg = 0;
+    for (; sg + 4 <= (ss >> 2); sg += 4) {
+        const uint4 pw[4] = {
+            *reinterpret_cast<const uint4*>(base_li + (sg << 7)),
+            *reinterpret_cast<const uint4*>(base_li + ((sg + 1) << 7)),
+            *reinterpret_cast<const uint4*>(base_li + ((sg + 2) << 7)),
+            *reinterpret_cast<const uint4*>(base_li + ((sg + 3) << 7)),
+        };
+        const uint32_t wv[16] = {
+            pw[0].x, pw[0].y, pw[0].z, pw[0].w,
+            pw[1].x, pw[1].y, pw[1].z, pw[1].w,
+            pw[2].x, pw[2].y, pw[2].z, pw[2].w,
+            pw[3].x, pw[3].y, pw[3].z, pw[3].w,
+        };
+#pragma unroll
+        for (int s2 = 0; s2 < 16; ++s2) {
+            const int ts = sg * 4 + s2;
+            const int ca = ts << 5;
+            const float sa = __half2float(
+                __ldg(srow + ((k0 + ca + 2 * i) >> 6)));
+            const uint32_t w = wv[s2];
+            const uint32_t b0 = w & 0xFF, b1 = (w >> 8) & 0xFF;
+            const uint32_t b2 = (w >> 16) & 0xFF, b3 = (w >> 24) & 0xFF;
+            p[s2 * 2] = __fmaf_rn(static_cast<float>((int)(b0 & 15) - 8) * sa, sx[ca + 2 * i], p[s2 * 2]);
+            p[s2 * 2] = __fmaf_rn(static_cast<float>((int)(b0 >> 4) - 8) * sa, sx[ca + 2 * i + 1], p[s2 * 2]);
+            p[s2 * 2 + 1] = __fmaf_rn(static_cast<float>((int)(b1 & 15) - 8) * sa, sx[ca + 2 * i + 8], p[s2 * 2 + 1]);
+            p[s2 * 2 + 1] = __fmaf_rn(static_cast<float>((int)(b1 >> 4) - 8) * sa, sx[ca + 2 * i + 9], p[s2 * 2 + 1]);
+            p[s2 * 2] = __fmaf_rn(static_cast<float>((int)(b2 & 15) - 8) * sa, sx[ca + 2 * i + 16], p[s2 * 2]);
+            p[s2 * 2] = __fmaf_rn(static_cast<float>((int)(b2 >> 4) - 8) * sa, sx[ca + 2 * i + 17], p[s2 * 2]);
+            p[s2 * 2 + 1] = __fmaf_rn(static_cast<float>((int)(b3 & 15) - 8) * sa, sx[ca + 2 * i + 24], p[s2 * 2 + 1]);
+            p[s2 * 2 + 1] = __fmaf_rn(static_cast<float>((int)(b3 >> 4) - 8) * sa, sx[ca + 2 * i + 25], p[s2 * 2 + 1]);
+        }
+    }
+    for (int ts2 = sg; ts2 < (ss >> 2); ++ts2) {
+        const uint4 pw = *reinterpret_cast<const uint4*>(base_li + (ts2 << 7));
+        const uint32_t wt[4] = {pw.x, pw.y, pw.z, pw.w};
+        for (int u2 = 0; u2 < 4; ++u2) {
+        const int ts = ts2 * 4 + u2;
+        const uint32_t w = wt[u2];
+        const int ca = ts << 5;
+        const float sa = __half2float(__ldg(srow + ((k0 + ca + 2 * i) >> 6)));
+        const uint32_t b0 = w & 0xFF, b1 = (w >> 8) & 0xFF;
+        const uint32_t b2 = (w >> 16) & 0xFF, b3 = (w >> 24) & 0xFF;
+        p[0] = __fmaf_rn(static_cast<float>((int)(b0 & 15) - 8) * sa, sx[ca + 2 * i], p[0]);
+        p[0] = __fmaf_rn(static_cast<float>((int)(b0 >> 4) - 8) * sa, sx[ca + 2 * i + 1], p[0]);
+        p[1] = __fmaf_rn(static_cast<float>((int)(b1 & 15) - 8) * sa, sx[ca + 2 * i + 8], p[1]);
+        p[1] = __fmaf_rn(static_cast<float>((int)(b1 >> 4) - 8) * sa, sx[ca + 2 * i + 9], p[1]);
+        p[0] = __fmaf_rn(static_cast<float>((int)(b2 & 15) - 8) * sa, sx[ca + 2 * i + 16], p[0]);
+        p[0] = __fmaf_rn(static_cast<float>((int)(b2 >> 4) - 8) * sa, sx[ca + 2 * i + 17], p[0]);
+        p[1] = __fmaf_rn(static_cast<float>((int)(b3 & 15) - 8) * sa, sx[ca + 2 * i + 24], p[1]);
+        p[1] = __fmaf_rn(static_cast<float>((int)(b3 >> 4) - 8) * sa, sx[ca + 2 * i + 25], p[1]);
+        }
+    }
+    float acc = 0.f;
+#pragma unroll
+    for (int u = 0; u < 32; ++u) acc += p[u];
+#pragma unroll
+    for (int off = 1; off < 4; off <<= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, off, 4);
+    }
+    if (row < rows && (lane & 3) == 0) {
+        partial[(long)row * slices + slice] = acc;
+    }
+}
+
+
+__global__ void int4_v21_reduce(
+    const float* __restrict__ partial,
+    float* __restrict__ output,
+    const int rows,
+    const int slices)
+{
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    float acc = 0.f;
+    for (int s = 0; s < slices; ++s) acc += partial[(long)row * slices + s];
+    output[row] = acc;
+}
+
+torch::Tensor int4_repack_v21(torch::Tensor packed, int64_t rows, int64_t cols)
+{
+    const long words = (((long)rows + 7) / 8) * (cols / 128) * 128;
+    auto dst = torch::empty(
+        {words * 4},
+        torch::TensorOptions().dtype(torch::kUInt8).device(packed.device()));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int blocks = (int)((words + 255) / 256 > 4096 ? 4096 : (words + 255) / 256);
+    int4_repack_v21_kernel<<<blocks, 256, 0, stream>>>(
+        packed.data_ptr<uint8_t>(),
+        reinterpret_cast<uint32_t*>(dst.data_ptr()),
+        (int)rows, (int)cols);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return dst;
+}
+
+torch::Tensor int4_gemv_v21(
+    torch::Tensor x,
+    torch::Tensor repacked,
+    torch::Tensor scales,
+    int64_t rows,
+    int64_t cols,
+    int64_t groups)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int slices = (int)((cols + V21_SLICE - 1) / V21_SLICE);
+    static torch::Tensor pc;
+    const long needed = (long)rows * slices;
+    if (!pc.defined() || pc.numel() < needed || pc.device() != x.device()) {
+        pc = torch::empty(
+            {needed}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    }
+    torch::Tensor partial = pc.narrow(0, 0, needed);
+    auto output = torch::empty(
+        {rows}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    dim3 grid(slices, (unsigned)(((rows / 8) + 3) / 4));
+    int4_gemv_v21_kernel<<<grid, 128, V21_SLICE * sizeof(float), stream>>>(
+        x.data_ptr<float>(),
+        reinterpret_cast<const uint32_t*>(repacked.data_ptr()),
+        reinterpret_cast<const __half*>(scales.data_ptr()),
+        partial.data_ptr<float>(), (int)rows, (int)cols, (int)groups, slices);
+    int4_v21_reduce<<<(rows + 255) / 256, 256, 0, stream>>>(
+        partial.data_ptr<float>(), output.data_ptr<float>(), (int)rows, slices);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
 constexpr int V17_SLICE = 2048;
 
 __global__ void int4_gemv_v17_kernel(
@@ -19240,6 +19437,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Segmented vector4 INT4 GEMV (conflict-free, staged activation).");
     m.def("int4_gemv_packed_f32_v4s_bf16", &int4_gemv_packed_f32_v4s<__nv_bfloat16>,
         "Segmented vector4 INT4 GEMV, bf16 activations.");
+    m.def("int4_repack_v21", &int4_repack_v21,
+        "v21 superstep-interleave repack.");
+    m.def("int4_gemv_v21", &int4_gemv_v21,
+        "v21 interleave GEMV (892 GB/s cold-stream, SM75+).");
     m.def("int4_gemv_v17", &int4_gemv_v17,
         "v17: marlin tiles + FMA GEMV (731-1000 GB/s, SM75+).");
     m.def("int4_repack_marlin", &int4_repack_marlin,

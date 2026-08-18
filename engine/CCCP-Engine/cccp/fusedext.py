@@ -2523,6 +2523,29 @@ if _EXT is not None:
             return None
         return _EXT.hadamard_bf16(x)
 
+    def int4_repack_v21_fused(payload, cols):
+        return _EXT.int4_repack_v21(
+            payload.contiguous(),
+            int(payload.numel() * 8 // cols // 4 // 4),
+            int(cols),
+        )
+    def int4_gemv_v21_fused(
+        rows: torch.Tensor,
+        payload: torch.Tensor,
+        scales: torch.Tensor,
+        cols: int,
+        groups: int,
+        group_vector: bool = True,
+    ) -> torch.Tensor | None:
+        """v21: superstep-interleave layout + 16B/lane GEMV."""
+        return _EXT.int4_gemv_v21(
+            rows.float().contiguous(),
+            payload.contiguous(),
+            scales.contiguous(),
+            int(payload.numel() * 8 // cols // 4),
+            int(cols),
+            int(groups),
+        )
     def int4_gemv_v17_fused(
         rows: torch.Tensor,
         payload: torch.Tensor,
