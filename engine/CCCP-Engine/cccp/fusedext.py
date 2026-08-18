@@ -878,6 +878,33 @@ if _EXT is not None:
             int(total_rows),
         )
 
+
+    def dense_vq_dequant_fp8_packed_fused(
+        payload: torch.Tensor,
+        codebook: torch.Tensor,
+        rows: int,
+        blocks: int,
+        bits: int,
+        row_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert packed VQ directly to E4M3 plus one tensor scale.
+
+        The CUDA entry quantizes only the compact codebook before expanding
+        packed indices.  It therefore never creates a full BF16 matrix.
+        """
+        if row_ids is None:
+            row_ids = torch.empty(
+                0, dtype=torch.int64, device=payload.device
+            )
+        result = _EXT.dense_vq_dequant_fp8_packed(
+            payload.contiguous().reshape(-1),
+            codebook.float().contiguous(),
+            int(rows),
+            int(blocks),
+            int(bits),
+            row_ids.contiguous(),
+        )
+        return result[0], result[1]
     def dense_vq_dequant_packed_fused(
         payload: torch.Tensor,
         codebook: torch.Tensor,
@@ -3806,6 +3833,9 @@ else:
     def dense_vq_gemv_grouped_fp8_codebook_fused(*args, **kwargs):
         raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")
 
+
+    def dense_vq_dequant_fp8_packed_fused(*args, **kwargs):
+        raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")
     def dense_vq_dequant_packed_fused(*args, **kwargs):
         raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")
 

@@ -3035,6 +3035,126 @@ __global__ void dense_vq_dequant_packed_kernel(
         destination[component] = __float2bfloat16_rn(source[component]);
 }
 
+
+__global__ void dense_vq_expand_fp8_packed_kernel(
+    const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ fp8_codebook,
+    uint8_t* __restrict__ output,
+    const long selected_rows,
+    const long row_start,
+    const long blocks,
+    const int vector,
+    const int dtype_tag,
+    const int64_t* __restrict__ row_ids)
+{
+    const long item = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const long count = selected_rows * blocks;
+    if (item >= count) return;
+    const long selected_row = item / blocks;
+    const long block = item - selected_row * blocks;
+    const long source_row = row_ids == nullptr
+        ? row_start + selected_row
+        : row_ids[selected_row];
+    const int64_t address = static_cast<int64_t>(
+        reinterpret_cast<uintptr_t>(packed));
+    const int code = routed_index_value(
+        address, dtype_tag, source_row * blocks + block);
+    const uint8_t* source = fp8_codebook + static_cast<long>(code) * vector;
+    uint8_t* destination = output +
+        (selected_row * blocks + block) * vector;
+    for (int component = 0; component < vector; ++component)
+        destination[component] = source[component];
+}
+
+std::vector<torch::Tensor> dense_vq_quantize_fp8_codebook(
+    torch::Tensor codebook)
+{
+    TORCH_CHECK(
+        codebook.is_cuda() && codebook.scalar_type() == at::kFloat &&
+        codebook.dim() == 2 && codebook.is_contiguous() &&
+        codebook.numel() > 0,
+        "Dense VQ FP8 codebook conversion requires contiguous CUDA FP32");
+    auto fp8_options = codebook.options().dtype(
+        at::ScalarType::Float8_e4m3fn);
+    auto fp8_codebook = torch::empty(codebook.sizes(), fp8_options);
+    auto scale = torch::empty(
+        {1, 1}, codebook.options().dtype(at::kFloat));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    C10_CUDA_CHECK(cudaMemsetAsync(
+        scale.data_ptr<float>(), 0, sizeof(float), stream));
+    const int64_t items = codebook.numel();
+    const int reduction_blocks = static_cast<int>(std::min<int64_t>(
+        1024, (items + 255) / 256));
+    dense_fp8_tensor_amax_kernel<float><<<
+        reduction_blocks, 256, 0, stream>>>(
+            codebook.data_ptr<float>(),
+            reinterpret_cast<unsigned int*>(scale.data_ptr<float>()),
+            items);
+    dense_fp8_quantize_tensor_kernel<float><<<
+        reduction_blocks, 256, 0, stream>>>(
+            codebook.data_ptr<float>(),
+            static_cast<uint8_t*>(fp8_codebook.data_ptr()),
+            scale.data_ptr<float>(),
+            items);
+    dense_fp8_finalize_tensor_scale_kernel<<<1, 1, 0, stream>>>(
+        scale.data_ptr<float>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {fp8_codebook, scale};
+}
+
+std::vector<torch::Tensor> dense_vq_dequant_fp8_packed(
+    torch::Tensor packed,
+    torch::Tensor codebook,
+    int64_t rows,
+    int64_t blocks,
+    int64_t bits,
+    torch::Tensor row_ids)
+{
+    TORCH_CHECK(
+        packed.is_cuda() && codebook.is_cuda() && row_ids.is_cuda(),
+        "Dense VQ FP8 conversion operands must be CUDA tensors");
+    TORCH_CHECK(
+        packed.scalar_type() == at::kByte && packed.dim() == 1 &&
+        codebook.scalar_type() == at::kFloat && codebook.dim() == 2 &&
+        row_ids.scalar_type() == at::kLong && row_ids.dim() == 1 &&
+        packed.is_contiguous() && codebook.is_contiguous() &&
+        row_ids.is_contiguous(),
+        "Dense VQ FP8 conversion operand layout mismatch");
+    const int tag = dense_vq_dtype_tag(static_cast<int>(bits));
+    const int vector = static_cast<int>(codebook.size(1));
+    const int64_t entries = codebook.size(0);
+    const int64_t expected_bits = rows * blocks * bits;
+    TORCH_CHECK(
+        tag >= 0 && rows > 0 && blocks > 0 && vector > 0 &&
+        expected_bits % 8 == 0 && packed.numel() == expected_bits / 8 &&
+        entries > 0 && entries <= (int64_t{1} << bits),
+        "Dense VQ FP8 conversion metadata mismatch");
+    const int64_t selected = row_ids.numel() == 0 ? rows : row_ids.numel();
+    auto converted_codebook = dense_vq_quantize_fp8_codebook(codebook);
+    auto fp8_codebook = converted_codebook[0];
+    auto scale = converted_codebook[1];
+    auto output = torch::empty(
+        {selected, blocks * vector}, fp8_codebook.options());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    // A VQ matrix only contains values from its codebook. Quantize that
+    // compact table once, then expand byte-sized E4M3 values while decoding
+    // the packed indices. This never materializes the old full BF16 matrix.
+    const int64_t count = selected * blocks;
+    dense_vq_expand_fp8_packed_kernel<<<
+        static_cast<unsigned>((count + 255) / 256), 256, 0, stream>>>(
+            packed.data_ptr<uint8_t>(),
+            static_cast<const uint8_t*>(fp8_codebook.data_ptr()),
+            static_cast<uint8_t*>(output.data_ptr()),
+            selected,
+            0,
+            blocks,
+            vector,
+            tag,
+            row_ids.numel() ? row_ids.data_ptr<int64_t>() : nullptr);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {output, scale};
+}
 torch::Tensor dense_vq_dequant_packed(
     torch::Tensor packed,
     torch::Tensor codebook,
@@ -17926,6 +18046,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dense_vq_gemv_grouped_fp8_codebook",
           &dense_vq_gemv_grouped_fp8_codebook,
           "Grouped GGUF-style BF16 Decode directly from packed VQ");
+    m.def("dense_vq_dequant_fp8_packed", &dense_vq_dequant_fp8_packed,
+        "Expand packed VQ to FP8 rows with a single tensor scale.");
     m.def("dense_vq_dequant_packed", &dense_vq_dequant_packed,
           "Dense VQ BF16 dequantization with optional row selection");
     m.def("dense_vq_expand_native8", &dense_vq_expand_native8,
