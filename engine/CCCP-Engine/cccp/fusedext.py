@@ -2526,7 +2526,7 @@ if _EXT is not None:
     def int4_repack_v21_fused(payload, cols):
         return _EXT.int4_repack_v21(
             payload.contiguous(),
-            int(payload.numel() * 8 // cols // 4 // 4),
+            int(payload.numel() * 2 // cols),
             int(cols),
         )
     def int4_gemv_v21_fused(
@@ -2542,7 +2542,7 @@ if _EXT is not None:
             rows.float().contiguous(),
             payload.contiguous(),
             scales.contiguous(),
-            int(payload.numel() * 8 // cols // 4),
+            int(payload.numel() * 2 // cols),
             int(cols),
             int(groups),
         )
