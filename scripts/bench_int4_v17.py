@@ -230,5 +230,32 @@ def main() -> None:
         print(f"v17 {r2}x{c2}: {m2:.4f} ms -> {nb2 / (m2 / 1e3) / 1e9:.0f} GB/s")
 
 
+def cold_stream() -> None:
+    torch.manual_seed(7)
+    rows, cols = 5120, 17408
+    groups = cols // 64
+    mats = []
+    for _ in range(60):
+        pk = torch.randint(0, 256, (rows * cols // 2,), device="cuda", dtype=torch.uint8)
+        sc = (torch.randn(rows, groups, device="cuda") * 0.05).half()
+        mats.append((ext.int4_repack17(pk, rows, cols), sc))
+    x = torch.randn(cols, device="cuda")
+    def one():
+        for rep, sc in mats:
+            ext.int4_gemv_v17(x, rep, sc, rows, cols, groups)
+    for _ in range(3):
+        one()
+    torch.cuda.synchronize()
+    s = torch.cuda.Event(enable_timing=True); e = torch.cuda.Event(enable_timing=True)
+    s.record()
+    for _ in range(5):
+        one()
+    e.record(); torch.cuda.synchronize()
+    ms = s.elapsed_time(e) / 5 / 60
+    nbytes = rows * cols * 0.5 + rows * groups * 2 + cols * 4
+    print(f"v17 cold-stream: {ms:.4f} ms/matrix -> {nbytes / (ms / 1e3) / 1e9:.0f} GB/s")
+
+
 if __name__ == "__main__":
     main()
+    cold_stream()
