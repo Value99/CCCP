@@ -1052,6 +1052,32 @@ class DenseVQLinearGroup(nn.Module):
                 )
                 if combined is None:
                     raise RuntimeError("grouped Dense VQ INT4 GEMV unavailable")
+            elif (
+                2 <= rows.shape[0] <= 5
+                and rows.is_cuda
+                and os.environ.get("CCCP_INT4_GEMV_V21B", "1") != "0"
+            ):
+                # MTP verify 批路径:int4 权重单次流扫(v1b,bit 一致于逐
+                # token v1)。替代整矩阵 LUT 反量化+GEMM——后者每次调用
+                # 物化 4× 权重字节的 fp16 矩阵,是 verify 280ms/轮的主因。
+                from .fusedext import int4_gemv_v1b_fused
+
+                combined = int4_gemv_v1b_fused(
+                    rows.float(),
+                    self.payload,
+                    self.gpu_scales,
+                    self.cols,
+                    64,
+                    group_vector=True,
+                )
+                if combined is None:
+                    combined = Int4Weight(
+                        self.payload,
+                        self.gpu_scales,
+                        self.cols,
+                        64,
+                        half=True,
+                    ).matmul_T(rows)
             else:
                 combined = Int4Weight(
                     self.payload,

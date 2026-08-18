@@ -2831,6 +2831,20 @@ class Engine:
         }
         stop_requested = False
 
+        # CCCP_MTP_PROFILE=1 时按段累计轮时间(draft/verify/logits/accept/
+        # commit/argmax/callback),定位投机解码的隐藏开销。默认关闭零开销。
+        profile = os.environ.get("CCCP_MTP_PROFILE", "0") == "1"
+        phase_ms: dict[str, float] = {}
+
+        def _phase(name: str, t0: float) -> None:
+            if not profile:
+                return
+            if getattr(model, "device", torch.device("cpu")).type == "cuda":
+                torch.cuda.synchronize(model.device)
+            phase_ms[name] = phase_ms.get(name, 0.0) + (
+                time.perf_counter() - t0
+            ) * 1000.0
+
         while (
             not stop_requested
             and _generation_open(
@@ -2863,6 +2877,7 @@ class Engine:
             mtp_base = mtp.cache_length
             draft_hidden = main_hidden_last
             draft_token = first
+            _t = time.perf_counter()
             if hasattr(mtp, "draft_block"):
                 draft_hidden, drafts = mtp.draft_block(
                     draft_hidden,
@@ -2881,23 +2896,38 @@ class Engine:
                     draft_token = int(draft_logits.argmax().item())
                     drafts.append(draft_token)
             stats["drafted"] += len(drafts)
+            if profile:
+                _phase("draft", _t)
 
             direct_commit = bool(
                 getattr(model, "supports_direct_verify_commit", False)
             )
+            _t = time.perf_counter()
             snapshot = (
                 None if direct_commit else model.snapshot_decode_state()
             )
+            if profile:
+                _phase("snapshot", _t)
             verify = getattr(model, "forward_hidden_verify", model.forward_hidden)
+            _t = time.perf_counter()
             verified_hidden = verify([first] + drafts)
+            if profile:
+                _phase("verify", _t)
+            _t = time.perf_counter()
             verified_logits = model.logits_of(verified_hidden)
+            if profile:
+                _phase("logits", _t)
+            _t = time.perf_counter()
             accepted = policy.accepted_prefix(
                 verified_logits,
                 drafts,
             )
+            if profile:
+                _phase("accept", _t)
 
             # EOS is structural for Qwen.  It may be accepted, but no token
             # after it can enter the committed prefix.
+            _t = time.perf_counter()
             emit_accepted = accepted
             eos_seen = False
             for index in range(accepted):
@@ -2922,6 +2952,9 @@ class Engine:
                     break
 
             stats["accepted"] += emit_accepted
+            if profile:
+                _phase("emit", _t)
+            _t = time.perf_counter()
             committed = 1 + emit_accepted
             full_block = emit_accepted == len(drafts) and not eos_seen
             if full_block:
@@ -2946,6 +2979,8 @@ class Engine:
             mtp.crop(min(mtp.cache_length, mtp_base + committed))
             next_position += committed
             stats["rounds"] += 1
+            if profile:
+                _phase("commit", _t)
 
         if getattr(model, "device", torch.device("cpu")).type == "cuda":
             torch.cuda.synchronize(model.device)
@@ -2965,6 +3000,14 @@ class Engine:
         self._cache_media_digest = getattr(self, "_active_media_digest", None)
         self._cache_media_slots = getattr(self, "_active_media_slots", ())
         self._cache_via_spec = False
+        if profile and stats.get("rounds"):
+            print(
+                "[cccp-mtp-profile] rounds={} ".format(stats["rounds"])
+                + " ".join(
+                    f"{name}={ms:.1f}ms" for name, ms in phase_ms.items()
+                ),
+                flush=True,
+            )
         print(
             "[cccp-mtp] architecture=qwen3.5-dense; "
             f"mode={stats['mode']}; rounds={stats['rounds']}; "
