@@ -640,6 +640,48 @@ class DenseVQLinear(nn.Module):
                 return result
             batch = int(rows.shape[0])
             import os  # local: env switch for v21b batch path
+            if (
+                2 <= batch <= 6
+                and rows.is_cuda
+                and os.environ.get("CCCP_INT4_GEMV_VERIFY", "v1b") == "fp8"
+            ):
+                # FP8 移植(组路径同款):lm_head 等非分组矩阵的 verify 批
+                # 路径走张量核 scaled_mm。
+                from .fusedext import dense_fp8_quantize_rows_fused
+                from .kernels import dequant_int4
+
+                fp8_w = getattr(self, "_fp8_w", None)
+                if fp8_w is None:
+                    dense = dequant_int4(
+                        self.payload, self.gpu_scales, 64
+                    )
+                    amax = dense.abs().amax().clamp_min(1e-12)
+                    fp8_w = (
+                        (dense * (448.0 / amax)).clamp(-448.0, 448.0)
+                    ).to(torch.float8_e4m3fn)
+                    self._fp8_w = fp8_w.contiguous()
+                    self._fp8_scale = (
+                        (amax / 448.0).reshape(1, 1).contiguous()
+                    )
+                source = rows.to(torch.bfloat16).contiguous()
+                quantized = torch.empty_like(
+                    source, dtype=torch.float8_e4m3fn
+                )
+                scales = torch.empty(
+                    (1, 1), dtype=torch.float32, device=source.device
+                )
+                fused = dense_fp8_quantize_rows_fused(
+                    source, quantized, scales
+                )
+                if fused is not None:
+                    return torch._scaled_mm(
+                        fused,
+                        self._fp8_w.t(),
+                        scale_a=scales,
+                        scale_b=self._fp8_scale,
+                        out_dtype=torch.bfloat16,
+                        use_fast_accum=True,
+                    ).float()
             if 2 <= batch <= 6 and rows.is_cuda and os.environ.get(
                 "CCCP_INT4_GEMV_V21B", "1"
             ) != "0":
@@ -1079,6 +1121,54 @@ class DenseVQLinearGroup(nn.Module):
                 )
                 if combined is None:
                     raise RuntimeError("grouped Dense VQ INT4 GEMV unavailable")
+            elif (
+                2 <= rows.shape[0] <= 6
+                and rows.is_cuda
+                and os.environ.get("CCCP_INT4_GEMV_VERIFY", "v1b") == "fp8"
+            ):
+                # FP8 移植(第二十四轮):verify 批路径走张量核 scaled_mm
+                # ——FP8 档实测有效带宽 ~1.8TB/s,是 CUDA-core int4 GEMV
+                # (892GB/s)的 2 倍。惰性一次性把 int4 组转 E4M3+全张量
+                # scale(镜像 fp8_image 的 [1,1] 张量 scale 路径),显存
+                # +1B/权重。draft 侧保持 int4 数值,接受率由实测裁定。
+                from .fusedext import dense_fp8_quantize_rows_fused
+                from .kernels import dequant_int4
+
+                fp8_w = getattr(self, "_fp8_w", None)
+                if fp8_w is None:
+                    dense = dequant_int4(
+                        self.payload, self.gpu_scales, 64
+                    )
+                    amax = dense.abs().amax().clamp_min(1e-12)
+                    fp8_w = (
+                        (dense * (448.0 / amax)).clamp(-448.0, 448.0)
+                    ).to(torch.float8_e4m3fn)
+                    self._fp8_w = fp8_w.contiguous()
+                    self._fp8_scale = (
+                        (amax / 448.0).reshape(1, 1).contiguous()
+                    )
+                source = rows.to(torch.bfloat16).contiguous()
+                quantized = torch.empty_like(
+                    source, dtype=torch.float8_e4m3fn
+                )
+                scales = torch.empty(
+                    (1, 1), dtype=torch.float32, device=source.device
+                )
+                fused = dense_fp8_quantize_rows_fused(
+                    source, quantized, scales
+                )
+                if fused is None:
+                    raise RuntimeError(
+                        "int4->fp8 verify activation quantizer unavailable"
+                    )
+                combined = torch._scaled_mm(
+                    fused,
+                    self._fp8_w.t(),
+                    scale_a=scales,
+                    scale_b=self._fp8_scale,
+                    out_dtype=torch.bfloat16,
+                    use_fast_accum=True,
+                ).float()
             elif (
                 2 <= rows.shape[0] <= 6
                 and rows.is_cuda
