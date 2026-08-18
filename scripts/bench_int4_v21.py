@@ -155,31 +155,6 @@ __global__ void int4_gemv_v19_kernel(
     }
 }
 
-__global__ void int4_pure_read_kernel(
-    const uint32_t* __restrict__ repacked,
-    float* __restrict__ sink,
-    const int rows,
-    const int cols,
-    const int slices)
-{
-    constexpr int SL = 2048;
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
-    const int slice = blockIdx.x;
-    const int k0 = slice * SL;
-    const int here = min(SL, cols - k0);
-    if (here <= 0) return;
-    const int row0 = (blockIdx.y * 4 + warp) * 8;
-    if (row0 >= rows) return;
-    const int groups_k = cols >> 7;
-    const uint32_t* base = repacked +
-        ((((long)(row0 >> 3)) * groups_k + (k0 >> 7)) << 7);
-    uint32_t acc = 0;
-    for (int ts = 0; ts < (here >> 5); ++ts) {
-        acc ^= base[(ts << 5) + lane];
-    }
-    if (acc == 0xDEADBEEFu) sink[0] = 1.f;   // 防优化
-}
 
 __global__ void v19_reduce(
     const float* __restrict__ partial,
