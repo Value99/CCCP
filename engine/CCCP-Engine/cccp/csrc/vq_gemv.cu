@@ -3300,6 +3300,141 @@ torch::Tensor dense_vq_mma_packed_m1(
 #endif
 }
 
+__global__ void dense_vq_mma_packed_m1_kernel(
+    const float* __restrict__ input,
+    const uint8_t* __restrict__ packed,
+    const __half* __restrict__ codebook,
+    float* __restrict__ output,
+    const int rows,
+    const int blocks,
+    const int vector,
+    const int dtype_tag)
+{
+    using namespace nvcuda;
+    constexpr int tile = 16;
+    const int lane = threadIdx.x;
+    const int row_start = static_cast<int>(blockIdx.x) * tile;
+    const int columns = blocks * vector;
+    const int64_t address = static_cast<int64_t>(
+        reinterpret_cast<uintptr_t>(packed));
+    __shared__ __align__(32) __half a_shared[tile * tile];
+    __shared__ __align__(32) __half b_shared[tile * tile];
+    __shared__ __align__(32) float c_shared[tile * tile];
+    wmma::fragment<wmma::matrix_a, tile, tile, tile, __half,
+                   wmma::row_major> a_fragment;
+    wmma::fragment<wmma::matrix_b, tile, tile, tile, __half,
+                   wmma::col_major> b_fragment;
+    wmma::fragment<wmma::accumulator, tile, tile, tile, float>
+        accumulator;
+    wmma::fill_fragment(accumulator, 0.0f);
+    for (int item = lane; item < tile * tile; item += 32)
+        a_shared[item] = __float2half_rn(0.0f);
+    __syncwarp();
+
+    for (int column_start = 0; column_start < columns;
+         column_start += tile) {
+        if (lane < tile)
+            a_shared[lane] = __float2half_rn(input[column_start + lane]);
+        const int code_blocks_per_row = tile / vector;
+        const int tile_code_blocks = tile * code_blocks_per_row;
+        for (int item = lane; item < tile_code_blocks; item += 32) {
+            // B is KxN and column-major. Each B column is one original
+            // output row. Packed VQ is decoded only into shared fragment
+            // staging and is never emitted as a global weight tile.
+            const int b_column = item / code_blocks_per_row;
+            const int local_block = item - b_column * code_blocks_per_row;
+            const int output_row = row_start + b_column;
+            const int source_block = column_start / vector + local_block;
+            if (output_row < rows) {
+                const int code = routed_index_value(
+                    address,
+                    dtype_tag,
+                    static_cast<long>(output_row) * blocks + source_block);
+                const __half* code_row =
+                    codebook + static_cast<long>(code) * vector;
+                const int destination =
+                    b_column * tile + local_block * vector;
+                for (int component = 0; component < vector; ++component)
+                    b_shared[destination + component] = code_row[component];
+            } else {
+                const int destination =
+                    b_column * tile + local_block * vector;
+                for (int component = 0; component < vector; ++component)
+                    b_shared[destination + component] =
+                        __float2half_rn(0.0f);
+            }
+        }
+        __syncwarp();
+        wmma::load_matrix_sync(a_fragment, a_shared, tile);
+        wmma::load_matrix_sync(b_fragment, b_shared, tile);
+        wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
+        __syncwarp();
+    }
+    wmma::store_matrix_sync(
+        c_shared, accumulator, tile, wmma::mem_row_major);
+    __syncwarp();
+    if (lane < tile && row_start + lane < rows)
+        output[row_start + lane] = c_shared[lane];
+}
+
+__global__ void dense_vq_compile_int4_g64_kernel(
+    const uint8_t* __restrict__ packed,
+    const float* __restrict__ codebook,
+    uint8_t* __restrict__ output,
+    __half* __restrict__ scales,
+    const int rows,
+    const int blocks,
+    const int vector,
+    const int dtype_tag,
+    const int groups)
+{
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const int64_t address = static_cast<int64_t>(
+        reinterpret_cast<uintptr_t>(packed));
+    const int columns = blocks * vector;
+    for (int group = warp; group < groups; group += warps) {
+        const int first_column = group * 64 + lane * 2;
+        const int first_block = first_column / vector;
+        const int first_component = first_column - first_block * vector;
+        const int second_column = first_column + 1;
+        const int second_block = second_column / vector;
+        const int second_component = second_column - second_block * vector;
+        const int first_code = routed_index_value(
+            address, dtype_tag,
+            static_cast<long>(row) * blocks + first_block);
+        const int second_code = routed_index_value(
+            address, dtype_tag,
+            static_cast<long>(row) * blocks + second_block);
+        const float first = codebook[
+            static_cast<long>(first_code) * vector + first_component];
+        const float second = codebook[
+            static_cast<long>(second_code) * vector + second_component];
+        float signed_max = fabsf(first) >= fabsf(second) ? first : second;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const float other = __shfl_down_sync(
+                0xffffffffu, signed_max, offset, 32);
+            if (fabsf(other) > fabsf(signed_max)) signed_max = other;
+        }
+        signed_max = __shfl_sync(0xffffffffu, signed_max, 0, 32);
+        float scale = signed_max == 0.0f ? 0.0f : signed_max / -8.0f;
+        const __half rounded_scale = __float2half_rn(scale);
+        scale = __half2float(rounded_scale);
+        const float inverse = scale == 0.0f ? 0.0f : 1.0f / scale;
+        const int low = max(
+            0, min(15, __float2int_rn(first * inverse + 8.0f)));
+        const int high = max(
+            0, min(15, __float2int_rn(second * inverse + 8.0f)));
+        output[static_cast<long>(row) * (columns / 2) + group * 32 + lane] =
+            static_cast<uint8_t>(low | (high << 4));
+        if (lane == 0)
+            scales[static_cast<long>(row) * groups + group] = rounded_scale;
+    }
+}
+
 torch::Tensor dense_vq_dequant_packed(
     torch::Tensor packed,
     torch::Tensor codebook,
