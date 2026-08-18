@@ -673,6 +673,24 @@ class DenseVQLinear(nn.Module):
                 # bytes through HBM on every call and dominated MTP verify).
                 from .fusedext import int4_gemv_fused as _gemv1
 
+                _use21 = os.environ.get("CCCP_INT4_GEMV_V21", "0") == "1"
+                if _use21:
+                    from .fusedext import int4_gemv_v21_fused
+                    from .fusedext import int4_repack_marlin_fused
+                    repacked = getattr(self, "_v21_payload", None)
+                    if repacked is None:
+                        repacked = int4_repack_marlin_fused(self.payload, self.cols)
+                        self._v21_payload = repacked
+                    cols21 = [
+                        int4_gemv_v21_fused(
+                            rows[i : i + 1].float().contiguous(),
+                            repacked,
+                            self.gpu_scales,
+                            self.cols, 64, group_vector=True)
+                        for i in range(batch)
+                    ]
+                    if all(c is not None for c in cols21):
+                        return torch.stack(cols21, dim=0)
                 columns = [
                     _gemv1(
                         rows[i : i + 1].float().contiguous(),
