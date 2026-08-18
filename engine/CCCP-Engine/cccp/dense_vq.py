@@ -643,6 +643,23 @@ class DenseVQLinear(nn.Module):
             if (
                 2 <= batch <= 6
                 and rows.is_cuda
+                and os.environ.get("CCCP_INT4_GEMV_VERIFY", "v1b") == "q8"
+            ):
+                from .fusedext import int4_gemv_v30_fused
+
+                result = int4_gemv_v30_fused(
+                    rows,
+                    self.payload,
+                    self.gpu_scales,
+                    self.cols,
+                    64,
+                    group_vector=True,
+                )
+                if result is not None:
+                    return result
+            if (
+                2 <= batch <= 6
+                and rows.is_cuda
                 and os.environ.get("CCCP_INT4_GEMV_VERIFY", "v1b") == "fp8"
             ):
                 # FP8 移植(组路径同款):lm_head 等非分组矩阵的 verify 批
@@ -1121,6 +1138,31 @@ class DenseVQLinearGroup(nn.Module):
                 )
                 if combined is None:
                     raise RuntimeError("grouped Dense VQ INT4 GEMV unavailable")
+            elif (
+                2 <= rows.shape[0] <= 6
+                and rows.is_cuda
+                and os.environ.get("CCCP_INT4_GEMV_VERIFY", "v1b") == "q8"
+            ):
+                # v30(第二十五轮):llama.cpp MMVQ 移植——Q8 激活×int4
+                # 权重 dp4a,原生布局零拷贝,显存保持 int4 档。
+                from .fusedext import int4_gemv_v30_fused
+
+                combined = int4_gemv_v30_fused(
+                    rows,
+                    self.payload,
+                    self.gpu_scales,
+                    self.cols,
+                    64,
+                    group_vector=True,
+                )
+                if combined is None:
+                    combined = Int4Weight(
+                        self.payload,
+                        self.gpu_scales,
+                        self.cols,
+                        64,
+                        half=True,
+                    ).matmul_T(rows)
             elif (
                 2 <= rows.shape[0] <= 6
                 and rows.is_cuda
