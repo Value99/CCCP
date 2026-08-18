@@ -13227,7 +13227,11 @@ torch::Tensor int4_gemv_v21b(
 constexpr int V1B_MAXB = 5;
 constexpr int V1B_SLICE = 4096;   // per-slice shared: B*4096*4B <= 80KB
 
-template <int ROWS_PER_BLOCK>
+// 命名避开文件头部 #define ROWS_PER_BLOCK 32（宏会让模板参数被展开成字面量）。
+// 逐 token 路径实际走 vector4 kernel（groups%4==0 时）：每 lane 负责一个
+// group（lane>>3），组内 4 字节连乘，warp_sum_f32 归约。v1b 必须逐位复刻
+// 该求和顺序，MTP fast-top3 的严格贪心比较才不被舍入差异翻转。
+template <int V1B_RPB>
 __global__ void int4_gemv_v1b_kernel(
     const float* __restrict__ x,          // [B, cols]
     const uint8_t* __restrict__ packed,   // [rows, cols/2]
@@ -13240,13 +13244,15 @@ __global__ void int4_gemv_v1b_kernel(
 {
     extern __shared__ float sx[];         // [B][V1B_SLICE]
     const int lane = threadIdx.x;
-    const int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
+    const int row = blockIdx.x * V1B_RPB + threadIdx.y;
     if (row >= rows) return;
     const int packed_cols = cols >> 1;
     const uint8_t* qrow = packed + (long)row * packed_cols;
     const __half* srow = scales + (long)row * groups;
-    const int slice_groups = V1B_SLICE >> 6;   // 64
+    const int slice_groups = V1B_SLICE >> 6;   // 64（64%4==0，组对齐保持）
     const int slices = (cols + V1B_SLICE - 1) / V1B_SLICE;
+    const int group_in_iteration = lane >> 3;
+    const int group_lane = lane & 7;
 
     float accs[V1B_MAXB];
 #pragma unroll
@@ -13256,45 +13262,83 @@ __global__ void int4_gemv_v1b_kernel(
         const int g0 = slice * slice_groups;
         const int g1 = min(groups, g0 + slice_groups);
         const int here = (min(cols, (g1 << 6)) - (g0 << 6));
-        // Stage this slice's activations for all B rows.
+        // Stage this slice's activations for all B rows.  增量式推进
+        // b/k，避免每个元素做除法/取模。
+        const int stride = 32 * V1B_RPB;
         const int linear = threadIdx.y * 32 + lane;
-        for (int c = linear; c < B * here; c += 32 * ROWS_PER_BLOCK) {
-            const int b = c / here;
-            const int k = c % here;
-            sx[b * V1B_SLICE + k] = x[(long)b * cols + (g0 << 6) + k];
+        for (int c = linear; c < B * here; c += stride) {
+            int b = c / here;
+            int k = c - b * here;
+            sx[b * V1B_SLICE + k] = __ldg(
+                x + (long)b * cols + (g0 << 6) + k);
         }
         __syncthreads();
-        for (int group = g0; group < g1; ++group) {
-            float scale = lane == 0 ? __half2float(srow[group]) : 0.f;
-            scale = __shfl_sync(0xffffffffu, scale, 0);
-            const int byte_index = group * 32 + lane;
-            const uint8_t q = __ldg(qrow + byte_index);
-            const int col = group * 64 + lane * 2;
-            const float lo = __fmul_rn(
-                static_cast<float>((q & 15) - 8), scale);
-            const float hi = __fmul_rn(
-                static_cast<float>((q >> 4) - 8), scale);
+        for (int group_base = g0; group_base < g1; group_base += 4) {
+            // 尾部不足 4 组时：越界段 scale=0 且 group/col 夹回有效范围，
+            // 使 fma 贡献恰为 0，同时保证 __shfl_sync 全 warp 参与。
+            const bool live =
+                group_base + group_in_iteration < g1;
+            const int group = live
+                ? group_base + group_in_iteration
+                : g1 - 1;
+            float scale = group_lane == 0 && live
+                ? __half2float(srow[group])
+                : 0.f;
+            scale = __shfl_sync(0xffffffffu, scale, 0, 8);
+            const uint32_t codes = __ldg(
+                reinterpret_cast<const uint32_t*>(
+                    qrow + group * 32 + group_lane * 4));
+            const int col_begin =
+                group * 64 + group_lane * 8 - (g0 << 6);
+            // 先预取本组全部 x 向量（10×float4），再进 FMA 链——
+            // 打断 LDS→FFMA 的串行依赖。
+            float4 xbuf[2][V1B_MAXB];
 #pragma unroll
-            for (int b = 0; b < V1B_MAXB; ++b) {
-                if (b >= B) break;
-                const float* xb = sx + b * V1B_SLICE;
-                const int local = col - (g0 << 6);
-                accs[b] = __fmaf_rn(lo, xb[local], accs[b]);
-                accs[b] = __fmaf_rn(hi, xb[local + 1], accs[b]);
+            for (int half4 = 0; half4 < 2; ++half4) {
+                const int col = col_begin + half4 * 4;
+#pragma unroll
+                for (int b = 0; b < V1B_MAXB; ++b) {
+                    xbuf[half4][b] = *reinterpret_cast<const float4*>(
+                        sx + b * V1B_SLICE + col);
+                }
+            }
+#pragma unroll
+            for (int half4 = 0; half4 < 2; ++half4) {
+                const uint16_t pair = static_cast<uint16_t>(
+                    codes >> (half4 * 16));
+                const uint8_t byte_a = static_cast<uint8_t>(pair);
+                const uint8_t byte_b = static_cast<uint8_t>(pair >> 8);
+                // 乘数顺序与 vector4 的 item 循环一致：c0..c7 逐列推进。
+                const float m0 = __fmul_rn(
+                    static_cast<float>((byte_a & 15) - 8), scale);
+                const float m1 = __fmul_rn(
+                    static_cast<float>((byte_a >> 4) - 8), scale);
+                const float m2 = __fmul_rn(
+                    static_cast<float>((byte_b & 15) - 8), scale);
+                const float m3 = __fmul_rn(
+                    static_cast<float>((byte_b >> 4) - 8), scale);
+                // b 维全程无分支（B<5 时多算的槽位不写回）。
+#pragma unroll
+                for (int b = 0; b < V1B_MAXB; ++b) {
+                    const float4 xv = xbuf[half4][b];
+                    accs[b] = __fmaf_rn(m0, xv.x, accs[b]);
+                    accs[b] = __fmaf_rn(m1, xv.y, accs[b]);
+                    accs[b] = __fmaf_rn(m2, xv.z, accs[b]);
+                    accs[b] = __fmaf_rn(m3, xv.w, accs[b]);
+                }
             }
         }
         __syncthreads();
     }
 #pragma unroll
     for (int b = 0; b < V1B_MAXB; ++b) {
-        if (b >= B) break;
         float acc = accs[b];
         acc += __shfl_down_sync(0xffffffffu, acc, 16);
         acc += __shfl_down_sync(0xffffffffu, acc, 8);
         acc += __shfl_down_sync(0xffffffffu, acc, 4);
         acc += __shfl_down_sync(0xffffffffu, acc, 2);
         acc += __shfl_down_sync(0xffffffffu, acc, 1);
-        if (lane == 0) {
+        if (lane == 0 && b < B) {
             output[(long)b * rows + row] = acc;
         }
     }
@@ -13314,7 +13358,9 @@ torch::Tensor int4_gemv_v1b(
     auto stream = at::cuda::getCurrentCUDAStream();
     auto output = torch::empty(
         {B, rows}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
-    const size_t shared = (size_t)B * V1B_SLICE * sizeof(float);
+    // 固定按 V1B_MAXB 槽位分配：b>=B 的槽位读未写共享（结果不写回），
+    // 换取计算段无分支；80KB 仍允许 2 block/SM。
+    const size_t shared = (size_t)V1B_MAXB * V1B_SLICE * sizeof(float);
     static size_t configured = 0;
     if (configured < shared) {
         auto set_attr = [&](auto kernel) {

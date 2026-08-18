@@ -2534,17 +2534,27 @@ if _EXT is not None:
         payload: torch.Tensor,
         scales: torch.Tensor,
         cols: int,
-        groups: int,
+        group_size: int,
         group_vector: bool = True,
     ) -> torch.Tensor | None:
         """v1b: batched (2..5) GEMV, bit-identical to v1 per-token."""
+        if (
+            not rows.is_cuda
+            or rows.dtype not in (torch.float32, torch.bfloat16)
+            or payload.dtype != torch.uint8
+            or scales.dtype != torch.float16
+            or group_size != 64
+            or cols <= 0
+            or cols % 64
+        ):
+            return None
         return _EXT.int4_gemv_v1b(
             rows.float().contiguous(),
             payload.contiguous(),
             scales.contiguous(),
             int(payload.numel() * 2 // cols),
             int(cols),
-            int(groups),
+            int(cols // group_size),
         )
     def int4_gemv_v21b_fused(
         rows: torch.Tensor,
