@@ -12619,6 +12619,12 @@ torch::Tensor int4_embedding_lookup_device_row(
 // cutting shared staging traffic ~4x for wide matrices.  Segments combine
 // through the v2 partial/reduce pair.  All-architecture LDG + FMA only.
 // ---------------------------------------------------------------------------
+__global__ void int4_gemv_v2_reduce_kernel(
+    const float* __restrict__ partial,
+    float* __restrict__ output,
+    const int rows,
+    const int segments);
+
 constexpr int kInt4V4SegCols = 4096;  // 64 groups per segment
 constexpr int kInt4V4Warps = 8;       // rows per block
 
