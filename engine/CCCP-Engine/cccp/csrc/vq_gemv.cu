@@ -12809,7 +12809,8 @@ __global__ void int4_repack_marlin_kernel(
     const int rows,
     const int cols)
 {
-    const long words_total = (long)rows * (cols / 32) * 32;
+    const long words_total =
+        (((long)rows + 7) / 8) * (cols / 32) * 32;  // uint32 count
     for (long w = blockIdx.x * (long)blockDim.x + threadIdx.x;
          w < words_total;
          w += (long)gridDim.x * blockDim.x) {
@@ -12837,9 +12838,12 @@ torch::Tensor int4_repack_marlin(
     int64_t cols)
 {
     TORCH_CHECK(cols % 32 == 0, "marlin repack requires cols%32==0");
-    auto dst = torch::empty_like(packed);
+    const long words = (((long)rows + 7) / 8) * (cols / 32) * 32;
+    auto dst = torch::empty(
+        {words * 4},
+        torch::TensorOptions().dtype(torch::kUInt8).device(packed.device()));
     auto stream = at::cuda::getCurrentCUDAStream();
-    const long total = (long)rows * (cols / 32) * 32 / 4;
+    const long total = words;
     const int blocks = (int)((total + 255) / 256 > 4096 ? 4096 : (total + 255) / 256);
     int4_repack_marlin_kernel<<<blocks, 256, 0, stream>>>(
         packed.data_ptr<uint8_t>(),
