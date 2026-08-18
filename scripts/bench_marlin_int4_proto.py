@@ -304,6 +304,7 @@ def main() -> None:
         import sys
         sys.path.insert(0, "/media/tyh20/disk22/cccp-qwen-gemv-20260818/engine/CCCP-Engine")
         from cccp.fusedext import int4_gemv_marlin_fused, int4_repack_marlin_fused
+        nbytes_r = rows * cols * 0.5 + rows * groups * 2 + cols * 2
         rep = int4_repack_marlin_fused(packed, cols)
         out_m = int4_gemv_marlin_fused(x, rep, scales, cols, groups)
         torch.cuda.synchronize()
@@ -333,11 +334,12 @@ def main() -> None:
             int4_gemv_marlin_fused(x, rep, scales, cols, groups)
         e2.record(); torch.cuda.synchronize()
         ms2 = s2.elapsed_time(e2) / 300
-        print(f"repack+marlin: {ms2:.4f} ms -> {nbytes / (ms2 / 1e3) / 1e9:.0f} GB/s")
+        print(f"repack+marlin: {ms2:.4f} ms -> {nbytes_r / (ms2 / 1e3) / 1e9:.0f} GB/s")
     except Exception as exc:  # noqa: BLE001
         print("repack path unavailable:", type(exc).__name__, exc)
 
     # 带宽
+    nbytes = rows * cols * 0.5 + rows * groups * 2 + cols * 2
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     for _ in range(50):
@@ -349,7 +351,6 @@ def main() -> None:
     end.record()
     torch.cuda.synchronize()
     ms = start.elapsed_time(end) / 300
-    nbytes = rows * cols * 0.5 + rows * groups * 2 + cols * 2
     print(f"marlin proto: {ms:.4f} ms  -> {nbytes / (ms / 1e3) / 1e9:.0f} GB/s "
           f"(目标 2000 GB/s;v1 实测 ~650)")
 
