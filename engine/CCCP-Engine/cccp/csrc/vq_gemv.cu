@@ -12610,8 +12610,6 @@ torch::Tensor int4_embedding_lookup_device_row(
     return output;
 }
 
-template <typename input_t, int rows_per_block>
-
 // ---------------------------------------------------------------------------
 // INT4 GEMV v2 — split-K batch=1 kernel, all architectures (SM70+).
 // One warp owns one output row inside a 1024-column segment; each lane loads
@@ -12670,7 +12668,6 @@ __global__ void int4_gemv_packed_f32_v2_kernel(
         // columns — no per-element tail guards are needed.
         (void)local_nibbles;
         float acc = 0.f;
-        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&word);
 #pragma unroll
         for (int b = 0; b < 16; ++b) {
             const uint8_t q = bytes[b];
@@ -12742,6 +12739,9 @@ torch::Tensor int4_gemv_packed_f32_v2(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
+
+template <typename input_t, int rows_per_block>
+
 
 __global__ void int4_gemv_packed_f32_kernel(
     const input_t* __restrict__ x,
