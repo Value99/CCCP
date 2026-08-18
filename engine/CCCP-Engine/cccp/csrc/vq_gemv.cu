@@ -33,6 +33,7 @@
 //        or scripts/prebuild_gpu_ops.ps1 (uses the bundled toolchain).
 
 #include <torch/extension.h>
+#include <mma.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Exceptions.h>
 #include <cuda_bf16.h>
@@ -3156,6 +3157,64 @@ std::vector<torch::Tensor> dense_vq_dequant_fp8_packed(
     return {output, scale};
 }
 
+__global__ void dense_vq_compile_int4_g64_kernel(
+    const uint8_t* __restrict__ packed,
+    const float* __restrict__ codebook,
+    uint8_t* __restrict__ output,
+    __half* __restrict__ scales,
+    const int rows,
+    const int blocks,
+    const int vector,
+    const int dtype_tag,
+    const int groups)
+{
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const int64_t address = static_cast<int64_t>(
+        reinterpret_cast<uintptr_t>(packed));
+    const int columns = blocks * vector;
+    for (int group = warp; group < groups; group += warps) {
+        const int first_column = group * 64 + lane * 2;
+        const int first_block = first_column / vector;
+        const int first_component = first_column - first_block * vector;
+        const int second_column = first_column + 1;
+        const int second_block = second_column / vector;
+        const int second_component = second_column - second_block * vector;
+        const int first_code = routed_index_value(
+            address, dtype_tag,
+            static_cast<long>(row) * blocks + first_block);
+        const int second_code = routed_index_value(
+            address, dtype_tag,
+            static_cast<long>(row) * blocks + second_block);
+        const float first = codebook[
+            static_cast<long>(first_code) * vector + first_component];
+        const float second = codebook[
+            static_cast<long>(second_code) * vector + second_component];
+        float signed_max = fabsf(first) >= fabsf(second) ? first : second;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const float other = __shfl_down_sync(
+                0xffffffffu, signed_max, offset, 32);
+            if (fabsf(other) > fabsf(signed_max)) signed_max = other;
+        }
+        signed_max = __shfl_sync(0xffffffffu, signed_max, 0, 32);
+        float scale = signed_max == 0.0f ? 0.0f : signed_max / -8.0f;
+        const __half rounded_scale = __float2half_rn(scale);
+        scale = __half2float(rounded_scale);
+        const float inverse = scale == 0.0f ? 0.0f : 1.0f / scale;
+        const int low = max(
+            0, min(15, __float2int_rn(first * inverse + 8.0f)));
+        const int high = max(
+            0, min(15, __float2int_rn(second * inverse + 8.0f)));
+        output[static_cast<long>(row) * (columns / 2) + group * 32 + lane] =
+            static_cast<uint8_t>(low | (high << 4));
+        if (lane == 0)
+            scales[static_cast<long>(row) * groups + group] = rounded_scale;
+    }
+}
+
 std::vector<torch::Tensor> dense_vq_compile_int4_g64(
     torch::Tensor packed,
     torch::Tensor codebook,
@@ -3250,56 +3309,6 @@ torch::Tensor dense_vq_expand_fp8_tile_out(
 }
 
 
-torch::Tensor dense_vq_mma_packed_m1(
-    torch::Tensor input,
-    torch::Tensor packed,
-    torch::Tensor codebook,
-    int64_t rows,
-    int64_t blocks,
-    int64_t bits)
-{
-#if defined(__HIP_PLATFORM_AMD__)
-    TORCH_CHECK(false, "Dense VQ direct MMA is unavailable on HIP");
-#else
-    TORCH_CHECK(
-        input.is_cuda() && packed.is_cuda() && codebook.is_cuda() &&
-        input.scalar_type() == at::kFloat && input.dim() == 2 &&
-        input.size(0) == 1 && input.is_contiguous() &&
-        packed.scalar_type() == at::kByte && packed.dim() == 1 &&
-        packed.is_contiguous() &&
-        codebook.scalar_type() == at::kHalf && codebook.dim() == 2 &&
-        codebook.is_contiguous(),
-        "Dense VQ direct MMA requires CUDA FP32 [1,C], packed uint8, "
-        "and FP16 codebook");
-    const int tag = dense_vq_dtype_tag(static_cast<int>(bits));
-    const int vector = static_cast<int>(codebook.size(1));
-    const int64_t columns = blocks * vector;
-    const int64_t expected_bits = rows * blocks * bits;
-    TORCH_CHECK(
-        tag >= 0 && rows > 0 && rows % 16 == 0 && blocks > 0 &&
-        vector > 0 && 16 % vector == 0 && columns % 16 == 0 &&
-        expected_bits % 8 == 0 &&
-        packed.numel() == expected_bits / 8 &&
-        input.size(1) == columns &&
-        codebook.size(0) <= (int64_t{1} << bits),
-        "Dense VQ direct MMA metadata mismatch");
-    auto output = torch::empty({1, rows}, input.options());
-    dense_vq_mma_packed_m1_kernel<<<
-        static_cast<unsigned>((rows + 15) / 16), 32, 0,
-        at::cuda::getCurrentCUDAStream()>>>(
-            input.data_ptr<float>(),
-            packed.data_ptr<uint8_t>(),
-            reinterpret_cast<const __half*>(codebook.data_ptr<at::Half>()),
-            output.data_ptr<float>(),
-            static_cast<int>(rows),
-            static_cast<int>(blocks),
-            vector,
-            tag);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return output;
-#endif
-}
-
 __global__ void dense_vq_mma_packed_m1_kernel(
     const float* __restrict__ input,
     const uint8_t* __restrict__ packed,
@@ -3377,63 +3386,57 @@ __global__ void dense_vq_mma_packed_m1_kernel(
         output[row_start + lane] = c_shared[lane];
 }
 
-__global__ void dense_vq_compile_int4_g64_kernel(
-    const uint8_t* __restrict__ packed,
-    const float* __restrict__ codebook,
-    uint8_t* __restrict__ output,
-    __half* __restrict__ scales,
-    const int rows,
-    const int blocks,
-    const int vector,
-    const int dtype_tag,
-    const int groups)
+torch::Tensor dense_vq_mma_packed_m1(
+    torch::Tensor input,
+    torch::Tensor packed,
+    torch::Tensor codebook,
+    int64_t rows,
+    int64_t blocks,
+    int64_t bits)
 {
-    const int row = blockIdx.x;
-    if (row >= rows) return;
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
-    const int warps = blockDim.x >> 5;
-    const int64_t address = static_cast<int64_t>(
-        reinterpret_cast<uintptr_t>(packed));
-    const int columns = blocks * vector;
-    for (int group = warp; group < groups; group += warps) {
-        const int first_column = group * 64 + lane * 2;
-        const int first_block = first_column / vector;
-        const int first_component = first_column - first_block * vector;
-        const int second_column = first_column + 1;
-        const int second_block = second_column / vector;
-        const int second_component = second_column - second_block * vector;
-        const int first_code = routed_index_value(
-            address, dtype_tag,
-            static_cast<long>(row) * blocks + first_block);
-        const int second_code = routed_index_value(
-            address, dtype_tag,
-            static_cast<long>(row) * blocks + second_block);
-        const float first = codebook[
-            static_cast<long>(first_code) * vector + first_component];
-        const float second = codebook[
-            static_cast<long>(second_code) * vector + second_component];
-        float signed_max = fabsf(first) >= fabsf(second) ? first : second;
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            const float other = __shfl_down_sync(
-                0xffffffffu, signed_max, offset, 32);
-            if (fabsf(other) > fabsf(signed_max)) signed_max = other;
-        }
-        signed_max = __shfl_sync(0xffffffffu, signed_max, 0, 32);
-        float scale = signed_max == 0.0f ? 0.0f : signed_max / -8.0f;
-        const __half rounded_scale = __float2half_rn(scale);
-        scale = __half2float(rounded_scale);
-        const float inverse = scale == 0.0f ? 0.0f : 1.0f / scale;
-        const int low = max(
-            0, min(15, __float2int_rn(first * inverse + 8.0f)));
-        const int high = max(
-            0, min(15, __float2int_rn(second * inverse + 8.0f)));
-        output[static_cast<long>(row) * (columns / 2) + group * 32 + lane] =
-            static_cast<uint8_t>(low | (high << 4));
-        if (lane == 0)
-            scales[static_cast<long>(row) * groups + group] = rounded_scale;
-    }
+#if defined(__HIP_PLATFORM_AMD__)
+    TORCH_CHECK(false, "Dense VQ direct MMA is unavailable on HIP");
+#else
+    TORCH_CHECK(
+        input.is_cuda() && packed.is_cuda() && codebook.is_cuda() &&
+        input.scalar_type() == at::kFloat && input.dim() == 2 &&
+        input.size(0) == 1 && input.is_contiguous() &&
+        packed.scalar_type() == at::kByte && packed.dim() == 1 &&
+        packed.is_contiguous() &&
+        codebook.scalar_type() == at::kHalf && codebook.dim() == 2 &&
+        codebook.is_contiguous(),
+        "Dense VQ direct MMA requires CUDA FP32 [1,C], packed uint8, "
+        "and FP16 codebook");
+    const int tag = dense_vq_dtype_tag(static_cast<int>(bits));
+    const int vector = static_cast<int>(codebook.size(1));
+    const int64_t columns = blocks * vector;
+    const int64_t expected_bits = rows * blocks * bits;
+    TORCH_CHECK(
+        tag >= 0 && rows > 0 && rows % 16 == 0 && blocks > 0 &&
+        vector > 0 && 16 % vector == 0 && columns % 16 == 0 &&
+        expected_bits % 8 == 0 &&
+        packed.numel() == expected_bits / 8 &&
+        input.size(1) == columns &&
+        codebook.size(0) <= (int64_t{1} << bits),
+        "Dense VQ direct MMA metadata mismatch");
+    auto output = torch::empty({1, rows}, input.options());
+    dense_vq_mma_packed_m1_kernel<<<
+        static_cast<unsigned>((rows + 15) / 16), 32, 0,
+        at::cuda::getCurrentCUDAStream()>>>(
+            input.data_ptr<float>(),
+            packed.data_ptr<uint8_t>(),
+            reinterpret_cast<const __half*>(codebook.data_ptr<at::Half>()),
+            output.data_ptr<float>(),
+            static_cast<int>(rows),
+            static_cast<int>(blocks),
+            vector,
+            tag);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+#endif
 }
+
+
 
 torch::Tensor dense_vq_dequant_packed(
     torch::Tensor packed,
