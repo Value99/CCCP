@@ -538,6 +538,18 @@ class DenseVQLinear(nn.Module):
 
             if rows.shape[0] == 1:
                 import os
+                if os.environ.get("CCCP_INT4_GEMV_V4S", "0") == "1":
+                    from .fusedext import int4_gemv_v4s_fused
+                    result = int4_gemv_v4s_fused(
+                        rows.contiguous(),
+                        self.payload,
+                        self.gpu_scales,
+                        self.cols,
+                        64,
+                        group_vector=True,
+                    )
+                    if result is not None:
+                        return result
                 if os.environ.get("CCCP_INT4_GEMV_V2", "0") == "1":
                     from .fusedext import int4_gemv_v2_fused
                     result = int4_gemv_v2_fused(

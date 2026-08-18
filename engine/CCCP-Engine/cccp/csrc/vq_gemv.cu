@@ -12610,6 +12610,150 @@ torch::Tensor int4_embedding_lookup_device_row(
     return output;
 }
 
+
+// ---------------------------------------------------------------------------
+// INT4 GEMV vector4-segmented — the measured best of both worlds:
+// v1 vector4's conflict-free lane layout (columns stride-2 inside 64-col
+// groups, 8 lanes per group, one shfl scale per subgroup) but the
+// activation is staged per 4096-column segment instead of the whole row,
+// cutting shared staging traffic ~4x for wide matrices.  Segments combine
+// through the v2 partial/reduce pair.  All-architecture LDG + FMA only.
+// ---------------------------------------------------------------------------
+constexpr int kInt4V4SegCols = 4096;  // 64 groups per segment
+constexpr int kInt4V4Warps = 8;       // rows per block
+
+template <typename input_t>
+__global__ void int4_gemv_packed_f32_v4s_kernel(
+    const input_t* __restrict__ x,
+    const uint8_t* __restrict__ packed,
+    const __half* __restrict__ scales,
+    float* __restrict__ partial,
+    const int rows,
+    const int cols,
+    const int groups,
+    const int segments)
+{
+    __shared__ float shared_x[kInt4V4SegCols];
+    const int lane = threadIdx.x;
+    const int row = blockIdx.y * kInt4V4Warps + threadIdx.y;
+    const int seg = blockIdx.x;
+    const int col_base = seg * kInt4V4SegCols;
+    const int seg_cols = min(kInt4V4SegCols, cols - col_base);
+    if (seg_cols <= 0) return;
+    const int seg_groups = seg_cols >> 6;
+
+    // Stage only this segment's activation (16 KiB), 256 threads.
+    for (int c = threadIdx.y * 32 + lane; c < seg_cols; c += 256) {
+        shared_x[c] = vq_scalar_to_float(x + (long)(col_base + c));
+    }
+    __syncthreads();
+    if (row >= rows) return;
+
+    const int packed_cols = cols >> 1;
+    const uint8_t* packed_row =
+        packed + (long)row * packed_cols + (col_base >> 1);
+    const __half* scale_row = scales + (long)row * groups;
+
+    // v1 vector4 inner loop restricted to this segment's groups.
+    const int group_in_iteration = lane >> 3;
+    const int group_lane = lane & 7;
+    float acc0 = 0.f, acc1 = 0.f;
+    const int group_span = kInt4V4SegCols >> 6;  // 64
+    for (int gbase = seg * group_span;
+         gbase < seg * group_span + seg_groups; gbase += 8) {
+        const int g0 = gbase + group_in_iteration;
+        const int g1 = gbase + 4 + group_in_iteration;
+        float s0 = 0.f, s1 = 0.f;
+        if (group_lane == 0) {
+            if (g0 < seg * group_span + seg_groups)
+                s0 = __half2float(__ldg(scale_row + g0));
+            if (g1 < seg * group_span + seg_groups)
+                s1 = __half2float(__ldg(scale_row + g1));
+        }
+        s0 = __shfl_sync(0xffffffffu, s0, 0, 8);
+        s1 = __shfl_sync(0xffffffffu, s1, 0, 8);
+        if (g0 < seg * group_span + seg_groups) {
+            const uint32_t codes = __ldg(reinterpret_cast<const uint32_t*>(
+                packed_row + (g0 - seg * group_span) * 32 + group_lane * 4));
+            const int col = g0 * 64 + group_lane * 8 - col_base;
+            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&codes);
+#pragma unroll
+            for (int item = 0; item < 4; ++item) {
+                const uint8_t q = bytes[item];
+                acc0 = __fmaf_rn(
+                    static_cast<float>((q & 15) - 8) * s0,
+                    shared_x[col + item * 2], acc0);
+                acc0 = __fmaf_rn(
+                    static_cast<float>((q >> 4) - 8) * s0,
+                    shared_x[col + item * 2 + 1], acc0);
+            }
+        }
+        if (g1 < seg * group_span + seg_groups) {
+            const uint32_t codes = __ldg(reinterpret_cast<const uint32_t*>(
+                packed_row + (g1 - seg * group_span) * 32 + group_lane * 4));
+            const int col = g1 * 64 + group_lane * 8 - col_base;
+            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&codes);
+#pragma unroll
+            for (int item = 0; item < 4; ++item) {
+                const uint8_t q = bytes[item];
+                acc1 = __fmaf_rn(
+                    static_cast<float>((q & 15) - 8) * s1,
+                    shared_x[col + item * 2], acc1);
+                acc1 = __fmaf_rn(
+                    static_cast<float>((q >> 4) - 8) * s1,
+                    shared_x[col + item * 2 + 1], acc1);
+            }
+        }
+    }
+    float acc = acc0 + acc1;
+    acc = warp_sum_f32(acc);
+    if (lane == 0) {
+        partial[(long)row * segments + seg] = acc;
+    }
+}
+
+template <typename input_t>
+torch::Tensor int4_gemv_packed_f32_v4s(
+    torch::Tensor x,
+    torch::Tensor packed,
+    torch::Tensor scales,
+    int64_t rows,
+    int64_t cols,
+    int64_t groups)
+{
+    TORCH_CHECK(cols % 64 == 0, "v4s requires 64-column G64 groups");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int segments =
+        (int)((cols + kInt4V4SegCols - 1) / kInt4V4SegCols);
+    static torch::Tensor partial_cache;
+    const long needed = (long)rows * segments;
+    if (!partial_cache.defined() ||
+        partial_cache.device() != x.device() ||
+        partial_cache.numel() < needed) {
+        partial_cache = torch::empty(
+            {needed},
+            torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    }
+    torch::Tensor partial = partial_cache.narrow(0, 0, needed);
+    auto output = torch::empty(
+        {rows},
+        torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+    dim3 block(32, kInt4V4Warps);
+    dim3 grid(segments, (unsigned)((rows + kInt4V4Warps - 1) / kInt4V4Warps));
+    int4_gemv_packed_f32_v4s_kernel<input_t><<<grid, block, 0, stream>>>(
+        reinterpret_cast<const input_t*>(x.data_ptr()),
+        packed.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half*>(scales.data_ptr()),
+        partial.data_ptr<float>(),
+        (int)rows, (int)cols, (int)groups, segments);
+    int4_gemv_v2_reduce_kernel<<<(unsigned)rows, 32, 0, stream>>>(
+        partial.data_ptr<float>(),
+        output.data_ptr<float>(),
+        (int)rows, segments);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
 // ---------------------------------------------------------------------------
 // INT4 GEMV v2 — split-K batch=1 kernel, all architectures (SM70+).
 // One warp owns one output row inside a 1024-column segment; each lane loads
@@ -18790,6 +18934,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("int4_embedding_lookup_device_row",
           &int4_embedding_lookup_device_row,
           "Packed INT4-G64 embedding lookup with a CUDA row index");
+    m.def("int4_gemv_packed_f32_v4s", &int4_gemv_packed_f32_v4s<float>,
+        "Segmented vector4 INT4 GEMV (conflict-free, staged activation).");
+    m.def("int4_gemv_packed_f32_v4s_bf16", &int4_gemv_packed_f32_v4s<__nv_bfloat16>,
+        "Segmented vector4 INT4 GEMV, bf16 activations.");
     m.def("int4_gemv_packed_f32_v2", &int4_gemv_packed_f32_v2<float>,
         "Split-K INT4 batch-1 GEMV (vectorized, all architectures).");
     m.def("int4_gemv_packed_f32_v2_bf16", &int4_gemv_packed_f32_v2<__nv_bfloat16>,
