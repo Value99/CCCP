@@ -18,6 +18,10 @@ def main() -> int:
     model = Path(sys.argv[1] if len(sys.argv) > 1 else
                  "/media/tyh20/disk22/qwen3.8-27b-cccp-l")
     engine = Engine(str(model), device="cuda")
+    if os.environ.get("CCCP_BENCH_NO_EOS", "0") == "1":
+        # 纯计时基准:清空 EOS 使生成跑满 max_new(稳态 tok/s 不被
+        # 轨迹提前停止污染;内容质量另由 validate_qwen35_chat 把关)。
+        engine.eos = set()
     adapter = Qwen35ChatAdapter()
     options = ChatOptions(
         thinking_mode="chat",
