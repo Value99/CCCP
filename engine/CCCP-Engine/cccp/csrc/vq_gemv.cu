@@ -12835,7 +12835,11 @@ __global__ void int4_repack_v21_kernel(
 }
 
 constexpr int V21_SLICE = 2048;
+constexpr int V21_SMALL_SLICE = 512;
 
+// SLICE 模板化：小矩阵(k<=5120)用 512 列细切片,块数 x4 改善
+// ramp/占用(第二十轮处方,584→750+GB/s);大矩阵维持 2048。
+template <int SLICE>
 __global__ void int4_gemv_v21_kernel(
     const float* __restrict__ x,
     const uint32_t* __restrict__ repacked,
@@ -12850,8 +12854,8 @@ __global__ void int4_gemv_v21_kernel(
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int slice = blockIdx.x;
-    const int k0 = slice * V21_SLICE;
-    const int here = min(V21_SLICE, cols - k0);
+    const int k0 = slice * SLICE;
+    const int here = min(SLICE, cols - k0);
     if (here <= 0) return;
     for (int c = threadIdx.x; c < here; c += 128) {
         sx[c] = x[k0 + c];
@@ -12978,7 +12982,19 @@ torch::Tensor int4_gemv_v21(
     int64_t groups)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
-    const int slices = (int)((cols + V21_SLICE - 1) / V21_SLICE);
+    // 小矩阵 k 细切片:块数 x4 改善 ramp/占用。auto=按 cols 选,
+    // 可用 CCCP_INT4_V21_KSLICE=512/2048 强制(A/B 用)。
+    static const int slice_env = [] {
+        const char* flag = std::getenv("CCCP_INT4_V21_KSLICE");
+        if (flag && flag[0] == '5') return 512;
+        if (flag && flag[0] == '2') return 2048;
+        return 0;  // auto
+    }();
+    const bool small = slice_env
+        ? (slice_env == 512)
+        : (cols <= 5120);
+    const int slice_cols = small ? V21_SMALL_SLICE : V21_SLICE;
+    const int slices = (int)((cols + slice_cols - 1) / slice_cols);
     static torch::Tensor pc;
     const long needed = (long)rows * slices;
     if (!pc.defined() || pc.numel() < needed || pc.device() != x.device()) {
@@ -12989,11 +13005,21 @@ torch::Tensor int4_gemv_v21(
     auto output = torch::empty(
         {rows}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
     dim3 grid(slices, (unsigned)(((rows / 8) + 3) / 4));
-    int4_gemv_v21_kernel<<<grid, 128, V21_SLICE * sizeof(float), stream>>>(
-        x.data_ptr<float>(),
-        reinterpret_cast<const uint32_t*>(repacked.data_ptr()),
-        reinterpret_cast<const __half*>(scales.data_ptr()),
-        partial.data_ptr<float>(), (int)rows, (int)cols, (int)groups, slices);
+    if (small) {
+        int4_gemv_v21_kernel<V21_SMALL_SLICE><<<
+            grid, 128, V21_SMALL_SLICE * sizeof(float), stream>>>(
+            x.data_ptr<float>(),
+            reinterpret_cast<const uint32_t*>(repacked.data_ptr()),
+            reinterpret_cast<const __half*>(scales.data_ptr()),
+            partial.data_ptr<float>(), (int)rows, (int)cols, (int)groups, slices);
+    } else {
+        int4_gemv_v21_kernel<V21_SLICE><<<
+            grid, 128, V21_SLICE * sizeof(float), stream>>>(
+            x.data_ptr<float>(),
+            reinterpret_cast<const uint32_t*>(repacked.data_ptr()),
+            reinterpret_cast<const __half*>(scales.data_ptr()),
+            partial.data_ptr<float>(), (int)rows, (int)cols, (int)groups, slices);
+    }
     int4_v21_reduce<<<(rows + 255) / 256, 256, 0, stream>>>(
         partial.data_ptr<float>(), output.data_ptr<float>(), (int)rows, slices);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
