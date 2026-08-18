@@ -639,6 +639,32 @@ class DenseVQLinear(nn.Module):
                     )
                 return result
             batch = int(rows.shape[0])
+            if 2 <= batch <= 5 and rows.is_cuda and os.environ.get(
+                "CCCP_INT4_GEMV_V21B", "1"
+            ) != "0":
+                # MTP verify: one batched weight stream instead of per-token
+                # GEMV loops (v21b), keeping memory-bound traffic at 1x.
+                from .fusedext import (
+                    int4_gemv_v21b_fused,
+                    int4_repack_marlin_fused,
+                )
+
+                repacked = getattr(self, "_v21_payload", None)
+                if repacked is None:
+                    repacked = int4_repack_marlin_fused(
+                        self.payload, self.cols
+                    )
+                    self._v21_payload = repacked
+                result = int4_gemv_v21b_fused(
+                    rows.float(),
+                    repacked,
+                    self.gpu_scales,
+                    self.cols,
+                    64,
+                    group_vector=True,
+                )
+                if result is not None:
+                    return result
             if 2 <= batch <= 16 and rows.is_cuda:
                 # Small-batch verify/prefill: run the fused batch-1 GEMV per
                 # token instead of dequantizing the whole INT4 matrix into a

@@ -2529,6 +2529,23 @@ if _EXT is not None:
             int(payload.numel() * 2 // cols),
             int(cols),
         )
+    def int4_gemv_v21b_fused(
+        rows: torch.Tensor,
+        payload: torch.Tensor,
+        scales: torch.Tensor,
+        cols: int,
+        groups: int,
+        group_vector: bool = True,
+    ) -> torch.Tensor | None:
+        """v21b: batched (2..5 rows) GEMV, one weight stream."""
+        return _EXT.int4_gemv_v21b(
+            rows.float().contiguous(),
+            payload.contiguous(),
+            scales.contiguous(),
+            int(payload.numel() * 2 // cols),
+            int(cols),
+            int(groups),
+        )
     def int4_gemv_v21_fused(
         rows: torch.Tensor,
         payload: torch.Tensor,
