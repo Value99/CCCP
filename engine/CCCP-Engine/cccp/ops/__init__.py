@@ -91,6 +91,19 @@ from .tensor_parallel import (
 )
 from .vq_fp8 import DenseVQFP8TileMMA
 
+
+def projection_expand_native8(metadata, output_gu, output_down):
+    """展开打包投影到可复用 E4M3/INT8 缓冲(packed_hybrid 消费,经 fusedext)。"""
+    from ..fusedext import projection_expand_native8_fused
+
+    result = projection_expand_native8_fused(metadata, output_gu, output_down)
+    if result is None:
+        raise RuntimeError(
+            "projection_expand_native8 unavailable for the given buffers"
+        )
+    return result
+
+
 __all__ = [
     "DecodeControl",
     "DenseVQFP8TileMMA",
@@ -180,4 +193,5 @@ __all__ = [
     "vq_relayout_row_tile",
     "vq_compile_u16_row_tile",
     "vq_compile_q4_0",
+    "projection_expand_native8",
 ]
