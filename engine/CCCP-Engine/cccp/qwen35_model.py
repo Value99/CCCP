@@ -790,6 +790,11 @@ class Qwen35DenseVQModel:
         for delta_name in (
             "torch_recurrent_gated_delta_rule",
             "torch_chunk_gated_delta_rule",
+            # fla 符号:建模层在 fla 可导入时直接调用,且无设备检查——
+            # CPU 张量会直入 Triton 崩溃。同样按张量设备分派(CPU→cpuext
+            # 融合,CUDA→fusedext;不支持形状回退原实现)。
+            "chunk_gated_delta_rule",
+            "fused_recurrent_gated_delta_rule",
         ):
             global_delta = getattr(qwen_impl, delta_name, None)
             if global_delta is not None and not getattr(
@@ -811,6 +816,26 @@ class Qwen35DenseVQModel:
                     module.recurrent_gated_delta_rule = _qwen35_delta_rule(
                         module.recurrent_gated_delta_rule
                     )
+                if hasattr(module, "chunk_gated_delta_rule"):
+                    # 实例在构造时绑定了 fla 的 chunk 函数对象(建模层
+                    # 423 行),模块级补丁够不到——fla 入口无设备检查,
+                    # CPU 张量直入 Triton 崩溃;同样按设备分派。
+                    module.chunk_gated_delta_rule = _qwen35_delta_rule(
+                        module.chunk_gated_delta_rule
+                    )
+                norm = getattr(module, "norm", None)
+                if (
+                    self.device.type == "cpu"
+                    and norm is not None
+                    and type(norm).__name__ == "FusedRMSNormGated"
+                ):
+                    # fla 的门控范数也是 Triton-only;CPU 换建模层自带
+                    # 的 torch 等价实现(权重同源拷贝,silu 门控语义一致)。
+                    torch_norm = qwen_impl.Qwen3_5RMSNormGated(
+                        int(norm.weight.shape[0]), eps=float(norm.eps)
+                    )
+                    torch_norm.weight.data.copy_(norm.weight.data)
+                    module.norm = torch_norm
                 if hasattr(module, "causal_conv1d_update"):
                     module.causal_conv1d_update = _qwen35_conv_update(
                         module.causal_conv1d_update

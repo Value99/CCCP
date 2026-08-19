@@ -27,7 +27,8 @@ def main() -> int:
     tp = 1
     if "--tp" in sys.argv:
         tp = int(sys.argv[sys.argv.index("--tp") + 1])
-    engine = Engine(str(model), device="cuda", tp_size=tp)
+    device = "cpu" if "--cpu" in sys.argv else "cuda"
+    engine = Engine(str(model), device=device, tp_size=tp)
     if os.environ.get("CCCP_BENCH_NO_EOS", "0") == "1":
         engine.eos = set()
     arch = getattr(engine, "arch", "") or ""
@@ -82,9 +83,23 @@ def main() -> int:
         free_gib = free / 2**30
     except Exception:
         pass
+    kv = getattr(engine, "last_kv_stats", None)
+    prefill_ms = getattr(kv, "prefill_ms", None) if kv is not None else None
+    prompt_n = len(plan.input_ids)
+    if prefill_ms:
+        prefill_str = (
+            f"prefill={prefill_ms:.0f}ms({prompt_n}tok,"
+            f"{prompt_n / (prefill_ms / 1000.0):.1f}tok/s)"
+        )
+    else:
+        prefill_str = "prefill=n/a"
+    decode_s = max(elapsed - (prefill_ms / 1000.0 if prefill_ms else 0.0), 1e-9)
     print(
-        f"[bench-any] arch={arch} tokens={len(out)} elapsed={elapsed:.2f}s "
-        f"tok/s={len(out) / max(elapsed, 1e-9):.2f} free_vram={free_gib:.1f}GiB",
+        f"[bench-any] arch={arch} dev={device} tokens={len(out)} "
+        f"elapsed={elapsed:.2f}s {prefill_str} "
+        f"decode={len(out) / decode_s:.2f}tok/s "
+        f"wall={len(out) / max(elapsed, 1e-9):.2f}tok/s "
+        f"free_vram={free_gib:.1f}GiB",
         flush=True,
     )
     print(f"[bench-any] content={parsed.content[:60]!r}", flush=True)

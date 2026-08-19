@@ -1649,7 +1649,12 @@ class DenseVQEmbedding(nn.Module):
                 blocks=self.blocks,
                 bits=self.bits,
             )
-            values = self.codebook[indices].reshape(-1, self.embedding_dim)
+            # 16bit 载荷的行索引是 uint16——torch 高级索引只收
+            # long/int/byte/bool,CPU 嵌入查表需转 int64(CUDA 路径
+            # 走 fused 算子不经此处;CPU 模式首跑实证)。
+            values = self.codebook[indices.long()].reshape(
+                -1, self.embedding_dim
+            )
             values = values.to(torch.bfloat16)
         return values.reshape(*shape, self.embedding_dim)
 
