@@ -52,12 +52,26 @@ def main() -> int:
         print(f"[bench-any] warmup={warmup} done", flush=True)
     # 预填单独计时,decode 段取 generate 内部统计或总时。
     started = time.perf_counter()
-    out = engine.generate(
-        plan.input_ids,
-        max_new=max_new,
-        temp=0.0,
-        top_p=1.0,
-    )
+    if os.environ.get("CCCP_TORCH_PROFILE", "0") == "1":
+        from torch.profiler import ProfilerActivity, profile
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        ) as prof:
+            out = engine.generate(
+                plan.input_ids,
+                max_new=max_new,
+                temp=0.0,
+                top_p=1.0,
+            )
+        prof.export_chrome_trace("/media/tyh20/disk22/dsv4_trace.json")
+    else:
+        out = engine.generate(
+            plan.input_ids,
+            max_new=max_new,
+            temp=0.0,
+            top_p=1.0,
+        )
     if engine.model.device.type == "cuda":
         torch.cuda.synchronize(engine.model.device)
     elapsed = time.perf_counter() - started
