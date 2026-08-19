@@ -8093,10 +8093,14 @@ torch::Tensor rmsnorm(
         out.get_device() == x.get_device(),
         "RMSNorm output buffer must be contiguous float32 and match input");
     auto stream = at::cuda::getCurrentCUDAStream();
-    rmsnorm_kernel<<<N, 256, 0, stream>>>(
-        x2.data_ptr<float>(), w.contiguous().data_ptr<float>(),
-        out.data_ptr<float>(), D, (float)eps);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    // 空批守卫:缓存全命中的续算路径会产生 0 行输入,grid 维度为 0
+    // 是 cudaErrorInvalidConfiguration(GLM 双 generate 实证)。
+    if (N > 0) {
+        rmsnorm_kernel<<<N, 256, 0, stream>>>(
+            x2.data_ptr<float>(), w.contiguous().data_ptr<float>(),
+            out.data_ptr<float>(), D, (float)eps);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
     return out.view(xc.sizes());
 }
 

@@ -1521,6 +1521,19 @@ class Engine:
             media_digest, media_slots, media_state
         )
         skip = self._kv_prefix_len(ids) if media_matches else 0
+        if (
+            skip
+            and skip >= len(ids)
+            and getattr(self, "arch", "glm") == "glm"
+        ):
+            # KV 与 prompt 完全一致(同进程二次 generate 同一 prompt):
+            # 后缀为空会让层栈/argmax 空批连环崩溃——回退一个 token
+            # 重放以恢复 next-token logits(Kimi 的 KDA 状态无安全
+            # 截断,不适用;第三十轮实证)。
+            truncate = getattr(self.model, "truncate_kv", None)
+            if callable(truncate):
+                self.model.truncate_kv(skip - 1)
+                skip -= 1
         if skip:
             mode = "exact-prefix"
             reason = (
@@ -1542,6 +1555,10 @@ class Engine:
             # prefix.  Preserve that valid KV prefix and replay only the
             # divergent suffix.  Kimi is deliberately excluded: its KDA
             # recurrent state has no equivalent safe truncation operation.
+            if lcp >= len(ids):
+                # 新 prompt 是缓存序列的完整前缀(lcp==len(ids)):回退
+                # 一个 token 重放,避免空后缀的空批连环崩溃(第三十轮)。
+                lcp -= 1
             self.model.truncate_kv(lcp)
             skip = lcp
             mode = "lcp-replay"

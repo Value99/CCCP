@@ -92,6 +92,9 @@ class MTPHead:
         return _lin(out, self.w("attn.o"))
 
     def _moe(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[0] == 0:
+            # 空批(续算路径):0 行 MoE 恒等返回(同 model.py._moe 守卫)。
+            return x
         c = self.m.cfg
         logits = _lin(x, self.w("router")).float()
         prob = logits.sigmoid()
@@ -137,10 +140,32 @@ class MTPHead:
                 isinstance(gu, VQWeight) and isinstance(dn, VQWeight)
                 for gu, dn in experts
             ):
-                raise RuntimeError(
-                    "MTP fused packed top-k decode requires VQ experts; "
-                    "the legacy single-token expert projection was deleted"
+                # 长生成后池内该专家可能是紧凑/展开形态(非 VQWeight
+                # 包装):复用 run_rows 单行路径而非硬失败——同进程二次
+                # generate 续算路径的实测触发点(第二十九轮)。
+                run_rows = getattr(self.m.pool, "run_rows", None)
+                if not callable(run_rows):
+                    raise RuntimeError(
+                        "MTP fused packed top-k decode requires VQ experts; "
+                        "the legacy single-token expert projection was "
+                        "deleted"
+                    )
+                routed = run_rows(
+                    self.LAYER,
+                    x,
+                    idx,
+                    w,
+                    activation=activation,
+                    activation_beta=activation_beta,
+                    activation_linear_beta=activation_linear_beta,
+                    limit=limit,
                 )
+                shared = _lin(
+                    F.silu(_lin(x, self.w("shared_gate")))
+                    * _lin(x, self.w("shared_up")),
+                    self.w("shared_down"),
+                )
+                return routed.to(shared.dtype) + shared
             from .grouped import moe_mlp_grouped_mixed
 
             routed = moe_mlp_grouped_mixed(

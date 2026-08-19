@@ -2027,6 +2027,10 @@ if _EXT is not None:
             or cos.shape != (q.shape[1], q.shape[2] // 2)
         ):
             return None
+        if q.shape[1] == 0:
+            # 空批(缓存全命中续算):0 位置 RoPE 是恒等,直接返回;
+            # 内核 grid 维度为 0 是 cudaErrorInvalidConfiguration。
+            return q, k
         return _EXT.glm_rope_qk(q, k, cos, sin)
 
     def glm_latent_kv_decode_prepare_fused(
