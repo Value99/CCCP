@@ -210,11 +210,30 @@ class TensorParallelVocab:
             for token in values
         }
         if len(ranks) != 1:
-            # Decode uses one token. Keep the general multi-token error
-            # explicit instead of silently returning mixed-device rows.
-            raise ValueError(
-                "vocabulary TP embedding batch crosses row shards"
-            )
+            # 多 token 预填跨词表分片:按 rank 分组嵌入、汇到 rank0、按
+            # 原序回填(调用方从返回值继承 device/dtype)。原实现为硬
+            # 错误——TP 预填由此不可用;decode 单 token 不经此分支。
+            base = self.devices[0]
+            by_rank: dict[int, list[int]] = {}
+            for index, token in enumerate(values):
+                for rank in range(len(self.devices)):
+                    if token < self.offsets[rank + 1]:
+                        by_rank.setdefault(rank, []).append(index)
+                        break
+            rows = [None] * len(values)
+            for rank, indexes in by_rank.items():
+                local = torch.as_tensor(
+                    [values[i] - self.offsets[rank] for i in indexes],
+                    dtype=torch.long,
+                    device=self.devices[rank],
+                )
+                embedded = F.embedding(
+                    local, self.embedding_shards[rank]
+                ).to(base)
+                for offset, i in enumerate(indexes):
+                    rows[i] = embedded[offset]
+            return torch.stack(rows)
+        rank = ranks.pop()
         rank = ranks.pop()
         local_ids = torch.as_tensor(
             [token - self.offsets[rank] for token in values],

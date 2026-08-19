@@ -24,7 +24,10 @@ def main() -> int:
     warmup = 0
     if "--warmup" in sys.argv:
         warmup = int(sys.argv[sys.argv.index("--warmup") + 1])
-    engine = Engine(str(model), device="cuda")
+    tp = 1
+    if "--tp" in sys.argv:
+        tp = int(sys.argv[sys.argv.index("--tp") + 1])
+    engine = Engine(str(model), device="cuda", tp_size=tp)
     if os.environ.get("CCCP_BENCH_NO_EOS", "0") == "1":
         engine.eos = set()
     arch = getattr(engine, "arch", "") or ""
