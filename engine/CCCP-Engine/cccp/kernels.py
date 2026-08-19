@@ -1720,15 +1720,22 @@ class ProjectionGroup:
 
 
 class VQWeight:
-    """VQ 索引态权重：u8 索引 [R, B] + 码本 [K, dim]，LUT 矩阵乘。"""
+    """VQ 索引态权重：u8 索引 [R, B] + 码本 [K, dim]，LUT 矩阵乘。
 
-    __slots__ = ("idx", "cb", "cols", "dim")
+    int4_g64 快档(第二十七轮)：码本驻留不变(默认零增长)，显存充足时
+    惰性编译一份 int4_g64 映像走 Int4Weight 分派(v30 批 2..6 dp4a +
+    vector4 decode)——门控镜像 FP8 image 模式：
+    CCCP_VQ_INT4_IMAGE=off(默认)|auto(空闲显存覆盖映像+保留才编译)|on。
+    """
+
+    __slots__ = ("idx", "cb", "cols", "dim", "_int4")
 
     def __init__(self, idx: torch.Tensor, cb: torch.Tensor, cols: int):
         self.idx = idx              # u8 [R, B]，B = cols // dim
         self.cb = cb.float()        # f32 [K, dim]
         self.cols = cols
         self.dim = cb.shape[1]
+        self._int4 = None
 
     @property
     def shape(self) -> torch.Size:
@@ -1747,6 +1754,52 @@ class VQWeight:
         """还原为 f32 [R, C]（小矩阵或对照测试用）。"""
         return self.cb[self.idx.reshape(-1).long()].reshape(self.idx.shape[0], self.cols)
 
+    def _int4_image(self, x: torch.Tensor):
+        """显存门控的 int4_g64 快档；不可用返回 None（走码本 LUT 路径）。"""
+        if self._int4 is not None:
+            return self._int4 or None
+        if (
+            not x.is_cuda
+            or self.idx.dtype != torch.uint8
+            or self.cols % 64
+            or self.idx.dim() != 2
+        ):
+            self._int4 = False
+            return None
+        mode = os.environ.get("CCCP_VQ_INT4_IMAGE", "off").strip().lower()
+        if mode in ("", "0", "off", "no", "false"):
+            self._int4 = False
+            return None
+        rows, blocks = self.idx.shape
+        image_bytes = rows * self.cols // 2 + rows * (self.cols // 64) * 2
+        if mode == "auto":
+            try:
+                free_bytes, _total = torch.cuda.mem_get_info(x.device)
+            except Exception:
+                self._int4 = False
+                return None
+            # 空闲需覆盖映像 + 2GiB 保留(镜像 FP8 image 的 planned 检查)。
+            if free_bytes < image_bytes + (2 * 2**30):
+                self._int4 = False
+                return None
+        try:
+            from .fusedext import dense_vq_compile_int4_g64_fused
+
+            packed, scales = dense_vq_compile_int4_g64_fused(
+                self.idx.reshape(-1), self.cb, rows, blocks, 8
+            )
+            self._int4 = Int4Weight(packed, scales, self.cols, 64)
+            print(
+                "[cccp-vq-int4] image=on "
+                f"rows={rows} cols={self.cols} "
+                f"+{image_bytes / 2**30:.2f}GiB "
+                f"mode={mode}",
+                flush=True,
+            )
+        except Exception:
+            self._int4 = False
+        return self._int4 or None
+
     def matmul_T(self, x: torch.Tensor) -> torch.Tensor:
         """LUT 版 y = x @ W.T。x: [T, C] → [T, R] f32。
 
@@ -1756,7 +1809,16 @@ class VQWeight:
         GPU 上内积走精度策略层的半精度（fp16/bf16 张量核，fp32 累加），
         查表求和用 sum(dtype=f32) 保 f32 累加精度——量化噪声比半精度舍入大
         两个数量级，输出分布不受影响（dspark_check 逐字一致验收过）。
+
+        int4 快档开启时按批路由：T=1 → vector4 decode，2..6 → v30 dp4a，
+        其余走 Int4Weight 的 chunk GEMM。
         """
+        if x.is_cuda:
+            int4 = self._int4_image(x)
+            if int4 is not None:
+                if x.dim() == 2 and x.shape[0] == 1:
+                    return int4.matmul_T_decode_fused(x)
+                return int4.matmul_T(x)
         T = x.shape[0]
         R, B = self.idx.shape
         K = self.cb.shape[0]
