@@ -328,7 +328,7 @@ class Int4Weight:
         走 Q8×Q4 dp4a 单 kernel(llama.cpp MMVQ 移植),替代逐块 LUT 反量化
         +GEMM——权重零拷贝、数值 rel ~0.6%(Q8 级)。所有架构(GLM/DSV4/
         Kimi/Qwen)经 Int4Weight 的 MTP verify/小批量路径自动受益;
-        CCCP_INT4_GEMV_V30=0 关闭。
+        CCCP_INT4_GEMV_V30=1 开启(默认关——通用层数值变更必须显式选入)。
         """
         if (
             not x.is_cuda
@@ -351,7 +351,7 @@ class Int4Weight:
             and self.q.dtype == torch.uint8
             and self.s.dtype == torch.float16
             and self.gs == 64
-            and os.environ.get("CCCP_INT4_GEMV_V30", "1") != "0"
+            and os.environ.get("CCCP_INT4_GEMV_V30", "0") == "1"
         ):
             fn = _int4_gemv_v30_fused()
             if fn is not None:
