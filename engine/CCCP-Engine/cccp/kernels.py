@@ -86,6 +86,21 @@ def _int4_gemv_fused():
 _INT4_GEMV_FUSED = None
 
 
+def _int4_gemv_v30_fused():
+    """Lazily resolve the batched Q8×Q4 dp4a GEMV kernel (v30)."""
+    global _INT4_GEMV_V30_FUSED
+    if _INT4_GEMV_V30_FUSED is None:
+        try:
+            from .fusedext import int4_gemv_v30_fused
+            _INT4_GEMV_V30_FUSED = int4_gemv_v30_fused
+        except Exception:
+            _INT4_GEMV_V30_FUSED = False
+    return _INT4_GEMV_V30_FUSED or None
+
+
+_INT4_GEMV_V30_FUSED = None
+
+
 def _block_fp8_gemv_fused():
     """Lazily resolve the native E4M3 block-scaled decode kernel."""
     global _BLOCK_FP8_GEMV_FUSED
@@ -308,6 +323,12 @@ class Int4Weight:
         行块大小自适应： transient 反量化块 ≤64MB（GPU 上 wq_b 级别大矩阵一次
         成型——原固定 512 行会把单个 GEMM 拆成 64 块 × 5 次 launch，WDDM 下
         launch 开销远超计算本身；显存代价仅一块临时缓冲）。
+
+        通用 v30 快路径(2026-08-19 第二十六轮):GPU 小批量(2..6)int4_g64
+        走 Q8×Q4 dp4a 单 kernel(llama.cpp MMVQ 移植),替代逐块 LUT 反量化
+        +GEMM——权重零拷贝、数值 rel ~0.6%(Q8 级)。所有架构(GLM/DSV4/
+        Kimi/Qwen)经 Int4Weight 的 MTP verify/小批量路径自动受益;
+        CCCP_INT4_GEMV_V30=0 关闭。
         """
         if (
             not x.is_cuda
@@ -323,6 +344,20 @@ class Int4Weight:
             )
             if fused_cpu is not None:
                 return fused_cpu
+        if (
+            x.is_cuda
+            and x.dim() == 2
+            and 2 <= x.shape[0] <= 6
+            and self.q.dtype == torch.uint8
+            and self.s.dtype == torch.float16
+            and self.gs == 64
+            and os.environ.get("CCCP_INT4_GEMV_V30", "1") != "0"
+        ):
+            fn = _int4_gemv_v30_fused()
+            if fn is not None:
+                fused = fn(x, self.q, self.s, self.cols, self.gs)
+                if fused is not None:
+                    return fused
         R = self.q.shape[0]
         if chunk is None:
             esz = 2 if self.half else 4
