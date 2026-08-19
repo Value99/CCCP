@@ -53,12 +53,29 @@ class DraftAcceptancePolicy:
     ) -> int:
         if logits.ndim != 2 or logits.shape[0] < len(drafts):
             raise ValueError("main verification logits do not cover all drafts")
+        accepted = 0
+        for index, draft in enumerate(drafts):
+            if not self.accepts(logits[index], draft):
+                break
+            accepted += 1
+        return accepted
+
+    def accepted_prefix_batched(
+        self,
+        logits: torch.Tensor,
+        drafts: list[int],
+    ) -> int:
+        """qwen3.5 MTP 专用批量判定:一次 topk/一次 isfinite/一次同步。
+
+        判定语义与 accepted_prefix() 逐位一致(行内 top-n 含 draft 且
+        行有限,首个未中即停);GLM/DSV4/Kimi 路径继续使用原版
+        accepted_prefix——通用策略的行为对它们完全恢复(第三十二轮)。
+        """
         total = len(drafts)
         if total == 0:
             return 0
-        # 批量版:一次 topk/一次 isfinite 归约/一次 .item() 同步。
-        # 逐 token 循环版每 draft 两次 GPU 同步(实测 126ms/轮,43% 轮时间)。
-        # 判定语义与逐行 accepts() 逐位一致:行内 top-n 含 draft 且行有限。
+        if logits.ndim != 2 or logits.shape[0] < total:
+            raise ValueError("main verification logits do not cover all drafts")
         rows = logits[:total]
         width = min(int(self.top_n), int(rows.shape[-1]))
         top = torch.topk(rows, k=width, dim=-1).indices
@@ -68,7 +85,6 @@ class DraftAcceptancePolicy:
         hits = (top == draft_tensor).any(dim=-1)
         finite_rows = torch.isfinite(rows).all(dim=-1)
         hits = hits & finite_rows
-        # 前导 True 计数(cumprod 截断在首个 False)
         leading = hits.to(torch.int32).cumprod(dim=0).sum()
         return int(leading.item())
 

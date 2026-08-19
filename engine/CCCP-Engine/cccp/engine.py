@@ -2935,7 +2935,7 @@ class Engine:
             if profile:
                 _phase("logits", _t)
             _t = time.perf_counter()
-            accepted = policy.accepted_prefix(
+            accepted = policy.accepted_prefix_batched(
                 verified_logits,
                 drafts,
             )

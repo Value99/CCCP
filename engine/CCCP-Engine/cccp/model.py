@@ -1753,22 +1753,6 @@ class GLMModel:
                     routed.unsqueeze(0),
                     shared,
                 )
-            # 长生成后池内专家为紧凑/展开形态(非 VQWeight 包装):单行
-            # 走 run_rows(行数无关的分组算子),与 prefill 分支同源——
-            # 同进程二次 generate 续算路径的实测触发点(第三十轮)。
-            run_rows = getattr(self.pool, "run_rows", None)
-            if callable(run_rows):
-                routed = run_rows(
-                    layer,
-                    x,
-                    idx,
-                    w,
-                    activation=self.operator_config.expert_activation,
-                    activation_beta=float(c.get("situ_beta", 4.0)),
-                    activation_linear_beta=c.get("situ_linear_beta"),
-                    limit=float(c.get("swiglu_limit", 0.0)),
-                )
-                return merge_outputs(routed, shared)
         raise RuntimeError(
             "fused packed top-k decode operator unavailable; the legacy "
             "single-token expert projection implementation was deleted"

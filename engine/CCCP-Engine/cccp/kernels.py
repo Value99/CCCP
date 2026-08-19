@@ -86,21 +86,6 @@ def _int4_gemv_fused():
 _INT4_GEMV_FUSED = None
 
 
-def _int4_gemv_v30_fused():
-    """Lazily resolve the batched Q8×Q4 dp4a GEMV kernel (v30)."""
-    global _INT4_GEMV_V30_FUSED
-    if _INT4_GEMV_V30_FUSED is None:
-        try:
-            from .fusedext import int4_gemv_v30_fused
-            _INT4_GEMV_V30_FUSED = int4_gemv_v30_fused
-        except Exception:
-            _INT4_GEMV_V30_FUSED = False
-    return _INT4_GEMV_V30_FUSED or None
-
-
-_INT4_GEMV_V30_FUSED = None
-
-
 def _block_fp8_gemv_fused():
     """Lazily resolve the native E4M3 block-scaled decode kernel."""
     global _BLOCK_FP8_GEMV_FUSED
@@ -323,12 +308,6 @@ class Int4Weight:
         行块大小自适应： transient 反量化块 ≤64MB（GPU 上 wq_b 级别大矩阵一次
         成型——原固定 512 行会把单个 GEMM 拆成 64 块 × 5 次 launch，WDDM 下
         launch 开销远超计算本身；显存代价仅一块临时缓冲）。
-
-        通用 v30 快路径(2026-08-19 第二十六轮):GPU 小批量(2..6)int4_g64
-        走 Q8×Q4 dp4a 单 kernel(llama.cpp MMVQ 移植),替代逐块 LUT 反量化
-        +GEMM——权重零拷贝、数值 rel ~0.6%(Q8 级)。所有架构(GLM/DSV4/
-        Kimi/Qwen)经 Int4Weight 的 MTP verify/小批量路径自动受益;
-        CCCP_INT4_GEMV_V30=1 开启(默认关——通用层数值变更必须显式选入)。
         """
         if (
             not x.is_cuda
@@ -344,20 +323,6 @@ class Int4Weight:
             )
             if fused_cpu is not None:
                 return fused_cpu
-        if (
-            x.is_cuda
-            and x.dim() == 2
-            and 2 <= x.shape[0] <= 6
-            and self.q.dtype == torch.uint8
-            and self.s.dtype == torch.float16
-            and self.gs == 64
-            and os.environ.get("CCCP_INT4_GEMV_V30", "0") == "1"
-        ):
-            fn = _int4_gemv_v30_fused()
-            if fn is not None:
-                fused = fn(x, self.q, self.s, self.cols, self.gs)
-                if fused is not None:
-                    return fused
         R = self.q.shape[0]
         if chunk is None:
             esz = 2 if self.half else 4
@@ -1720,22 +1685,15 @@ class ProjectionGroup:
 
 
 class VQWeight:
-    """VQ 索引态权重：u8 索引 [R, B] + 码本 [K, dim]，LUT 矩阵乘。
+    """VQ 索引态权重：u8 索引 [R, B] + 码本 [K, dim]，LUT 矩阵乘。"""
 
-    int4_g64 快档(第二十七轮)：码本驻留不变(默认零增长)，显存充足时
-    惰性编译一份 int4_g64 映像走 Int4Weight 分派(v30 批 2..6 dp4a +
-    vector4 decode)——门控镜像 FP8 image 模式：
-    CCCP_VQ_INT4_IMAGE=off(默认)|auto(空闲显存覆盖映像+保留才编译)|on。
-    """
-
-    __slots__ = ("idx", "cb", "cols", "dim", "_int4")
+    __slots__ = ("idx", "cb", "cols", "dim")
 
     def __init__(self, idx: torch.Tensor, cb: torch.Tensor, cols: int):
         self.idx = idx              # u8 [R, B]，B = cols // dim
         self.cb = cb.float()        # f32 [K, dim]
         self.cols = cols
         self.dim = cb.shape[1]
-        self._int4 = None
 
     @property
     def shape(self) -> torch.Size:
@@ -1754,107 +1712,6 @@ class VQWeight:
         """还原为 f32 [R, C]（小矩阵或对照测试用）。"""
         return self.cb[self.idx.reshape(-1).long()].reshape(self.idx.shape[0], self.cols)
 
-    def _compile_int4_cpu(self):
-        """CPU 侧码本→int4_g64 编译(torch 算子,分块限内存)。
-
-        量化语义对齐 CUDA kernel:组内符号最大值 signed_max,scale=
-        signed_max/-8,q=clamp(round(v/scale+8),0,15)。
-        """
-        R = self.idx.shape[0]
-        C = self.cols
-        G = C // 64
-        packed = torch.empty(R, C // 2, dtype=torch.uint8)
-        scales = torch.empty(R, G, dtype=torch.float16)
-        for r0 in range(0, R, 512):
-            r1 = min(r0 + 512, R)
-            dense = self.cb[
-                self.idx[r0:r1].reshape(-1).long()
-            ].reshape(r1 - r0, C)
-            g = dense.reshape(-1, G, 64)
-            # 组内 signed max:argmax(|v|) 再取原值
-            amax_idx = g.abs().flatten(2).argmax(2).unsqueeze(-1)
-            signed_max = g.gather(2, amax_idx).squeeze(2)
-            scale = torch.where(
-                signed_max == 0,
-                torch.zeros_like(signed_max),
-                signed_max / -8.0,
-            ).to(torch.float16)
-            scales[r0:r1] = scale
-            inv = torch.where(
-                scale == 0,
-                torch.zeros_like(scale),
-                1.0 / scale.to(torch.float32),
-            )
-            q = (
-                g.to(torch.float32) * inv.unsqueeze(-1) + 8.0
-            ).round().clamp(0, 15).to(torch.uint8)
-            lo = q[..., 0::2].reshape(r1 - r0, G, 32)
-            hi = q[..., 1::2].reshape(r1 - r0, G, 32)
-            packed[r0:r1] = (lo | (hi << 4)).reshape(r1 - r0, C // 2)
-        return Int4Weight(packed, scales, self.cols, 64)
-
-    def _int4_image(self, x: torch.Tensor):
-        """显存/内存门控的 int4_g64 快档；不可用返回 None（走码本 LUT 路径）。"""
-        if self._int4 is not None:
-            return self._int4 or None
-        if (
-            self.idx.dtype != torch.uint8
-            or self.cols % 64
-            or self.idx.dim() != 2
-        ):
-            self._int4 = False
-            return None
-        mode = os.environ.get("CCCP_VQ_INT4_IMAGE", "off").strip().lower()
-        if mode in ("", "0", "off", "no", "false"):
-            self._int4 = False
-            return None
-        rows, blocks = self.idx.shape
-        image_bytes = rows * self.cols // 2 + rows * (self.cols // 64) * 2
-        if x.is_cuda:
-            if mode == "auto":
-                try:
-                    free_bytes, _total = torch.cuda.mem_get_info(x.device)
-                except Exception:
-                    self._int4 = False
-                    return None
-                # 空闲需覆盖映像 + 2GiB 保留(镜像 FP8 image 的 planned 检查)。
-                if free_bytes < image_bytes + (2 * 2**30):
-                    self._int4 = False
-                    return None
-            try:
-                from .fusedext import dense_vq_compile_int4_g64_fused
-
-                packed, scales = dense_vq_compile_int4_g64_fused(
-                    self.idx.reshape(-1), self.cb, rows, blocks, 8
-                )
-                self._int4 = Int4Weight(packed, scales, self.cols, 64)
-                print(
-                    "[cccp-vq-int4] image=on "
-                    f"rows={rows} cols={self.cols} "
-                    f"+{image_bytes / 2**30:.2f}GiB "
-                    f"mode={mode}",
-                    flush=True,
-                )
-            except Exception:
-                self._int4 = False
-        else:
-            # CPU:auto 不自动开(RAM 余量不可移植估计),显式 on 才编译;
-            # 编译走 torch 算子(一次性,分块)。
-            if mode != "on":
-                self._int4 = False
-                return None
-            try:
-                self._int4 = self._compile_int4_cpu()
-                print(
-                    "[cccp-vq-int4] image=on-cpu "
-                    f"rows={rows} cols={self.cols} "
-                    f"+{image_bytes / 2**30:.2f}GiB",
-                    flush=True,
-                )
-            except Exception:
-                self._int4 = False
-        return self._int4 or None
-
     def matmul_T(self, x: torch.Tensor) -> torch.Tensor:
         """LUT 版 y = x @ W.T。x: [T, C] → [T, R] f32。
 
@@ -1864,15 +1721,7 @@ class VQWeight:
         GPU 上内积走精度策略层的半精度（fp16/bf16 张量核，fp32 累加），
         查表求和用 sum(dtype=f32) 保 f32 累加精度——量化噪声比半精度舍入大
         两个数量级，输出分布不受影响（dspark_check 逐字一致验收过）。
-
-        int4 快档开启时按批路由：GPU T=1 → vector4 decode，2..6 → v30 dp4a；
-        CPU T=1 → 融合 int4_gemv_cpu;其余走 Int4Weight 的 chunk 路径。
         """
-        int4 = self._int4_image(x)
-        if int4 is not None:
-            if x.dim() == 2 and x.shape[0] == 1:
-                return int4.matmul_T_decode_fused(x)
-            return int4.matmul_T(x)
         T = x.shape[0]
         R, B = self.idx.shape
         K = self.cb.shape[0]
