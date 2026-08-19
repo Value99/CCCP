@@ -658,9 +658,18 @@ class DenseVQLinear(nn.Module):
                 if result is not None:
                     return result
             if (
-                2 <= batch <= 6
-                and rows.is_cuda
-                and os.environ.get("CCCP_INT4_GEMV_VERIFY", "v1b") == "fp8"
+                rows.is_cuda
+                and (
+                    (batch > 6 and os.environ.get(
+                        "CCCP_INT4_PREFILL_FP8", "1"
+                    ) != "0")
+                    or (
+                        2 <= batch <= 6
+                        and os.environ.get(
+                            "CCCP_INT4_GEMV_VERIFY", "v1b"
+                        ) == "fp8"
+                    )
+                )
             ):
                 # FP8 移植(组路径同款):lm_head 等非分组矩阵的 verify 批
                 # 路径走张量核 scaled_mm。
@@ -691,7 +700,7 @@ class DenseVQLinear(nn.Module):
                     source, quantized, scales
                 )
                 if fused is not None:
-                    return torch._scaled_mm(
+                    result = torch._scaled_mm(
                         fused,
                         self._fp8_w.t(),
                         scale_a=scales,
@@ -699,6 +708,15 @@ class DenseVQLinear(nn.Module):
                         out_dtype=torch.bfloat16,
                         use_fast_accum=True,
                     ).float()
+                    if (
+                        batch > 6
+                        and os.environ.get(
+                            "CCCP_INT4_PREFILL_FP8", "1"
+                        ) != "persist"
+                    ):
+                        self._fp8_w = None
+                        self._fp8_scale = None
+                    return result
             if 2 <= batch <= 6 and rows.is_cuda and os.environ.get(
                 "CCCP_INT4_GEMV_V21B", "1"
             ) != "0":
@@ -1164,9 +1182,21 @@ class DenseVQLinearGroup(nn.Module):
                         half=True,
                     ).matmul_T(rows)
             elif (
-                2 <= rows.shape[0] <= 6
-                and rows.is_cuda
-                and os.environ.get("CCCP_INT4_GEMV_VERIFY", "v1b") == "fp8"
+                rows.is_cuda
+                and (
+                    (
+                        rows.shape[0] > 6
+                        and os.environ.get(
+                            "CCCP_INT4_PREFILL_FP8", "1"
+                        ) != "0"
+                    )
+                    or (
+                        2 <= rows.shape[0] <= 6
+                        and os.environ.get(
+                            "CCCP_INT4_GEMV_VERIFY", "v1b"
+                        ) == "fp8"
+                    )
+                )
             ):
                 # FP8 移植(第二十四轮):verify 批路径走张量核 scaled_mm
                 # ——FP8 档实测有效带宽 ~1.8TB/s,是 CUDA-core int4 GEMV
@@ -1211,6 +1241,17 @@ class DenseVQLinearGroup(nn.Module):
                     out_dtype=torch.bfloat16,
                     use_fast_accum=True,
                 ).float()
+                if (
+                    rows.shape[0] > 6
+                    and os.environ.get(
+                        "CCCP_INT4_PREFILL_FP8", "1"
+                    ) != "persist"
+                ):
+                    # prefill 瞬态映像:用毕释放,常驻显存保持 int4 档
+                    # (重建成本 ~200ms/次 prefill);=persist 则常驻
+                    # (+13.5GiB)换取连续 prefill 免重建。
+                    self._fp8_w = None
+                    self._fp8_scale = None
             elif (
                 2 <= rows.shape[0] <= 6
                 and rows.is_cuda

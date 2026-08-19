@@ -282,6 +282,7 @@ def _qwen35_delta_rule(fallback):
         use_qk_l2norm_in_kernel=True,
         **kwargs,
     ):
+        passthrough = dict(kwargs)
         del kwargs
         if (
             use_qk_l2norm_in_kernel
@@ -338,6 +339,23 @@ def _qwen35_delta_rule(fallback):
                         device=query.device,
                     )
                 )
+                if query.shape[1] > 8:
+                    # 长 prefill:串行 recurrent 批内核(为 MTP verify 的
+                    # 小批设计)在 T 大时是纯串行瓶颈(实测 32tok=1.1s,
+                    # 28 tok/s);放行原 fla chunk 并行路径(用户实测
+                    # prefill 应为 2000 tok/s 级)。decode/verify(≤8)
+                    # 路径不变。
+                    return fallback(
+                        query,
+                        key,
+                        value,
+                        g=g,
+                        beta=beta,
+                        initial_state=initial_state,
+                        output_final_state=output_final_state,
+                        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                        **passthrough,
+                    )
                 if query.shape[1] == 1:
                     from .fusedext import qwen35_delta_recurrent_fused
 
