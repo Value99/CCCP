@@ -1,13 +1,13 @@
 {
   "schema": "cccp-launcher-update-v1",
   "channel": "stable",
-  "version": "0.9.6",
-  "released_at": "2026-08-18T04:57:13+08:00",
-  "title": "CCCP 启动器 0.9.6",
+  "version": "0.9.10",
+  "released_at": "2026-08-22T23:07:43+08:00",
+  "title": "CCCP 启动器 0.9.10",
   "summary": "修复消费级 NVIDIA 显卡 Prefill 期间三类 cudaErrorIllegalAddress，并统一专家展开工作区的块级收尾。",
   "download": {
     "provider": "GitHub Releases",
-    "url": "https://github.com/Value99/CCCP/releases/tag/v0.9.6",
+    "url": "https://github.com/Value99/CCCP/releases/tag/v0.9.10",
     "extraction_code": ""
   },
   "github": {
