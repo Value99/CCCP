@@ -26,7 +26,7 @@
 
 然后双击 `CCCP-Launcher-0.9.10-Offline-Setup.exe`。安装器会自动校验、合并、解压并启动。模型不包含在启动器发行包内，需要单独下载并放入解压目录的 `models` 文件夹。
 
-> Release 页面底部的 `Source code (zip/tar.gz)` 是 GitHub 自动生成的公开资料快照，不包含启动器源码、推理引擎源码、模型或 CCCP 量化框架。普通用户请下载上面列出的离线安装器和分卷。
+> Release 页面底部的 `Source code (zip/tar.gz)` 是 GitHub 自动生成的源码快照，其中包含已开放的 [`CCCP-Engine` 推理运行时源码](engine/CCCP-Engine)，但不包含启动器源码、模型或 CCCP 量化框架。普通用户请下载上面列出的离线安装器和分卷。
 
 ### 0.9.10 重点更新
 
