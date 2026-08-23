@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.pyd
+*.dll
+*.lib
+*.exp
+*.obj
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+results/
+benchmark-results/
+traces/

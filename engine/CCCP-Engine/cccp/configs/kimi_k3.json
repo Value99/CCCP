@@ -1,0 +1,130 @@
+{
+  "schema": 1,
+  "architecture": "kimi_k3",
+  "display_name": "Kimi K3（CCCP）",
+  "supports_parallel": true,
+  "tested_tp_min": 2,
+  "tested_tp_max": 8,
+  "speculative": {
+    "provider": "kimi_prompt_lookup",
+    "max_draft": 5,
+    "accept_top_n": 3,
+    "attachment": {
+      "kind": "builtin"
+    }
+  },
+  "defaults": {
+    "device": "cuda",
+    "max_new": 512,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "spec": 0,
+    "reasoning": "chat",
+    "host": "0.0.0.0",
+    "port": 8000,
+    "max_queue": 16
+  },
+  "environment": {
+    "CCCP_FUSED": "1",
+    "CCCP_TP_GRAPH": "1",
+    "CCCP_TP_DIRECT_INPUT": "1",
+    "CCCP_TP_HIDDEN": "0",
+    "CCCP_TP_HIDDEN_STATE": "0",
+    "CCCP_SMALL_OP_TP": "4",
+    "CCCP_DENSE_TP": "1",
+    "CCCP_FIRST_DENSE_TP": "1",
+    "CCCP_SHARED_MLP_TP": "1",
+    "CCCP_ATTENTION_TP": "1",
+    "CCCP_MLA_TP": "1",
+    "CCCP_FLASHINFER_MLA": "1",
+    "CCCP_ROUTED_PROJECTION_TP": "0",
+    "CCCP_ROUTED_DOWN_ROW_TP": "0",
+    "CCCP_ROUTER_TP": "0",
+    "CCCP_MOE_PRELUDE_TP": "0",
+    "CCCP_MOE_ROUTE_DOWN_TP": "0",
+    "CCCP_PAGED_LATENT_ATTENTION": "1",
+    "CCCP_LINEAR_ROUTE_FUSED": "1",
+    "CCCP_RESIDUAL_SINGLE_MAX_ROWS": "2",
+    "CCCP_RESIDUAL_INVERSE_CACHE": "1",
+    "CCCP_P12_SHARED": "direct",
+    "CCCP_VRAM_WATCH": "1",
+    "CCCP_CPU_PACKED": "1",
+    "CCCP_CPU_PACKED_DIRECT": "1",
+    "CCCP_CPU_THREADS": "physical",
+    "CCCP_CPU_NUMA": "auto",
+    "OMP_PROC_BIND": "true",
+    "OMP_PLACES": "cores",
+    "CCCP_RAM_RESERVE_GB": "2",
+    "CCCP_RESIDENT_RESERVE_GB": "2",
+    "CCCP_VRAM_RESERVE_GB": "1"
+  },
+  "profiles": {
+    "ram": {
+      "description": "单卡计算；紧凑专家常驻RAM并按需进入显存缓存",
+      "tp": 1,
+      "environment": {
+        "CCCP_KIMI_PACKED_HYBRID": "1",
+        "CCCP_SINGLE_GPU_LAYER_GRAPH": "0",
+        "CCCP_TP_HIDDEN": "1",
+        "CCCP_TP_HIDDEN_STATE": "1",
+        "CCCP_TP_NO_OWNER": "0",
+        "CCCP_TP_LAYER_GRAPH": "1",
+        "CCCP_MOE_OWNER_GRAPH": "1",
+        "CCCP_MOE_ROUTE_DOWN_TP": "0",
+        "CCCP_ROUTED_PROJECTION_TP": "1"
+      }
+    },
+    "parallel": {
+      "description": "兼容名称：采用已验证的4卡全显存无owner真张量并行",
+      "tp": 4,
+      "environment": {
+        "CCCP_MOE_PARALLELISM": "tensor",
+        "CCCP_TP_PARALLEL_LAUNCH": "0",
+        "CCCP_TP_HIDDEN": "1",
+        "CCCP_TP_HIDDEN_STATE": "1",
+        "CCCP_TP_NO_OWNER": "1",
+        "CCCP_TP_LAYER_GRAPH": "1",
+        "CCCP_TP_MOE_PLAN": "1",
+        "CCCP_TP_DECODE_LAYER_PLAN": "0",
+        "CCCP_ROUTED_WARPS": "8",
+        "CCCP_MOE_ROUTE_DOWN_TP": "1"
+      }
+    },
+    "parallel_tp4": {
+      "description": "推荐：4卡全显存无owner真张量并行；全rank固定地址父图",
+      "tp": 4,
+      "environment": {
+        "CCCP_MOE_PARALLELISM": "tensor",
+        "CCCP_TP_PARALLEL_LAUNCH": "0",
+        "CCCP_TP_HIDDEN": "1",
+        "CCCP_TP_HIDDEN_STATE": "1",
+        "CCCP_TP_NO_OWNER": "1",
+        "CCCP_TP_LAYER_GRAPH": "1",
+        "CCCP_TP_MOE_PLAN": "1",
+        "CCCP_TP_DECODE_LAYER_PLAN": "0",
+        "CCCP_ROUTED_WARPS": "8",
+        "CCCP_MOE_ROUTE_DOWN_TP": "1"
+      }
+    },
+    "parallel_tp8": {
+      "description": "推荐高速：8卡全显存无owner真张量并行；92层嵌套计划顺序提交rank图",
+      "tp": 8,
+      "environment": {
+        "CCCP_MOE_PARALLELISM": "tensor",
+        "CCCP_TP_PARALLEL_LAUNCH": "0",
+        "CCCP_TP_HIDDEN": "1",
+        "CCCP_TP_HIDDEN_STATE": "1",
+        "CCCP_TP_NO_OWNER": "1",
+        "CCCP_TP_LAYER_GRAPH": "1",
+        "CCCP_TP_MOE_PLAN": "1",
+        "CCCP_TP_DECODE_LAYER_PLAN": "0",
+        "CCCP_TP_FUSED_MOE_FINALIZE": "1",
+        "CCCP_TP_EVENT_BARRIER": "1",
+        "CCCP_ROUTED_WARPS": "8",
+        "CCCP_MOE_ROUTE_DOWN_TP": "1",
+        "CCCP_PREFILL_MOE_BATCH": "4096",
+        "CCCP_KIMI_PREFILL_BLOCK": "4096"
+      }
+    }
+  }
+}

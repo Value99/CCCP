@@ -1,0 +1,64 @@
+{
+  "schema": 1,
+  "architecture": "qwen3_5_dense",
+  "display_name": "Qwen3.5 Dense VQ（CCCP）",
+  "supports_parallel": false,
+  "speculative": {
+    "provider": "qwen35_mtp",
+    "max_draft": 5,
+    "accept_top_n": 3,
+    "residency": {
+      "cpu": "disabled",
+      "nvidia_fp8": "fp8",
+      "nvidia_legacy": "int8",
+      "independent_of_lru": true
+    },
+    "execution": {
+      "draft": "fixed-block-cuda-graph",
+      "verify": "fixed-block-cuda-graph"
+    },
+    "attachment": {
+      "kind": "config-positive",
+      "field": "mtp_layers"
+    }
+  },
+  "defaults": {
+    "device": "cuda",
+    "max_new": 512,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "spec": 0,
+    "spec_by_device": {
+      "cpu": 0,
+      "cuda": 4,
+      "amd": 0
+    },
+    "reasoning": "chat",
+    "host": "0.0.0.0",
+    "port": 8000,
+    "max_queue": 16
+  },
+  "environment": {
+    "CCCP_FUSED": "1",
+    "CCCP_CPU_COMPILE": "q4",
+    "CCCP_CPU_THREADS": "physical",
+    "CCCP_CPU_NUMA": "auto",
+    "CCCP_RAM_RESERVE_GB": "2",
+    "CCCP_RESIDENT_RESERVE_GB": "2",
+    "CCCP_VRAM_RESERVE_GB": "1"
+  },
+  "profiles": {
+    "ram": {
+      "description": "Dense VQ 单卡/CPU 自动模式；不包含动态专家或路由配置",
+      "tp": 1,
+      "environment": {}
+    },
+    "resident": {
+      "description": "Dense VQ 权重完整常驻单卡显存；运行期无专家换入",
+      "tp": 1,
+      "environment": {
+        "CCCP_FULL_RESIDENT": "1"
+      }
+    }
+  }
+}

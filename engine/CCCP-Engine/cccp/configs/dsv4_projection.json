@@ -1,0 +1,148 @@
+{
+  "schema": 1,
+  "architecture": "dsv4_projection",
+  "display_name": "DeepSeek-V4 三投影 CCCP",
+  "supports_parallel": true,
+  "tested_tp_min": 2,
+  "tested_tp_max": 8,
+  "tested_tp_values": [2, 4, 8],
+  "defaults": {
+    "device": "cuda",
+    "max_new": 512,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "spec": 0,
+    "reasoning": "chat",
+    "host": "0.0.0.0",
+    "port": 8000,
+    "max_queue": 16
+  },
+  "environment": {
+    "CCCP_COMPUTE_DTYPE": "bf16",
+    "CCCP_DENSE_BF16": "none",
+    "CCCP_FUSED": "1",
+    "CCCP_PROJECTION_FUSED": "1",
+    "CCCP_PROJECTION_TILE_VIEW": "0",
+    "CCCP_PROJECTION_TILE_FUSED": "0",
+    "CCCP_PROJECTION_DOWN_REDUCE": "0",
+    "CCCP_STATIC_DECODE_GRAPHS": "1",
+    "CCCP_STATIC_FFN_GRAPH": "1",
+    "CCCP_P10_SHARED": "1",
+    "CCCP_PAGED_KV_FUSED": "1",
+    "CCCP_VRAM_WATCH": "1",
+    "CCCP_CPU_PACKED": "1",
+    "CCCP_CPU_PACKED_DIRECT": "1",
+    "CCCP_CPU_THREADS": "auto",
+    "CCCP_CPU_NUMA": "auto",
+    "CCCP_RAM_RESERVE_GB": "2",
+    "CCCP_RESIDENT_RESERVE_GB": "2",
+    "CCCP_VRAM_RESERVE_GB": "1"
+  },
+  "profiles": {
+    "ram": {
+      "description": "单卡计算；FP8 Dense 常驻 GPU，紧凑三投影专家常驻 RAM 并按需缓存到 VRAM",
+      "tp": 1,
+      "environment": {
+        "CCCP_RAM_MIRROR": "0",
+        "CCCP_FULL_RESIDENT": "1"
+      }
+    },
+    "resident": {
+      "description": "单卡全显存；FP8 Dense 与紧凑三投影专家均驻 GPU，不建立专家 RAM 镜像",
+      "tp": 1,
+      "environment": {
+        "CCCP_PACKED_FULL_GPU": "1",
+        "CCCP_RAM_MIRROR": "0",
+        "CCCP_DENSE_BF16": "all",
+        "CCCP_SINGLE_GPU_LAYER_GRAPH": "1",
+        "CCCP_DSV4_TOKEN_GRAPH": "1",
+        "CCCP_TP_LAYER_GRAPH": "1",
+        "CCCP_TP_HIDDEN": "1",
+        "CCCP_TP_NO_OWNER": "1"
+      }
+    },
+    "mapped": {
+      "description": "单卡受限显存：Dense驻GPU，配置内全部packed专家驻RAM，有界热槽按真实路由缓存到VRAM",
+      "tp": 1,
+      "environment": {
+        "CCCP_PACKED_FULL_GPU": "0",
+        "CCCP_PACKED_HOST_MAPPED": "0",
+        "CCCP_MAPPED_STAGE": "0",
+        "CCCP_MAPPED_ELASTIC_CACHE": "0",
+        "CCCP_FULL_RESIDENT": "1",
+        "CCCP_ALLOW_PAGEFILE_RESIDENT": "1",
+        "CCCP_VRAM_RESERVE_GB": "1",
+        "CCCP_RAM_MIRROR": "0",
+        "CCCP_DENSE_BF16": "none",
+        "CCCP_SINGLE_GPU_LAYER_GRAPH": "0",
+        "CCCP_DSV4_TOKEN_GRAPH": "0",
+        "CCCP_TP_LAYER_GRAPH": "0"
+      }
+    },
+    "resident_tile_experimental": {
+      "description": "Marlin式静态packed tile view与两段Top-K融合实验；仅用于CLI回归，不替代更快的resident基线",
+      "tp": 1,
+      "environment": {
+        "CCCP_PACKED_FULL_GPU": "1",
+        "CCCP_RAM_MIRROR": "0",
+        "CCCP_DENSE_BF16": "all",
+        "CCCP_SINGLE_GPU_LAYER_GRAPH": "1",
+        "CCCP_PROJECTION_TILE_VIEW": "1",
+        "CCCP_PROJECTION_TILE_FUSED": "1"
+      }
+    },
+    "parallel": {
+      "description": "多卡全显存真TP；Attention Head-TP、共享Dense/Router Row-TP 与 packed routed MoE 跨全部rank计算",
+      "tp": 4,
+      "environment": {
+        "CCCP_MOE_PARALLELISM": "tensor",
+        "CCCP_TP_GRAPH": "1",
+        "CCCP_TP_HIDDEN": "1",
+        "CCCP_TP_NO_OWNER": "1",
+        "CCCP_TP_FUSED_MOE_FINALIZE": "1",
+        "CCCP_TP_EVENT_BARRIER": "1",
+        "CCCP_TP_HC_LAYER_PLAN": "1",
+        "CCCP_TP_PARALLEL_LAUNCH": "0",
+        "CCCP_DSV4_FULL_TP": "1",
+        "CCCP_SHARED_MLP_TP": "1",
+        "CCCP_ROUTED_WARPS": "8",
+        "CCCP_RAM_MIRROR": "0"
+      }
+    },
+    "parallel_tp4": {
+      "description": "四卡全层真TP；全rank直接持有TPHidden，无hidden owner",
+      "tp": 4,
+      "environment": {
+        "CCCP_MOE_PARALLELISM": "tensor",
+        "CCCP_TP_GRAPH": "1",
+        "CCCP_TP_HIDDEN": "1",
+        "CCCP_TP_NO_OWNER": "1",
+        "CCCP_TP_FUSED_MOE_FINALIZE": "1",
+        "CCCP_TP_EVENT_BARRIER": "1",
+        "CCCP_TP_HC_LAYER_PLAN": "1",
+        "CCCP_TP_PARALLEL_LAUNCH": "0",
+        "CCCP_DSV4_FULL_TP": "1",
+        "CCCP_SHARED_MLP_TP": "1",
+        "CCCP_ROUTED_WARPS": "8",
+        "CCCP_RAM_MIRROR": "0"
+      }
+    },
+    "parallel_tp8": {
+      "description": "八卡全层真TP兼容配置；本轮仅回归TP4，使用前先运行cccp check",
+      "tp": 8,
+      "environment": {
+        "CCCP_MOE_PARALLELISM": "tensor",
+        "CCCP_TP_GRAPH": "1",
+        "CCCP_TP_HIDDEN": "1",
+        "CCCP_TP_NO_OWNER": "1",
+        "CCCP_TP_FUSED_MOE_FINALIZE": "1",
+        "CCCP_TP_EVENT_BARRIER": "1",
+        "CCCP_TP_HC_LAYER_PLAN": "1",
+        "CCCP_DSV4_FULL_TP": "1",
+        "CCCP_SHARED_MLP_TP": "1",
+        "CCCP_ROUTED_WARPS": "8",
+        "CCCP_RAM_MIRROR": "0"
+      }
+    }
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "architecture": "dsv4",
+  "display_name": "DeepSeek-V4（CCCP）",
+  "supports_parallel": false,
+  "speculative": {
+    "provider": "dsv4_dspark",
+    "max_draft": 5,
+    "accept_top_n": 3,
+    "attachment": {
+      "kind": "manifest-file",
+      "field": "dspark_file"
+    }
+  },
+  "defaults": {
+    "device": "cuda",
+    "max_new": 512,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "spec": 0,
+    "reasoning": "chat",
+    "host": "0.0.0.0",
+    "port": 8000,
+    "max_queue": 16
+  },
+  "environment": {
+    "CCCP_COMPUTE_DTYPE": "bf16",
+    "CCCP_DENSE_BF16": "all",
+    "CCCP_FUSED": "1",
+    "CCCP_STATIC_DECODE_GRAPHS": "1",
+    "CCCP_STATIC_FFN_GRAPH": "1",
+    "CCCP_PAGED_KV_FUSED": "1",
+    "CCCP_VRAM_WATCH": "1",
+    "CCCP_CPU_THREADS": "auto",
+    "CCCP_CPU_NUMA": "auto",
+    "CCCP_CPU_VQ_INT8": "0",
+    "CCCP_RAM_RESERVE_GB": "2",
+    "CCCP_RESIDENT_RESERVE_GB": "2",
+    "CCCP_VRAM_RESERVE_GB": "1"
+  },
+  "profiles": {
+    "ram": {
+      "description": "单卡计算；压缩专家常驻 RAM，按需进入显存缓存",
+      "tp": 1,
+      "environment": {
+        "CCCP_RAM_MIRROR": "0"
+      }
+    }
+  }
+}
