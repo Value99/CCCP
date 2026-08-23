@@ -4,7 +4,7 @@
   "version": "0.9.10",
   "released_at": "2026-08-22T23:07:43+08:00",
   "title": "CCCP 启动器 0.9.10",
-  "summary": "修复消费级 NVIDIA 显卡 Prefill 期间三类 cudaErrorIllegalAddress，并统一专家展开工作区的块级收尾。",
+  "summary": "0.9.10 兼容性重发：修复 RTX 20/30 系列误入不支持的 FP8 scaled-mm 路径，并开放 CCCP-Engine 推理运行时源码。",
   "download": {
     "provider": "GitHub Releases",
     "url": "https://github.com/Value99/CCCP/releases/tag/v0.9.10",
@@ -26,11 +26,13 @@
     "platform": "Windows x64"
   },
   "release_notes": [
+    "RTX 20/30 系列不会再误入仅新架构支持的 FP8 scaled-mm 路径；相关能力按计算架构与运行时支持情况严格启用。",
+    "离线包内置 SM75、SM86、SM89、SM90、SM120 五种 NVIDIA 预编译算子。",
     "Prefill 编译投影核按有符号 32 位偏移寻址：gate-up 平板超过 2^31 字节时分片专家数被硬性钳制，消除越界写入与静默显存损坏。",
     "Prefill 工作区整块保留复用，不再逐层 synchronize/empty_cache/重分配；该循环曾在 WDDM 消费级显卡上触发驱动错误。",
     "Windows 批量 H2D 拷贝自动限制为每组不超过 8 份，避开百余份十 MiB 级拷贝一次提交的越界窗口；可用 CCCP_H2D_BATCH_MAX_COPIES 调整。",
     "Kimi Prefill 与 MTP 的专家展开工作区改为统一块级收尾，不再泄漏进 Decode 阶段。",
-    "新增 data/runtime/debug_env.txt 诊断通道：无需终端即可给 serve 进程注入一次性环境变量。",
+    "CCCP-Engine 推理运行时源码已开放：https://github.com/Value99/CCCP/tree/main/engine/CCCP-Engine。",
     "完整自动化回归 326 passed、11 skipped。"
   ]
 }
