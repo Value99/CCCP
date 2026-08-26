@@ -41,10 +41,12 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cub/block/block_radix_sort.cuh>
+#include <cub/warp/warp_merge_sort.cuh>
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <climits>
 #include <condition_variable>
 #include <cfloat>
 #include <cstdlib>
@@ -2727,6 +2729,202 @@ torch::Tensor dense_fp8_quantize_rows(
     return output;
 }
 
+// Fuse the gated activation and the row-wise E4M3 conversion used between
+// the two routed expert GEMMs.  The old chain wrote a full BF16 activation,
+// reread it to find amax, then reread it again for quantization.  One CTA per
+// routed row keeps the rounded BF16 activation in shared memory, preserving
+// the former numerical boundary while removing both global-memory passes.
+__global__ void gated_activation_fp8_quantize_rows_kernel(
+    const __nv_bfloat16* __restrict__ gate_up,
+    uint8_t* __restrict__ output,
+    float* __restrict__ scales,
+    const int64_t rows,
+    const int intermediate,
+    const int activation,
+    const float beta,
+    const float linear_beta,
+    const float limit)
+{
+    const int64_t row = static_cast<int64_t>(blockIdx.x);
+    if (row >= rows)
+        return;
+    extern __shared__ __nv_bfloat16 activated[];
+    __shared__ float reductions[256];
+    __shared__ float row_scale;
+    const int64_t source = row * static_cast<int64_t>(2 * intermediate);
+    float maximum = 0.0f;
+    for (int column = threadIdx.x; column < intermediate;
+         column += blockDim.x) {
+        float gate = __bfloat162float(gate_up[source + column]);
+        float up = __bfloat162float(
+            gate_up[source + intermediate + column]);
+        float value;
+        if (activation == 0) {
+            if (limit > 0.0f) {
+                gate = fminf(gate, limit);
+                up = fminf(fmaxf(up, -limit), limit);
+            }
+            value = (gate / (1.0f + expf(-gate))) * up;
+        } else {
+            const float nonlinear =
+                beta * tanhf(gate / beta) / (1.0f + expf(-gate));
+            if (linear_beta > 0.0f)
+                up = linear_beta * tanhf(up / linear_beta);
+            value = nonlinear * up;
+        }
+        const __nv_bfloat16 rounded = __float2bfloat16_rn(value);
+        activated[column] = rounded;
+        maximum = fmaxf(maximum, fabsf(__bfloat162float(rounded)));
+    }
+    reductions[threadIdx.x] = maximum;
+    __syncthreads();
+    for (int width = blockDim.x / 2; width > 0; width >>= 1) {
+        if (threadIdx.x < width)
+            reductions[threadIdx.x] = fmaxf(
+                reductions[threadIdx.x], reductions[threadIdx.x + width]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        row_scale = fmaxf(reductions[0] / 448.0f, 1.0e-12f);
+        scales[row] = row_scale;
+    }
+    __syncthreads();
+    const float inverse_scale = 1.0f / row_scale;
+    const int64_t destination = row * static_cast<int64_t>(intermediate);
+    for (int column = threadIdx.x; column < intermediate;
+         column += blockDim.x) {
+        const float value = fminf(
+            448.0f,
+            fmaxf(
+                -448.0f,
+                __bfloat162float(activated[column]) * inverse_scale));
+        __nv_fp8_e4m3 quantized(value);
+        output[destination + column] = quantized.__x;
+    }
+}
+
+torch::Tensor gated_activation_fp8_quantize_rows(
+    torch::Tensor gate_up,
+    torch::Tensor output,
+    torch::Tensor scales,
+    int64_t activation,
+    double beta,
+    double linear_beta,
+    double limit)
+{
+    TORCH_CHECK(
+        gate_up.is_cuda() && gate_up.scalar_type() == at::kBFloat16 &&
+        gate_up.is_contiguous() && gate_up.dim() == 2 &&
+        gate_up.size(1) % 2 == 0,
+        "Gated FP8 activation requires contiguous CUDA BF16 [N,2I]");
+    const int64_t rows = gate_up.size(0);
+    const int64_t intermediate = gate_up.size(1) / 2;
+    TORCH_CHECK(
+        output.is_cuda() &&
+        output.scalar_type() == at::ScalarType::Float8_e4m3fn &&
+        output.is_contiguous() && output.dim() == 2 &&
+        output.size(0) == rows && output.size(1) == intermediate &&
+        scales.is_cuda() && scales.scalar_type() == at::kFloat &&
+        scales.is_contiguous() && scales.size(0) == rows &&
+        scales.size(1) == 1 && (activation == 0 || activation == 1),
+        "Gated FP8 activation output/scale mismatch");
+    auto stream = at::cuda::getCurrentCUDAStream(gate_up.get_device());
+    gated_activation_fp8_quantize_rows_kernel<<<
+        static_cast<unsigned>(rows), 256,
+        static_cast<size_t>(intermediate) * sizeof(__nv_bfloat16),
+        stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(
+                gate_up.data_ptr<at::BFloat16>()),
+            static_cast<uint8_t*>(output.data_ptr()),
+            scales.data_ptr<float>(), rows, static_cast<int>(intermediate),
+            static_cast<int>(activation), static_cast<float>(beta),
+            static_cast<float>(linear_beta), static_cast<float>(limit));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+__global__ void routed_inverse_order_kernel(
+    const int64_t* __restrict__ sorted_positions,
+    int64_t* __restrict__ inverse,
+    const int64_t count)
+{
+    const int64_t item = static_cast<int64_t>(blockIdx.x) * blockDim.x
+        + threadIdx.x;
+    if (item < count)
+        inverse[sorted_positions[item]] = item;
+}
+
+__global__ void routed_weighted_reduce_kernel(
+    const __nv_bfloat16* __restrict__ rows,
+    const int64_t* __restrict__ inverse,
+    const float* __restrict__ weights,
+    float* __restrict__ output,
+    const int tokens,
+    const int top_k,
+    const int hidden)
+{
+    const int64_t item = static_cast<int64_t>(blockIdx.x) * blockDim.x
+        + threadIdx.x;
+    const int64_t total = static_cast<int64_t>(tokens) * hidden;
+    if (item >= total)
+        return;
+    const int token = static_cast<int>(item / hidden);
+    const int column = static_cast<int>(item - static_cast<int64_t>(token) * hidden);
+    float sum = 0.0f;
+    #pragma unroll
+    for (int route = 0; route < top_k; ++route) {
+        const int64_t logical = static_cast<int64_t>(token) * top_k + route;
+        const int64_t packed = inverse[logical];
+        sum += __bfloat162float(
+            rows[packed * static_cast<int64_t>(hidden) + column])
+            * weights[logical];
+    }
+    output[item] = sum;
+}
+
+torch::Tensor routed_weighted_reduce(
+    torch::Tensor rows,
+    torch::Tensor sorted_positions,
+    torch::Tensor weights,
+    torch::Tensor inverse,
+    torch::Tensor output,
+    int64_t top_k)
+{
+    TORCH_CHECK(
+        rows.is_cuda() && rows.scalar_type() == at::kBFloat16 &&
+        rows.is_contiguous() && rows.dim() == 2 &&
+        sorted_positions.is_cuda() &&
+        sorted_positions.scalar_type() == at::kLong &&
+        sorted_positions.is_contiguous() &&
+        weights.is_cuda() && weights.scalar_type() == at::kFloat &&
+        weights.is_contiguous() && inverse.is_cuda() &&
+        inverse.scalar_type() == at::kLong && inverse.is_contiguous() &&
+        output.is_cuda() && output.scalar_type() == at::kFloat &&
+        output.is_contiguous() && output.dim() == 2 && top_k > 0,
+        "Routed weighted reduction operand mismatch");
+    const int64_t routes = rows.size(0);
+    TORCH_CHECK(
+        sorted_positions.numel() == routes && weights.numel() == routes &&
+        inverse.numel() >= routes && output.size(0) * top_k == routes &&
+        output.size(1) == rows.size(1),
+        "Routed weighted reduction shape mismatch");
+    auto stream = at::cuda::getCurrentCUDAStream(rows.get_device());
+    routed_inverse_order_kernel<<<
+        static_cast<unsigned>((routes + 255) / 256), 256, 0, stream>>>(
+            sorted_positions.data_ptr<int64_t>(), inverse.data_ptr<int64_t>(),
+            routes);
+    const int64_t items = output.numel();
+    routed_weighted_reduce_kernel<<<
+        static_cast<unsigned>((items + 255) / 256), 256, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(
+                rows.data_ptr<at::BFloat16>()),
+            inverse.data_ptr<int64_t>(), weights.data_ptr<float>(),
+            output.data_ptr<float>(), static_cast<int>(output.size(0)),
+            static_cast<int>(top_k), static_cast<int>(output.size(1)));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
 inline int dense_vq_dtype_tag(const int bits)
 {
     switch (bits) {
@@ -3007,6 +3205,514 @@ torch::Tensor dense_vq_gemv_grouped_fp8_codebook(
         columns);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
+}
+
+// Compact-codebook Decode probe and reusable single-projection primitive.
+// The packed VQ indices remain in their archive representation.  Each warp
+// owns one output row, converts only the referenced E4M3 codewords in
+// registers, and immediately accumulates the dot product.  No full FP8/BF16
+// weight row is ever allocated or written to global memory.
+__global__ void dense_vq_gemv_packed_fp8_codebook_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ codebook,
+    float* __restrict__ output,
+    const int rows,
+    const int blocks,
+    const int vector,
+    const int dtype_tag,
+    const float codebook_scale)
+{
+    const int row =
+        blockIdx.x * CCCP_DENSE_VQ_ROWS_PER_BLOCK + threadIdx.y;
+    extern __shared__ __nv_bfloat16 compact_fp8_staged_input[];
+    const int columns = blocks * vector;
+    for (int column = threadIdx.y * 32 + threadIdx.x;
+         column < columns;
+         column += 32 * CCCP_DENSE_VQ_ROWS_PER_BLOCK)
+        compact_fp8_staged_input[column] = input[column];
+    __syncthreads();
+    if (row >= rows) return;
+
+    const int64_t address = static_cast<int64_t>(
+        reinterpret_cast<uintptr_t>(packed));
+    float sum = 0.0f;
+    for (int block = threadIdx.x; block < blocks; block += 32) {
+        const int code = routed_index_value(
+            address,
+            dtype_tag,
+            static_cast<long>(row) * blocks + block);
+        const uint8_t* code_row =
+            codebook + static_cast<long>(code) * vector;
+        const __nv_bfloat16* input_row =
+            compact_fp8_staged_input + block * vector;
+        float partial = 0.0f;
+        #pragma unroll
+        for (int component = 0; component < 16; component += 4) {
+            if (component >= vector) break;
+            __nv_fp8x4_e4m3 packed_code;
+            packed_code.__x = __ldg(reinterpret_cast<const uint32_t*>(
+                code_row + component));
+            const float4 code_value = static_cast<float4>(packed_code);
+            const float2 input01 = __bfloat1622float2(
+                *reinterpret_cast<const __nv_bfloat162*>(
+                    input_row + component));
+            const float2 input23 = __bfloat1622float2(
+                *reinterpret_cast<const __nv_bfloat162*>(
+                    input_row + component + 2));
+            partial = fmaf(
+                code_value.x * codebook_scale, input01.x, partial);
+            partial = fmaf(
+                code_value.y * codebook_scale, input01.y, partial);
+            partial = fmaf(
+                code_value.z * codebook_scale, input23.x, partial);
+            partial = fmaf(
+                code_value.w * codebook_scale, input23.y, partial);
+        }
+        sum += partial;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset, 32);
+    if (threadIdx.x == 0) output[row] = sum;
+}
+
+torch::Tensor dense_vq_gemv_packed_fp8_codebook(
+    torch::Tensor input,
+    torch::Tensor packed,
+    torch::Tensor codebook,
+    double codebook_scale,
+    int64_t rows,
+    int64_t blocks,
+    int64_t bits)
+{
+#if defined(__HIP_PLATFORM_AMD__)
+    TORCH_CHECK(false, "compact E4M3 codebook GEMV is unavailable on HIP");
+#else
+    TORCH_CHECK(
+        input.is_cuda() && packed.is_cuda() && codebook.is_cuda() &&
+        input.scalar_type() == at::kBFloat16 && input.dim() == 2 &&
+        input.size(0) == 1 && input.is_contiguous() &&
+        packed.scalar_type() == at::kByte && packed.dim() == 1 &&
+        packed.is_contiguous() &&
+        codebook.scalar_type() == at::ScalarType::Float8_e4m3fn &&
+        codebook.dim() == 2 && codebook.is_contiguous(),
+        "compact E4M3 codebook GEMV requires CUDA BF16 [1,C], packed "
+        "uint8, and E4M3 [K,D]");
+    const int tag = dense_vq_dtype_tag(static_cast<int>(bits));
+    const int vector = static_cast<int>(codebook.size(1));
+    const int64_t columns = blocks * vector;
+    const int64_t expected_bits = rows * blocks * bits;
+    TORCH_CHECK(
+        tag >= 0 && rows > 0 && blocks > 0 &&
+        (vector == 4 || vector == 8 || vector == 16) &&
+        expected_bits % 8 == 0 &&
+        packed.numel() == expected_bits / 8 &&
+        input.size(1) == columns &&
+        codebook.size(0) > 0 &&
+        codebook.size(0) <= (int64_t{1} << bits) &&
+        std::isfinite(codebook_scale) && codebook_scale > 0.0,
+        "compact E4M3 codebook GEMV metadata mismatch");
+    const int device = input.get_device();
+    TORCH_CHECK(
+        packed.get_device() == device && codebook.get_device() == device,
+        "compact E4M3 codebook GEMV tensors must share one device");
+    const size_t input_bytes =
+        static_cast<size_t>(columns) * sizeof(__nv_bfloat16);
+    TORCH_CHECK(
+        input_bytes <= 48 * 1024,
+        "compact E4M3 codebook GEMV input exceeds shared-memory contract");
+    auto output = torch::empty(
+        {1, rows}, input.options().dtype(at::kFloat));
+    const dim3 block(32, CCCP_DENSE_VQ_ROWS_PER_BLOCK);
+    const dim3 grid(static_cast<unsigned>(
+        (rows + CCCP_DENSE_VQ_ROWS_PER_BLOCK - 1) /
+        CCCP_DENSE_VQ_ROWS_PER_BLOCK));
+    dense_vq_gemv_packed_fp8_codebook_kernel<<<
+        grid,
+        block,
+        input_bytes,
+        at::cuda::getCurrentCUDAStream(device)>>>(
+            reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+            packed.data_ptr<uint8_t>(),
+            static_cast<const uint8_t*>(codebook.data_ptr()),
+            output.data_ptr<float>(),
+            static_cast<int>(rows),
+            static_cast<int>(blocks),
+            vector,
+            tag,
+            static_cast<float>(codebook_scale));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+#endif
+}
+
+// Compact-codebook Q8 Decode primitive.  This is deliberately different
+// from an INT8 weight image: only the small VQ codebook is quantized once.
+// The packed expert indices remain authoritative, the activation is
+// quantized once per VQ block into CTA shared memory, and each referenced
+// codeword is consumed immediately by DP4A.  No decoded/expanded weight row
+// or matrix exists in global memory.
+template <int DTYPE_TAG>
+__device__ __forceinline__ int routed_index_value_t(
+    const int64_t address,
+    const long offset,
+    const long index_count)
+{
+    const uintptr_t raw = static_cast<uintptr_t>(address);
+    if constexpr (DTYPE_TAG == 0)
+        return static_cast<int>(
+            reinterpret_cast<const uint8_t*>(raw)[offset]);
+    if constexpr (DTYPE_TAG == 1)
+        return static_cast<int>(
+            reinterpret_cast<const uint16_t*>(raw)[offset]);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(raw);
+    if constexpr (DTYPE_TAG == 2) {
+        const long base = (offset >> 1) * 3;
+        if ((offset & 1) == 0)
+            return static_cast<int>(
+                bytes[base] | ((bytes[base + 1] & 0x0f) << 8));
+        return static_cast<int>(
+            (bytes[base + 1] >> 4) | (bytes[base + 2] << 4));
+    }
+    if constexpr (DTYPE_TAG == 5) {
+        const long bit_offset = offset * 9;
+        const long base = bit_offset >> 3;
+        const int shift = static_cast<int>(bit_offset & 7);
+        const unsigned word =
+            static_cast<unsigned>(bytes[base]) |
+            (static_cast<unsigned>(bytes[base + 1]) << 8);
+        return static_cast<int>((word >> shift) & 0x1ffu);
+    }
+    if constexpr (DTYPE_TAG >= 6 && DTYPE_TAG <= 8) {
+        constexpr int bits = 2 * DTYPE_TAG - 1;
+        const long bit_offset = offset * bits;
+        const long base = bit_offset >> 3;
+        const int shift = static_cast<int>(bit_offset & 7);
+        unsigned word =
+            static_cast<unsigned>(bytes[base]) |
+            (static_cast<unsigned>(bytes[base + 1]) << 8);
+        if (shift + bits > 16)
+            word |= static_cast<unsigned>(bytes[base + 2]) << 16;
+        return static_cast<int>(
+            (word >> shift) & ((1u << bits) - 1u));
+    }
+    if constexpr (DTYPE_TAG == 4) {
+        const long group = offset >> 2;
+        const long base = (offset >> 2) * 5;
+        const long group_count = (index_count + 3) >> 2;
+        // Four p10 indices occupy five bytes.  Read their common 40-bit word
+        // through two naturally aligned 32-bit loads instead of rebuilding
+        // it with five dependent byte loads for every output row.  The last
+        // group keeps the exact scalar path so no padding/over-read contract
+        // is imposed on a packed archive.
+        if ((raw & 3u) == 0 && group + 1 < group_count) {
+            const uintptr_t absolute_address = raw + base;
+            const uintptr_t aligned_address = absolute_address & ~uintptr_t{3};
+            const int byte_shift = static_cast<int>(
+                (absolute_address & uintptr_t{3}) * 8);
+            const unsigned long long low = __ldg(reinterpret_cast<const uint32_t*>(
+                aligned_address));
+            const unsigned long long high = __ldg(reinterpret_cast<const uint32_t*>(
+                aligned_address + 4));
+            const unsigned long long word =
+                (low | (high << 32)) >> byte_shift;
+            return static_cast<int>(
+                (word >> (10 * (offset & 3))) & 0x3ffu);
+        }
+        unsigned long long word = 0;
+        #pragma unroll
+        for (int byte = 0; byte < 5; ++byte)
+            word |= static_cast<unsigned long long>(bytes[base + byte])
+                    << (8 * byte);
+        return static_cast<int>(
+            (word >> (10 * (offset & 3))) & 0x3ffu);
+    }
+    const long base = (offset >> 2) * 7;
+    unsigned long long word = 0;
+    #pragma unroll
+    for (int byte = 0; byte < 7; ++byte)
+        word |= static_cast<unsigned long long>(bytes[base + byte])
+                << (8 * byte);
+    return static_cast<int>(
+        (word >> (14 * (offset & 3))) & 0x3fffu);
+}
+
+__device__ __forceinline__ void routed_p10_index_quad(
+    const int64_t address,
+    const long offset,
+    const long index_count,
+    int (&codes)[4])
+{
+    const uintptr_t raw = static_cast<uintptr_t>(address);
+    const long group = offset >> 2;
+    const long group_count = (index_count + 3) >> 2;
+    if ((offset & 3) == 0 && offset + 3 < index_count &&
+        (raw & 3u) == 0 && group + 1 < group_count) {
+        const uintptr_t absolute_address = raw + group * 5;
+        const uintptr_t aligned_address = absolute_address & ~uintptr_t{3};
+        const int byte_shift = static_cast<int>(
+            (absolute_address & uintptr_t{3}) * 8);
+        const unsigned long long low = __ldg(
+            reinterpret_cast<const uint32_t*>(aligned_address));
+        const unsigned long long high = __ldg(
+            reinterpret_cast<const uint32_t*>(aligned_address + 4));
+        const unsigned long long word =
+            (low | (high << 32)) >> byte_shift;
+        codes[0] = static_cast<int>(word & 0x3ffu);
+        codes[1] = static_cast<int>((word >> 10) & 0x3ffu);
+        codes[2] = static_cast<int>((word >> 20) & 0x3ffu);
+        codes[3] = static_cast<int>((word >> 30) & 0x3ffu);
+        return;
+    }
+    #pragma unroll
+    for (int item = 0; item < 4; ++item)
+        codes[item] = routed_index_value_t<4>(
+            address, offset + item, index_count);
+}
+
+template <int VECTOR>
+__device__ __forceinline__ int vq_block_dot_routed_q8_codebook_i32_t(
+    const int8_t* __restrict__ codebook,
+    const int8_t* __restrict__ input)
+{
+    if constexpr (VECTOR == 16) {
+        const uint4 code = __ldg(
+            reinterpret_cast<const uint4*>(codebook));
+        const uint4 value = *reinterpret_cast<const uint4*>(input);
+        int sum = __dp4a(
+            static_cast<int>(code.x), static_cast<int>(value.x), 0);
+        sum = __dp4a(
+            static_cast<int>(code.y), static_cast<int>(value.y), sum);
+        sum = __dp4a(
+            static_cast<int>(code.z), static_cast<int>(value.z), sum);
+        return __dp4a(
+            static_cast<int>(code.w), static_cast<int>(value.w), sum);
+    }
+    if constexpr (VECTOR == 8) {
+        const uint2 code = __ldg(
+            reinterpret_cast<const uint2*>(codebook));
+        const uint2 value = *reinterpret_cast<const uint2*>(input);
+        const int first = __dp4a(
+            static_cast<int>(code.x), static_cast<int>(value.x), 0);
+        return __dp4a(
+            static_cast<int>(code.y), static_cast<int>(value.y), first);
+    }
+    const int code = __ldg(reinterpret_cast<const int*>(codebook));
+    const int value = *reinterpret_cast<const int*>(input);
+    return __dp4a(code, value, 0);
+}
+
+__device__ __forceinline__ int vq_block_dot_routed_q8_codebook_i32(
+    const int8_t* __restrict__ codebook,
+    const int8_t* __restrict__ input,
+    const int vector)
+{
+    if (vector == 16)
+        return vq_block_dot_routed_q8_codebook_i32_t<16>(codebook, input);
+    if (vector == 8)
+        return vq_block_dot_routed_q8_codebook_i32_t<8>(codebook, input);
+    return vq_block_dot_routed_q8_codebook_i32_t<4>(codebook, input);
+}
+
+#if !defined(__HIP_PLATFORM_AMD__)
+
+__device__ __forceinline__ int compact_q8_bits_from_tag(const int tag)
+{
+    if (tag == 0) return 8;
+    if (tag == 1) return 16;
+    if (tag == 2) return 12;
+    if (tag == 3) return 14;
+    if (tag == 4) return 10;
+    if (tag == 5) return 9;
+    if (tag == 6) return 11;
+    if (tag == 7) return 13;
+    if (tag == 8) return 15;
+    return 0;
+}
+
+// Route-local codebooks are only a few MiB even though the model-wide Q8
+// codebook set is larger than H20's L2.  The cache-control stream issues L2
+// prefetch hints for the selected layer while the default stream evaluates
+// the independent shared expert.  Duplicate semantic codebooks in one route
+// are skipped; packed expert bytes and expanded weight residency are unchanged.
+__global__ void compact_q8_codebook_l2_prefetch_kernel(
+    const int64_t* __restrict__ metadata,
+    const int expert_count)
+{
+    const int item = static_cast<int>(blockIdx.x);
+    const int projection = item / expert_count;
+    const int expert = item - projection * expert_count;
+    if (projection >= 3 || expert >= expert_count) return;
+    const int pointer_row = projection * 5 + 1;
+    const int vector_row = projection * 5 + 3;
+    const int tag_row = projection * 5 + 4;
+    const int64_t pointer = metadata[
+        static_cast<long>(pointer_row) * expert_count + expert];
+    const int vector = static_cast<int>(metadata[
+        static_cast<long>(vector_row) * expert_count + expert]);
+    const int tag = static_cast<int>(metadata[
+        static_cast<long>(tag_row) * expert_count + expert]);
+    if (pointer == 0 || (vector != 4 && vector != 8 && vector != 16)) return;
+    // A route may select several experts sharing the same projection codebook.
+    // Let only its first occurrence populate L2.
+    for (int prior = 0; prior < expert; ++prior) {
+        if (metadata[
+                static_cast<long>(pointer_row) * expert_count + prior] ==
+            pointer)
+            return;
+    }
+    const int bits = compact_q8_bits_from_tag(tag);
+    if (bits == 0) return;
+    const long bytes = (long{1} << bits) * vector;
+    const auto* base = reinterpret_cast<const unsigned char*>(
+        static_cast<uintptr_t>(pointer));
+    // One hint per cache line.  It is intentionally a hint rather than a
+    // compulsory load so demand traffic from the concurrent shared branch
+    // retains scheduler priority.
+    for (long offset = static_cast<long>(threadIdx.x) * 128;
+         offset < bytes;
+         offset += static_cast<long>(blockDim.x) * 128) {
+        const void* address = base + offset;
+        asm volatile("prefetch.global.L2 [%0];" : : "l"(address));
+    }
+}
+#endif
+
+__global__ void dense_vq_gemv_packed_q8_codebook_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    const uint8_t* __restrict__ packed,
+    const int8_t* __restrict__ codebook,
+    float* __restrict__ output,
+    const int rows,
+    const int blocks,
+    const int vector,
+    const int dtype_tag,
+    const float codebook_scale)
+{
+    const int linear_thread = threadIdx.y * 32 + threadIdx.x;
+    const int row =
+        blockIdx.x * CCCP_DENSE_VQ_ROWS_PER_BLOCK + threadIdx.y;
+    const int columns = blocks * vector;
+    extern __shared__ unsigned char compact_q8_raw[];
+    auto* quantized_input = reinterpret_cast<int8_t*>(compact_q8_raw);
+    auto* input_scales = reinterpret_cast<float*>(
+        compact_q8_raw + ((columns + 15) & ~15));
+
+    for (int block = linear_thread; block < blocks;
+         block += 32 * CCCP_DENSE_VQ_ROWS_PER_BLOCK) {
+        const __nv_bfloat16* source = input + block * vector;
+        float absolute_max = 0.0f;
+        #pragma unroll
+        for (int component = 0; component < 16; ++component) {
+            if (component >= vector) break;
+            absolute_max = fmaxf(
+                absolute_max,
+                fabsf(__bfloat162float(source[component])));
+        }
+        const float scale = fmaxf(absolute_max, 1.0e-12f) / 127.0f;
+        input_scales[block] = scale;
+        #pragma unroll
+        for (int component = 0; component < 16; ++component) {
+            if (component >= vector) break;
+            const float value = __bfloat162float(source[component]) / scale;
+            quantized_input[block * vector + component] =
+                static_cast<int8_t>(__float2int_rn(
+                    fminf(fmaxf(value, -127.0f), 127.0f)));
+        }
+    }
+    __syncthreads();
+    if (row >= rows) return;
+
+    const int64_t address = static_cast<int64_t>(
+        reinterpret_cast<uintptr_t>(packed));
+    float sum = 0.0f;
+    for (int block = threadIdx.x; block < blocks; block += 32) {
+        const int code = routed_index_value(
+            address,
+            dtype_tag,
+            static_cast<long>(row) * blocks + block);
+        const int integer_sum = vq_block_dot_routed_q8_codebook_i32(
+            codebook + static_cast<long>(code) * vector,
+            quantized_input + block * vector,
+            vector);
+        sum += static_cast<float>(integer_sum) *
+            (codebook_scale * input_scales[block]);
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset, 32);
+    if (threadIdx.x == 0) output[row] = sum;
+}
+
+torch::Tensor dense_vq_gemv_packed_q8_codebook(
+    torch::Tensor input,
+    torch::Tensor packed,
+    torch::Tensor codebook,
+    double codebook_scale,
+    int64_t rows,
+    int64_t blocks,
+    int64_t bits)
+{
+#if defined(__HIP_PLATFORM_AMD__)
+    TORCH_CHECK(false, "compact Q8 codebook GEMV is unavailable on HIP");
+#else
+    TORCH_CHECK(
+        input.is_cuda() && packed.is_cuda() && codebook.is_cuda() &&
+        input.scalar_type() == at::kBFloat16 && input.dim() == 2 &&
+        input.size(0) == 1 && input.is_contiguous() &&
+        packed.scalar_type() == at::kByte && packed.dim() == 1 &&
+        packed.is_contiguous() &&
+        codebook.scalar_type() == at::kChar && codebook.dim() == 2 &&
+        codebook.is_contiguous(),
+        "compact Q8 codebook GEMV requires CUDA BF16 [1,C], packed "
+        "uint8, and INT8 [K,D]");
+    const int tag = dense_vq_dtype_tag(static_cast<int>(bits));
+    const int vector = static_cast<int>(codebook.size(1));
+    const int64_t columns = blocks * vector;
+    const int64_t expected_bits = rows * blocks * bits;
+    TORCH_CHECK(
+        tag >= 0 && rows > 0 && blocks > 0 &&
+        (vector == 4 || vector == 8 || vector == 16) &&
+        expected_bits % 8 == 0 &&
+        packed.numel() == expected_bits / 8 &&
+        input.size(1) == columns && codebook.size(0) > 0 &&
+        codebook.size(0) <= (int64_t{1} << bits) &&
+        std::isfinite(codebook_scale) && codebook_scale > 0.0,
+        "compact Q8 codebook GEMV metadata mismatch");
+    const int device = input.get_device();
+    TORCH_CHECK(
+        packed.get_device() == device && codebook.get_device() == device,
+        "compact Q8 codebook GEMV tensors must share one device");
+    const size_t quantized_bytes = static_cast<size_t>(columns);
+    const size_t scale_offset = (quantized_bytes + 15) & ~size_t{15};
+    const size_t shared_bytes =
+        scale_offset + static_cast<size_t>(blocks) * sizeof(float);
+    TORCH_CHECK(
+        shared_bytes <= 48 * 1024,
+        "compact Q8 codebook GEMV input exceeds shared-memory contract");
+    auto output = torch::empty(
+        {1, rows}, input.options().dtype(at::kFloat));
+    const dim3 block(32, CCCP_DENSE_VQ_ROWS_PER_BLOCK);
+    const dim3 grid(static_cast<unsigned>(
+        (rows + CCCP_DENSE_VQ_ROWS_PER_BLOCK - 1) /
+            CCCP_DENSE_VQ_ROWS_PER_BLOCK));
+    dense_vq_gemv_packed_q8_codebook_kernel<<<
+        grid,
+        block,
+        shared_bytes,
+        at::cuda::getCurrentCUDAStream(device)>>>(
+            reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+            packed.data_ptr<uint8_t>(),
+            codebook.data_ptr<int8_t>(),
+            output.data_ptr<float>(),
+            static_cast<int>(rows),
+            static_cast<int>(blocks),
+            vector,
+            tag,
+            static_cast<float>(codebook_scale));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+#endif
 }
 
 __global__ void dense_vq_dequant_packed_kernel(
@@ -3780,6 +4486,93 @@ __device__ __forceinline__ void vq_block_dot_pair_routed_bf16(
     }
 }
 
+__device__ __forceinline__ float vq_block_dot_routed_fp8_codebook(
+    const uint8_t* codebook,
+    const __nv_bfloat16* input,
+    const int vector,
+    const float scale)
+{
+    float value = 0.0f;
+    #pragma unroll
+    for (int component = 0; component < 16; component += 4) {
+        if (component >= vector) break;
+        __nv_fp8x4_e4m3 packed_code;
+        packed_code.__x = __ldg(reinterpret_cast<const uint32_t*>(
+            codebook + component));
+        const float4 code = static_cast<float4>(packed_code);
+        const float2 input01 = __bfloat1622float2(
+            *reinterpret_cast<const __nv_bfloat162*>(input + component));
+        const float2 input23 = __bfloat1622float2(
+            *reinterpret_cast<const __nv_bfloat162*>(input + component + 2));
+        value = fmaf(code.x * scale, input01.x, value);
+        value = fmaf(code.y * scale, input01.y, value);
+        value = fmaf(code.z * scale, input23.x, value);
+        value = fmaf(code.w * scale, input23.y, value);
+    }
+    return value;
+}
+
+__device__ __forceinline__ float vq_gemv_routed_row_fp8_codebook(
+    const int64_t index_address,
+    const uint8_t* __restrict__ codebook,
+    const __nv_bfloat16* __restrict__ input,
+    const int blocks,
+    const int vector,
+    const int dtype_tag,
+    const long index_row,
+    const float scale)
+{
+    float value = 0.0f;
+    for (int block = threadIdx.x; block < blocks; block += 32) {
+        const int code = routed_index_value(
+            index_address, dtype_tag, index_row + block);
+        value += vq_block_dot_routed_fp8_codebook(
+            codebook + static_cast<long>(code) * vector,
+            input + block * vector,
+            vector,
+            scale);
+    }
+    return value;
+}
+
+__device__ __forceinline__ void vq_gemv_routed_pair_fp8_codebook(
+    const int64_t gate_index_address,
+    const int64_t up_index_address,
+    const uint8_t* __restrict__ gate_codebook,
+    const uint8_t* __restrict__ up_codebook,
+    const __nv_bfloat16* __restrict__ input,
+    const int blocks,
+    const int vector,
+    const int gate_dtype_tag,
+    const int up_dtype_tag,
+    const long index_row,
+    const float gate_scale,
+    const float up_scale,
+    float& gate_value,
+    float& up_value)
+{
+    gate_value = 0.0f;
+    up_value = 0.0f;
+    for (int block = threadIdx.x; block < blocks; block += 32) {
+        const long offset = index_row + block;
+        const int gate_code = routed_index_value(
+            gate_index_address, gate_dtype_tag, offset);
+        const int up_code = routed_index_value(
+            up_index_address, up_dtype_tag, offset);
+        const __nv_bfloat16* input_block = input + block * vector;
+        gate_value += vq_block_dot_routed_fp8_codebook(
+            gate_codebook + static_cast<long>(gate_code) * vector,
+            input_block,
+            vector,
+            gate_scale);
+        up_value += vq_block_dot_routed_fp8_codebook(
+            up_codebook + static_cast<long>(up_code) * vector,
+            input_block,
+            vector,
+            up_scale);
+    }
+}
+
 __device__ __forceinline__ void vq_gemv_routed_pair(
     const int64_t gate_index_address,
     const int64_t up_index_address,
@@ -4332,6 +5125,1234 @@ __device__ __forceinline__ float projection_gate_up_activation(
     return nonlinear * up;
 }
 
+// Low-memory native route: compact indices and compact E4M3 codebooks stay
+// resident. Gate/Up and Down convert only referenced codewords in registers;
+// there is no expanded expert-weight workspace between lookup and dot.
+template <int WARPS, int ROWS_PER_WARP>
+__global__ void vq_projection_gate_up_compact_fp8_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    const int64_t* __restrict__ route_ids,
+    const int64_t* __restrict__ metadata,
+    const float* __restrict__ scales,
+    __nv_bfloat16* __restrict__ activated,
+    const int top_k,
+    const int expert_count,
+    const int output_rows,
+    const int input_cols,
+    const int activation_kind,
+    const float beta,
+    const float linear_beta,
+    const float limit)
+{
+    const int position = blockIdx.y;
+    if (position >= top_k) return;
+    const int expert = static_cast<int>(route_ids[position]);
+    const int linear_thread = threadIdx.y * 32 + threadIdx.x;
+    constexpr int block_threads = 32 * WARPS;
+    extern __shared__ __nv_bfloat16 compact_fp8_gate_up_input[];
+    __shared__ RoutedBlockMetadata gate_meta;
+    __shared__ RoutedBlockMetadata up_meta;
+    __shared__ float gate_scale;
+    __shared__ float up_scale;
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        gate_meta.valid = 0;
+        up_meta.valid = 0;
+        if (expert >= 0 && expert < expert_count) {
+            gate_meta.index_address = metadata[expert];
+            gate_meta.codebook_address =
+                metadata[(long)expert_count + expert];
+            gate_meta.blocks = static_cast<int>(
+                metadata[(long)2 * expert_count + expert]);
+            gate_meta.vector = static_cast<int>(
+                metadata[(long)3 * expert_count + expert]);
+            gate_meta.dtype_tag = static_cast<int>(
+                metadata[(long)4 * expert_count + expert]);
+            up_meta.index_address =
+                metadata[(long)5 * expert_count + expert];
+            up_meta.codebook_address =
+                metadata[(long)6 * expert_count + expert];
+            up_meta.blocks = static_cast<int>(
+                metadata[(long)7 * expert_count + expert]);
+            up_meta.vector = static_cast<int>(
+                metadata[(long)8 * expert_count + expert]);
+            up_meta.dtype_tag = static_cast<int>(
+                metadata[(long)9 * expert_count + expert]);
+            gate_meta.valid = gate_meta.index_address != 0 &&
+                gate_meta.codebook_address != 0 && gate_meta.blocks > 0;
+            up_meta.valid = up_meta.index_address != 0 &&
+                up_meta.codebook_address != 0 && up_meta.blocks > 0;
+            gate_scale = scales[(long)expert * 3];
+            up_scale = scales[(long)expert * 3 + 1];
+        }
+    }
+    const auto* input4 = reinterpret_cast<const uint4*>(input);
+    auto* shared4 = reinterpret_cast<uint4*>(compact_fp8_gate_up_input);
+    for (int item = linear_thread; item < input_cols / 8;
+         item += block_threads)
+        shared4[item] = input4[item];
+    __syncthreads();
+    if (!gate_meta.valid || !up_meta.valid) return;
+
+    const auto* gate_codebook = reinterpret_cast<const uint8_t*>(
+        static_cast<uintptr_t>(gate_meta.codebook_address));
+    const auto* up_codebook = reinterpret_cast<const uint8_t*>(
+        static_cast<uintptr_t>(up_meta.codebook_address));
+    float gate_values[ROWS_PER_WARP] = {};
+    float up_values[ROWS_PER_WARP] = {};
+    #pragma unroll
+    for (int item = 0; item < ROWS_PER_WARP; ++item) {
+        const int row = blockIdx.x * (WARPS * ROWS_PER_WARP) +
+            threadIdx.y + item * WARPS;
+        if (row >= output_rows) continue;
+        if (gate_meta.blocks == up_meta.blocks &&
+            gate_meta.vector == up_meta.vector) {
+            vq_gemv_routed_pair_fp8_codebook(
+                gate_meta.index_address,
+                up_meta.index_address,
+                gate_codebook,
+                up_codebook,
+                compact_fp8_gate_up_input,
+                gate_meta.blocks,
+                gate_meta.vector,
+                gate_meta.dtype_tag,
+                up_meta.dtype_tag,
+                (long)row * gate_meta.blocks,
+                gate_scale,
+                up_scale,
+                gate_values[item],
+                up_values[item]);
+        } else {
+            gate_values[item] = vq_gemv_routed_row_fp8_codebook(
+                gate_meta.index_address,
+                gate_codebook,
+                compact_fp8_gate_up_input,
+                gate_meta.blocks,
+                gate_meta.vector,
+                gate_meta.dtype_tag,
+                (long)row * gate_meta.blocks,
+                gate_scale);
+            up_values[item] = vq_gemv_routed_row_fp8_codebook(
+                up_meta.index_address,
+                up_codebook,
+                compact_fp8_gate_up_input,
+                up_meta.blocks,
+                up_meta.vector,
+                up_meta.dtype_tag,
+                (long)row * up_meta.blocks,
+                up_scale);
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        #pragma unroll
+        for (int item = 0; item < ROWS_PER_WARP; ++item) {
+            gate_values[item] += __shfl_down_sync(
+                0xffffffffu, gate_values[item], offset);
+            up_values[item] += __shfl_down_sync(
+                0xffffffffu, up_values[item], offset);
+        }
+    }
+    if (threadIdx.x == 0) {
+        #pragma unroll
+        for (int item = 0; item < ROWS_PER_WARP; ++item) {
+            const int row = blockIdx.x * (WARPS * ROWS_PER_WARP) +
+                threadIdx.y + item * WARPS;
+            if (row < output_rows)
+                activated[(long)position * output_rows + row] =
+                    __float2bfloat16_rn(projection_gate_up_activation(
+                        gate_values[item], up_values[item], activation_kind,
+                        beta, linear_beta, limit));
+        }
+    }
+}
+
+template <int WARPS, int ROWS_PER_WARP>
+__global__ void vq_projection_down_compact_fp8_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    const int64_t* __restrict__ route_ids,
+    const int64_t* __restrict__ metadata,
+    const float* __restrict__ scales,
+    __nv_bfloat16* __restrict__ output,
+    const int top_k,
+    const int expert_count,
+    const int output_rows,
+    const int input_cols)
+{
+    const int position = blockIdx.y;
+    if (position >= top_k) return;
+    const int expert = static_cast<int>(route_ids[position]);
+    const int linear_thread = threadIdx.y * 32 + threadIdx.x;
+    constexpr int block_threads = 32 * WARPS;
+    extern __shared__ __nv_bfloat16 compact_fp8_down_input[];
+    __shared__ RoutedBlockMetadata down_meta;
+    __shared__ float down_scale;
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        down_meta.valid = 0;
+        if (expert >= 0 && expert < expert_count) {
+            down_meta.index_address =
+                metadata[(long)10 * expert_count + expert];
+            down_meta.codebook_address =
+                metadata[(long)11 * expert_count + expert];
+            down_meta.blocks = static_cast<int>(
+                metadata[(long)12 * expert_count + expert]);
+            down_meta.vector = static_cast<int>(
+                metadata[(long)13 * expert_count + expert]);
+            down_meta.dtype_tag = static_cast<int>(
+                metadata[(long)14 * expert_count + expert]);
+            down_meta.valid = down_meta.index_address != 0 &&
+                down_meta.codebook_address != 0 && down_meta.blocks > 0;
+            down_scale = scales[(long)expert * 3 + 2];
+        }
+    }
+    const __nv_bfloat16* input_row = input + (long)position * input_cols;
+    const auto* input4 = reinterpret_cast<const uint4*>(input_row);
+    auto* shared4 = reinterpret_cast<uint4*>(compact_fp8_down_input);
+    for (int item = linear_thread; item < input_cols / 8;
+         item += block_threads)
+        shared4[item] = input4[item];
+    __syncthreads();
+    if (!down_meta.valid) return;
+
+    const auto* codebook = reinterpret_cast<const uint8_t*>(
+        static_cast<uintptr_t>(down_meta.codebook_address));
+    float values[ROWS_PER_WARP] = {};
+    #pragma unroll
+    for (int item = 0; item < ROWS_PER_WARP; ++item) {
+        const int row = blockIdx.x * (WARPS * ROWS_PER_WARP) +
+            threadIdx.y + item * WARPS;
+        if (row < output_rows)
+            values[item] = vq_gemv_routed_row_fp8_codebook(
+                down_meta.index_address,
+                codebook,
+                compact_fp8_down_input,
+                down_meta.blocks,
+                down_meta.vector,
+                down_meta.dtype_tag,
+                (long)row * down_meta.blocks,
+                down_scale);
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        #pragma unroll
+        for (int item = 0; item < ROWS_PER_WARP; ++item)
+            values[item] += __shfl_down_sync(
+                0xffffffffu, values[item], offset);
+    }
+    if (threadIdx.x == 0) {
+        #pragma unroll
+        for (int item = 0; item < ROWS_PER_WARP; ++item) {
+            const int row = blockIdx.x * (WARPS * ROWS_PER_WARP) +
+                threadIdx.y + item * WARPS;
+            if (row < output_rows)
+                output[(long)position * output_rows + row] =
+                    __float2bfloat16_rn(values[item]);
+        }
+    }
+}
+
+template <int VECTOR, int DTYPE_TAG>
+__device__ __forceinline__ float vq_gemv_routed_row_q8_codebook_t(
+    const int64_t index_address,
+    const int8_t* __restrict__ codebook,
+    const int8_t* __restrict__ input,
+    const float* __restrict__ input_scales,
+    const int blocks,
+    const long index_count,
+    const long index_row,
+    const float codebook_scale)
+{
+    float value = 0.0f;
+    if constexpr (DTYPE_TAG == 4) {
+        for (int block = threadIdx.x * 4;
+            block < blocks;
+            block += 32 * 4) {
+            if (block + 3 < blocks) {
+                int codes[4];
+                routed_p10_index_quad(
+                    index_address, index_row + block, index_count, codes);
+                #pragma unroll
+                for (int item = 0; item < 4; ++item) {
+                    value += static_cast<float>(
+                        vq_block_dot_routed_q8_codebook_i32_t<VECTOR>(
+                            codebook + static_cast<long>(codes[item]) * VECTOR,
+                            input + (block + item) * VECTOR));
+                }
+            } else {
+                #pragma unroll
+                for (int item = 0; item < 4; ++item) {
+                    if (block + item >= blocks) break;
+                    const int code = routed_index_value_t<DTYPE_TAG>(
+                        index_address, index_row + block + item, index_count);
+                    value += static_cast<float>(
+                        vq_block_dot_routed_q8_codebook_i32_t<VECTOR>(
+                            codebook + static_cast<long>(code) * VECTOR,
+                            input + (block + item) * VECTOR));
+                }
+            }
+        }
+    } else {
+        for (int block = threadIdx.x; block < blocks; block += 32) {
+            const int code = routed_index_value_t<DTYPE_TAG>(
+                index_address, index_row + block, index_count);
+            value += static_cast<float>(
+                vq_block_dot_routed_q8_codebook_i32_t<VECTOR>(
+                    codebook + static_cast<long>(code) * VECTOR,
+                    input + block * VECTOR));
+        }
+    }
+    return value * (codebook_scale * input_scales[0]);
+}
+
+template <int VECTOR>
+__device__ __forceinline__ float vq_gemv_routed_row_q8_codebook_vector_t(
+    const int64_t index_address,
+    const int8_t* __restrict__ codebook,
+    const int8_t* __restrict__ input,
+    const float* __restrict__ input_scales,
+    const int blocks,
+    const int dtype_tag,
+    const long index_count,
+    const long index_row,
+    const float codebook_scale)
+{
+    if (dtype_tag == 0)
+        return vq_gemv_routed_row_q8_codebook_t<VECTOR, 0>(
+            index_address, codebook, input, input_scales, blocks,
+            index_count, index_row, codebook_scale);
+    if (dtype_tag == 1)
+        return vq_gemv_routed_row_q8_codebook_t<VECTOR, 1>(
+            index_address, codebook, input, input_scales, blocks,
+            index_count, index_row, codebook_scale);
+    if (dtype_tag == 2)
+        return vq_gemv_routed_row_q8_codebook_t<VECTOR, 2>(
+            index_address, codebook, input, input_scales, blocks,
+            index_count, index_row, codebook_scale);
+    if (dtype_tag == 3)
+        return vq_gemv_routed_row_q8_codebook_t<VECTOR, 3>(
+            index_address, codebook, input, input_scales, blocks,
+            index_count, index_row, codebook_scale);
+    if (dtype_tag == 4)
+        return vq_gemv_routed_row_q8_codebook_t<VECTOR, 4>(
+            index_address, codebook, input, input_scales, blocks,
+            index_count, index_row, codebook_scale);
+    if (dtype_tag == 5)
+        return vq_gemv_routed_row_q8_codebook_t<VECTOR, 5>(
+            index_address, codebook, input, input_scales, blocks,
+            index_count, index_row, codebook_scale);
+    if (dtype_tag == 6)
+        return vq_gemv_routed_row_q8_codebook_t<VECTOR, 6>(
+            index_address, codebook, input, input_scales, blocks,
+            index_count, index_row, codebook_scale);
+    if (dtype_tag == 7)
+        return vq_gemv_routed_row_q8_codebook_t<VECTOR, 7>(
+            index_address, codebook, input, input_scales, blocks,
+            index_count, index_row, codebook_scale);
+    return vq_gemv_routed_row_q8_codebook_t<VECTOR, 8>(
+        index_address, codebook, input, input_scales, blocks,
+        index_count, index_row, codebook_scale);
+}
+
+__device__ __forceinline__ float vq_gemv_routed_row_q8_codebook(
+    const int64_t index_address,
+    const int8_t* __restrict__ codebook,
+    const int8_t* __restrict__ input,
+    const float* __restrict__ input_scales,
+    const int blocks,
+    const int vector,
+    const int dtype_tag,
+    const long index_count,
+    const long index_row,
+    const float codebook_scale)
+{
+    if (vector == 16)
+        return vq_gemv_routed_row_q8_codebook_vector_t<16>(
+            index_address, codebook, input, input_scales, blocks,
+            dtype_tag, index_count, index_row, codebook_scale);
+    if (vector == 8)
+        return vq_gemv_routed_row_q8_codebook_vector_t<8>(
+            index_address, codebook, input, input_scales, blocks,
+            dtype_tag, index_count, index_row, codebook_scale);
+    return vq_gemv_routed_row_q8_codebook_vector_t<4>(
+        index_address, codebook, input, input_scales, blocks,
+        dtype_tag, index_count, index_row, codebook_scale);
+}
+
+template <int VECTOR, int DTYPE_TAG>
+__device__ __forceinline__ void vq_gemv_routed_pair_q8_codebook_same_t(
+    const int64_t gate_index_address,
+    const int64_t up_index_address,
+    const int8_t* __restrict__ gate_codebook,
+    const int8_t* __restrict__ up_codebook,
+    const int8_t* __restrict__ input,
+    const float* __restrict__ input_scales,
+    const int blocks,
+    const long index_count,
+    const long index_row,
+    const float gate_scale,
+    const float up_scale,
+    float& gate_value,
+    float& up_value)
+{
+    gate_value = 0.0f;
+    up_value = 0.0f;
+    if constexpr (DTYPE_TAG == 4) {
+        for (int block = threadIdx.x * 4;
+            block < blocks;
+            block += 32 * 4) {
+            if (block + 3 < blocks) {
+                int gate_codes[4];
+                int up_codes[4];
+                routed_p10_index_quad(
+                    gate_index_address, index_row + block,
+                    index_count, gate_codes);
+                routed_p10_index_quad(
+                    up_index_address, index_row + block,
+                    index_count, up_codes);
+                #pragma unroll
+                for (int item = 0; item < 4; ++item) {
+                    const int8_t* input_block =
+                        input + (block + item) * VECTOR;
+                    gate_value += static_cast<float>(
+                        vq_block_dot_routed_q8_codebook_i32_t<VECTOR>(
+                            gate_codebook +
+                                static_cast<long>(gate_codes[item]) * VECTOR,
+                            input_block));
+                    up_value += static_cast<float>(
+                        vq_block_dot_routed_q8_codebook_i32_t<VECTOR>(
+                            up_codebook +
+                                static_cast<long>(up_codes[item]) * VECTOR,
+                            input_block));
+                }
+            } else {
+                #pragma unroll
+                for (int item = 0; item < 4; ++item) {
+                    if (block + item >= blocks) break;
+                    const long offset = index_row + block + item;
+                    const int gate_code = routed_index_value_t<DTYPE_TAG>(
+                        gate_index_address, offset, index_count);
+                    const int up_code = routed_index_value_t<DTYPE_TAG>(
+                        up_index_address, offset, index_count);
+                    const int8_t* input_block =
+                        input + (block + item) * VECTOR;
+                    gate_value += static_cast<float>(
+                        vq_block_dot_routed_q8_codebook_i32_t<VECTOR>(
+                            gate_codebook +
+                                static_cast<long>(gate_code) * VECTOR,
+                            input_block));
+                    up_value += static_cast<float>(
+                        vq_block_dot_routed_q8_codebook_i32_t<VECTOR>(
+                            up_codebook +
+                                static_cast<long>(up_code) * VECTOR,
+                            input_block));
+                }
+            }
+        }
+    } else {
+        for (int block = threadIdx.x; block < blocks; block += 32) {
+            const long offset = index_row + block;
+            const int gate_code = routed_index_value_t<DTYPE_TAG>(
+                gate_index_address, offset, index_count);
+            const int up_code = routed_index_value_t<DTYPE_TAG>(
+                up_index_address, offset, index_count);
+            const int8_t* input_block = input + block * VECTOR;
+            gate_value += static_cast<float>(
+                vq_block_dot_routed_q8_codebook_i32_t<VECTOR>(
+                    gate_codebook + static_cast<long>(gate_code) * VECTOR,
+                    input_block));
+            up_value += static_cast<float>(
+                vq_block_dot_routed_q8_codebook_i32_t<VECTOR>(
+                    up_codebook + static_cast<long>(up_code) * VECTOR,
+                    input_block));
+        }
+    }
+    gate_value *= gate_scale * input_scales[0];
+    up_value *= up_scale * input_scales[0];
+}
+
+template <int VECTOR>
+__device__ __forceinline__ void vq_gemv_routed_pair_q8_codebook_t(
+    const int64_t gate_index_address,
+    const int64_t up_index_address,
+    const int8_t* __restrict__ gate_codebook,
+    const int8_t* __restrict__ up_codebook,
+    const int8_t* __restrict__ input,
+    const float* __restrict__ input_scales,
+    const int blocks,
+    const int gate_dtype_tag,
+    const int up_dtype_tag,
+    const long index_count,
+    const long index_row,
+    const float gate_scale,
+    const float up_scale,
+    float& gate_value,
+    float& up_value)
+{
+    if (gate_dtype_tag == up_dtype_tag) {
+        #define CCCP_Q8_PAIR_SAME(TAG) \
+            vq_gemv_routed_pair_q8_codebook_same_t<VECTOR, TAG>( \
+                gate_index_address, up_index_address, gate_codebook, \
+                up_codebook, input, input_scales, blocks, index_count, \
+                index_row, \
+                gate_scale, up_scale, gate_value, up_value)
+        if (gate_dtype_tag == 0) { CCCP_Q8_PAIR_SAME(0); return; }
+        if (gate_dtype_tag == 1) { CCCP_Q8_PAIR_SAME(1); return; }
+        if (gate_dtype_tag == 2) { CCCP_Q8_PAIR_SAME(2); return; }
+        if (gate_dtype_tag == 3) { CCCP_Q8_PAIR_SAME(3); return; }
+        if (gate_dtype_tag == 4) { CCCP_Q8_PAIR_SAME(4); return; }
+        if (gate_dtype_tag == 5) { CCCP_Q8_PAIR_SAME(5); return; }
+        if (gate_dtype_tag == 6) { CCCP_Q8_PAIR_SAME(6); return; }
+        if (gate_dtype_tag == 7) { CCCP_Q8_PAIR_SAME(7); return; }
+        if (gate_dtype_tag == 8) { CCCP_Q8_PAIR_SAME(8); return; }
+        #undef CCCP_Q8_PAIR_SAME
+    }
+    gate_value = 0.0f;
+    up_value = 0.0f;
+    for (int block = threadIdx.x; block < blocks; block += 32) {
+        const long offset = index_row + block;
+        const int gate_code = routed_index_value(
+            gate_index_address, gate_dtype_tag, offset);
+        const int up_code = routed_index_value(
+            up_index_address, up_dtype_tag, offset);
+        const int8_t* input_block = input + block * VECTOR;
+        gate_value += static_cast<float>(
+            vq_block_dot_routed_q8_codebook_i32_t<VECTOR>(
+                gate_codebook + static_cast<long>(gate_code) * VECTOR,
+                input_block));
+        up_value += static_cast<float>(
+            vq_block_dot_routed_q8_codebook_i32_t<VECTOR>(
+                up_codebook + static_cast<long>(up_code) * VECTOR,
+                input_block));
+    }
+    gate_value *= gate_scale * input_scales[0];
+    up_value *= up_scale * input_scales[0];
+}
+
+__device__ __forceinline__ void vq_gemv_routed_pair_q8_codebook(
+    const int64_t gate_index_address,
+    const int64_t up_index_address,
+    const int8_t* __restrict__ gate_codebook,
+    const int8_t* __restrict__ up_codebook,
+    const int8_t* __restrict__ input,
+    const float* __restrict__ input_scales,
+    const int blocks,
+    const int vector,
+    const int gate_dtype_tag,
+    const int up_dtype_tag,
+    const long index_count,
+    const long index_row,
+    const float gate_scale,
+    const float up_scale,
+    float& gate_value,
+    float& up_value)
+{
+    if (vector == 16) {
+        vq_gemv_routed_pair_q8_codebook_t<16>(
+            gate_index_address, up_index_address, gate_codebook, up_codebook,
+            input, input_scales, blocks, gate_dtype_tag, up_dtype_tag,
+            index_count, index_row, gate_scale, up_scale, gate_value,
+            up_value);
+        return;
+    }
+    if (vector == 8) {
+        vq_gemv_routed_pair_q8_codebook_t<8>(
+            gate_index_address, up_index_address, gate_codebook, up_codebook,
+            input, input_scales, blocks, gate_dtype_tag, up_dtype_tag,
+            index_count, index_row, gate_scale, up_scale, gate_value,
+            up_value);
+        return;
+    }
+    vq_gemv_routed_pair_q8_codebook_t<4>(
+        gate_index_address, up_index_address, gate_codebook, up_codebook,
+        input, input_scales, blocks, gate_dtype_tag, up_dtype_tag,
+        index_count, index_row, gate_scale, up_scale, gate_value, up_value);
+}
+
+constexpr int CCCP_Q8_P10_CODES = 1 << 10;
+constexpr int CCCP_Q8_P10_SHARED_PERMUTATION = 5;
+constexpr int CCCP_Q8_P11_CODES = 1 << 11;
+constexpr int CCCP_Q8_P11_SHARED_PERMUTATION = 5;
+constexpr int CCCP_Q8_P12_CODES = 1 << 12;
+constexpr int CCCP_Q8_P12_SHARED_PERMUTATION = 5;
+constexpr int CCCP_Q8_P13_CODES = 1 << 13;
+constexpr int CCCP_Q8_P13_SHARED_PERMUTATION = 5;
+
+__device__ __forceinline__ int cccp_q8_p10_shared_slot(const int code)
+{
+    return (code * CCCP_Q8_P10_SHARED_PERMUTATION) &
+        (CCCP_Q8_P10_CODES - 1);
+}
+
+__device__ __forceinline__ int cccp_q8_p11_shared_slot(const int code)
+{
+    return (code * CCCP_Q8_P11_SHARED_PERMUTATION) &
+        (CCCP_Q8_P11_CODES - 1);
+}
+
+__device__ __forceinline__ int cccp_q8_p12_shared_slot(const int code)
+{
+    return (code * CCCP_Q8_P12_SHARED_PERMUTATION) &
+        (CCCP_Q8_P12_CODES - 1);
+}
+
+__device__ __forceinline__ int cccp_q8_p13_shared_slot(const int code)
+{
+    return (code * CCCP_Q8_P13_SHARED_PERMUTATION) &
+        (CCCP_Q8_P13_CODES - 1);
+}
+
+__device__ __forceinline__ float vq_gemv_routed_row_q8_p11_d4_shared(
+    const int64_t index_address,
+    const int* __restrict__ codebook,
+    const int8_t* __restrict__ input,
+    const float input_scale,
+    const int blocks,
+    const long index_count,
+    const long index_row,
+    const float codebook_scale)
+{
+    float value = 0.0f;
+    for (int block = threadIdx.x; block < blocks; block += 32) {
+        const int code = routed_index_value_t<6>(
+            index_address, index_row + block, index_count);
+        const int input_value = *reinterpret_cast<const int*>(input + block * 4);
+        value += static_cast<float>(__dp4a(
+            codebook[cccp_q8_p11_shared_slot(code)],
+            input_value,
+            0));
+    }
+    return value * (codebook_scale * input_scale);
+}
+
+// P10/d4 Gate and Up each use a 4 KiB Q8 codebook.  A decode CTA reuses
+// those random lookup rows across sixteen output rows, so stage both tables
+// once and permute their bank index by five.  The compact VQ indices remain
+// in HBM and no expanded expert-weight image is created.
+__device__ __forceinline__ void vq_gemv_routed_pair_q8_p10_d4_shared(
+    const int64_t gate_index_address,
+    const int64_t up_index_address,
+    const int* __restrict__ gate_codebook,
+    const int* __restrict__ up_codebook,
+    const int8_t* __restrict__ input,
+    const float input_scale,
+    const int blocks,
+    const long index_count,
+    const long index_row,
+    const float gate_scale,
+    const float up_scale,
+    float& gate_value,
+    float& up_value)
+{
+    gate_value = 0.0f;
+    up_value = 0.0f;
+    for (int block = threadIdx.x * 4;
+         block < blocks;
+         block += 32 * 4) {
+        int gate_codes[4];
+        int up_codes[4];
+        routed_p10_index_quad(
+            gate_index_address, index_row + block,
+            index_count, gate_codes);
+        routed_p10_index_quad(
+            up_index_address, index_row + block,
+            index_count, up_codes);
+        #pragma unroll
+        for (int item = 0; item < 4; ++item) {
+            if (block + item >= blocks) break;
+            const int input_value = *reinterpret_cast<const int*>(
+                input + (block + item) * 4);
+            gate_value += static_cast<float>(__dp4a(
+                gate_codebook[cccp_q8_p10_shared_slot(gate_codes[item])],
+                input_value,
+                0));
+            up_value += static_cast<float>(__dp4a(
+                up_codebook[cccp_q8_p10_shared_slot(up_codes[item])],
+                input_value,
+                0));
+        }
+    }
+    gate_value *= gate_scale * input_scale;
+    up_value *= up_scale * input_scale;
+}
+
+// P11/d4 has twice as many entries as P10 but still fits both Gate and Up Q8
+// codebooks in 16 KiB of shared memory.  Keep the compact 11-bit indices in
+// HBM and reuse the staged codebook across every output row in this CTA.
+__device__ __forceinline__ void vq_gemv_routed_pair_q8_p11_d4_shared(
+    const int64_t gate_index_address,
+    const int64_t up_index_address,
+    const int* __restrict__ gate_codebook,
+    const int* __restrict__ up_codebook,
+    const int8_t* __restrict__ input,
+    const float input_scale,
+    const int blocks,
+    const long index_count,
+    const long index_row,
+    const float gate_scale,
+    const float up_scale,
+    float& gate_value,
+    float& up_value)
+{
+    gate_value = 0.0f;
+    up_value = 0.0f;
+    for (int block = threadIdx.x; block < blocks; block += 32) {
+        const long offset = index_row + block;
+        const int gate_code = routed_index_value_t<6>(
+            gate_index_address, offset, index_count);
+        const int up_code = routed_index_value_t<6>(
+            up_index_address, offset, index_count);
+        const int input_value = *reinterpret_cast<const int*>(input + block * 4);
+        gate_value += static_cast<float>(__dp4a(
+            gate_codebook[cccp_q8_p11_shared_slot(gate_code)],
+            input_value,
+            0));
+        up_value += static_cast<float>(__dp4a(
+            up_codebook[cccp_q8_p11_shared_slot(up_code)],
+            input_value,
+            0));
+    }
+    gate_value *= gate_scale * input_scale;
+    up_value *= up_scale * input_scale;
+}
+
+// A P12/d4 Down codebook is 16 KiB.  Stage it once per CTA and reuse it for
+// all output rows while leaving the packed indices in HBM.
+__device__ __forceinline__ float vq_gemv_routed_row_q8_p12_d4_shared(
+    const int64_t index_address,
+    const int* __restrict__ codebook,
+    const int8_t* __restrict__ input,
+    const float input_scale,
+    const int blocks,
+    const long index_count,
+    const long index_row,
+    const float codebook_scale)
+{
+    float value = 0.0f;
+    for (int block = threadIdx.x; block < blocks; block += 32) {
+        const int code = routed_index_value_t<2>(
+            index_address, index_row + block, index_count);
+        const int input_value = *reinterpret_cast<const int*>(input + block * 4);
+        value += static_cast<float>(__dp4a(
+            codebook[cccp_q8_p12_shared_slot(code)],
+            input_value,
+            0));
+    }
+    return value * (codebook_scale * input_scale);
+}
+
+// P13/d4 is the most common high-precision Up layout.  Its 32 KiB Q8
+// codebook is staged alone; Gate keeps its original compact HBM lookup so
+// mixed-precision pairs do not require a second large shared allocation.
+__device__ __forceinline__ float vq_gemv_routed_row_q8_p13_d4_shared(
+    const int64_t index_address,
+    const int* __restrict__ codebook,
+    const int8_t* __restrict__ input,
+    const float input_scale,
+    const int blocks,
+    const long index_count,
+    const long index_row,
+    const float codebook_scale)
+{
+    float value = 0.0f;
+    for (int block = threadIdx.x; block < blocks; block += 32) {
+        const int code = routed_index_value_t<7>(
+            index_address, index_row + block, index_count);
+        const int input_value = *reinterpret_cast<const int*>(input + block * 4);
+        value += static_cast<float>(__dp4a(
+            codebook[cccp_q8_p13_shared_slot(code)],
+            input_value,
+            0));
+    }
+    return value * (codebook_scale * input_scale);
+}
+
+// Quantize one activation row with one tensor scale.  The old compact path
+// used one scale per tiny VQ block (d4/d8/d16), forcing every output-row warp
+// to load and multiply hundreds of FP32 scales.  A route-global scale keeps
+// the DP4A accumulation integer until the final multiply.  Gate and Up share
+// the same input row, so their quantized activation is written only once.
+__global__ void compact_q8_quantize_rows_global_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    uint8_t* __restrict__ quant_workspace,
+    const int rows,
+    const int input_cols,
+    const int quantized_span,
+    const int workspace_stride)
+{
+    const int row = static_cast<int>(blockIdx.x);
+    if (row >= rows) return;
+    __shared__ float warp_maxima[8];
+    __shared__ float row_scale;
+    float absolute_max = 0.0f;
+    const __nv_bfloat16* source = input + (long)row * input_cols;
+    for (int column = threadIdx.x;
+         column < input_cols;
+         column += blockDim.x)
+        absolute_max = fmaxf(
+            absolute_max,
+            fabsf(__bfloat162float(source[column])));
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        absolute_max = fmaxf(
+            absolute_max,
+            __shfl_down_sync(0xffffffffu, absolute_max, offset));
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0)
+        warp_maxima[warp] = absolute_max;
+    __syncthreads();
+    if (warp == 0) {
+        float block_max = threadIdx.x < 8
+            ? warp_maxima[lane]
+            : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            block_max = fmaxf(
+                block_max,
+                __shfl_down_sync(0xffffffffu, block_max, offset));
+        if (lane == 0)
+            row_scale = fmaxf(block_max, 1.0e-12f) * (1.0f / 127.0f);
+    }
+    uint8_t* route_workspace = quant_workspace +
+        (long)row * workspace_stride;
+    auto* quantized_input = reinterpret_cast<int8_t*>(route_workspace);
+    auto* input_scales = reinterpret_cast<float*>(
+        route_workspace + quantized_span);
+    __syncthreads();
+    if (threadIdx.x == 0)
+        input_scales[0] = row_scale;
+    const float inverse_scale = 1.0f / row_scale;
+    for (int column = threadIdx.x;
+         column < input_cols;
+         column += blockDim.x) {
+        const float value = __bfloat162float(source[column]) * inverse_scale;
+        quantized_input[column] = static_cast<int8_t>(__float2int_rn(
+            fminf(fmaxf(value, -127.0f), 127.0f)));
+    }
+}
+
+template <int WARPS, int ROWS_PER_WARP>
+__launch_bounds__(32 * WARPS, 3)
+__global__ void vq_projection_gate_up_compact_q8_kernel(
+    const uint8_t* __restrict__ quant_workspace,
+    const int64_t* __restrict__ route_ids,
+    const int64_t* __restrict__ metadata,
+    const float* __restrict__ scales,
+    __nv_bfloat16* __restrict__ activated,
+    const int top_k,
+    const int expert_count,
+    const int output_rows,
+    const int input_cols,
+    const int activation_kind,
+    const float beta,
+    const float linear_beta,
+    const float limit)
+{
+    const int position = blockIdx.y;
+    if (position >= top_k) return;
+    const int expert = static_cast<int>(route_ids[position]);
+    const int linear_thread = threadIdx.y * 32 + threadIdx.x;
+    const int quantized_span = (input_cols + 15) & ~15;
+    const uint8_t* route_workspace = quant_workspace;
+    const auto* quantized_input = reinterpret_cast<const int8_t*>(
+        route_workspace);
+    const auto* input_scales = reinterpret_cast<const float*>(
+        route_workspace + quantized_span);
+    __shared__ RoutedBlockMetadata gate_meta;
+    __shared__ RoutedBlockMetadata up_meta;
+    __shared__ float gate_scale;
+    __shared__ float up_scale;
+    __shared__ int shared_q8_d4_tag;
+    __shared__ int shared_p13_gate_tag;
+    __shared__ int shared_q8_words[CCCP_Q8_P13_CODES + CCCP_Q8_P11_CODES];
+    if (linear_thread == 0) {
+        gate_meta.valid = 0;
+        up_meta.valid = 0;
+        shared_q8_d4_tag = -1;
+        shared_p13_gate_tag = -1;
+        if (expert >= 0 && expert < expert_count) {
+            gate_meta.index_address = metadata[expert];
+            gate_meta.codebook_address =
+                metadata[(long)expert_count + expert];
+            gate_meta.blocks = static_cast<int>(
+                metadata[(long)2 * expert_count + expert]);
+            gate_meta.vector = static_cast<int>(
+                metadata[(long)3 * expert_count + expert]);
+            gate_meta.dtype_tag = static_cast<int>(
+                metadata[(long)4 * expert_count + expert]);
+            up_meta.index_address =
+                metadata[(long)5 * expert_count + expert];
+            up_meta.codebook_address =
+                metadata[(long)6 * expert_count + expert];
+            up_meta.blocks = static_cast<int>(
+                metadata[(long)7 * expert_count + expert]);
+            up_meta.vector = static_cast<int>(
+                metadata[(long)8 * expert_count + expert]);
+            up_meta.dtype_tag = static_cast<int>(
+                metadata[(long)9 * expert_count + expert]);
+            gate_meta.valid = gate_meta.index_address != 0 &&
+                gate_meta.codebook_address != 0 && gate_meta.blocks > 0;
+            up_meta.valid = up_meta.index_address != 0 &&
+                up_meta.codebook_address != 0 && up_meta.blocks > 0;
+            gate_scale = scales[(long)expert * 3];
+            up_scale = scales[(long)expert * 3 + 1];
+            const bool shared_q8_d4 =
+                gate_meta.valid && up_meta.valid &&
+                gate_meta.dtype_tag == up_meta.dtype_tag &&
+                (gate_meta.dtype_tag == 4 || gate_meta.dtype_tag == 6) &&
+                gate_meta.vector == 4 && up_meta.vector == 4 &&
+                gate_meta.blocks == input_cols / 4 &&
+                up_meta.blocks == input_cols / 4;
+            if (shared_q8_d4)
+                shared_q8_d4_tag = gate_meta.dtype_tag;
+            else if (
+                gate_meta.valid && up_meta.valid &&
+                up_meta.dtype_tag == 7 && up_meta.vector == 4 &&
+                up_meta.blocks == input_cols / 4) {
+                shared_q8_d4_tag = 7;
+                if (
+                    (gate_meta.dtype_tag == 2 || gate_meta.dtype_tag == 6) &&
+                    gate_meta.vector == 4 &&
+                    gate_meta.blocks == input_cols / 4)
+                    shared_p13_gate_tag = gate_meta.dtype_tag;
+            }
+        }
+    }
+    __syncthreads();
+    if (!gate_meta.valid || !up_meta.valid) return;
+    const bool shared_quantized_layout =
+        up_meta.blocks == gate_meta.blocks &&
+        up_meta.vector == gate_meta.vector;
+
+    const auto* gate_codebook = reinterpret_cast<const int8_t*>(
+        static_cast<uintptr_t>(gate_meta.codebook_address));
+    const auto* up_codebook = reinterpret_cast<const int8_t*>(
+        static_cast<uintptr_t>(up_meta.codebook_address));
+    int* shared_gate_q8_d4 = shared_q8_words;
+    int* shared_up_q8_d4 = shared_q8_words;
+    if (shared_q8_d4_tag == 4 || shared_q8_d4_tag == 6) {
+        const auto* gate_words = reinterpret_cast<const int*>(gate_codebook);
+        const auto* up_words = reinterpret_cast<const int*>(up_codebook);
+        const int code_count = shared_q8_d4_tag == 4 ?
+            CCCP_Q8_P10_CODES : CCCP_Q8_P11_CODES;
+        shared_up_q8_d4 = shared_q8_words + code_count;
+        for (int code = linear_thread;
+             code < code_count;
+             code += 32 * WARPS) {
+            const int slot = shared_q8_d4_tag == 4 ?
+                cccp_q8_p10_shared_slot(code) :
+                cccp_q8_p11_shared_slot(code);
+            shared_gate_q8_d4[slot] = __ldg(gate_words + code);
+            shared_up_q8_d4[slot] = __ldg(up_words + code);
+        }
+        __syncthreads();
+    } else if (shared_q8_d4_tag == 7) {
+        shared_up_q8_d4 = shared_q8_words;
+        if (shared_p13_gate_tag == 2) {
+            shared_gate_q8_d4 = shared_q8_words;
+            const auto* gate_words = reinterpret_cast<const int*>(gate_codebook);
+            for (int code = linear_thread;
+                 code < CCCP_Q8_P12_CODES;
+                 code += 32 * WARPS) {
+                const int slot = cccp_q8_p12_shared_slot(code);
+                shared_gate_q8_d4[slot] = __ldg(gate_words + code);
+            }
+        } else {
+            const auto* up_words = reinterpret_cast<const int*>(up_codebook);
+            shared_gate_q8_d4 = shared_q8_words + CCCP_Q8_P13_CODES;
+            for (int code = linear_thread;
+                 code < CCCP_Q8_P13_CODES;
+                 code += 32 * WARPS) {
+                const int slot = cccp_q8_p13_shared_slot(code);
+                shared_up_q8_d4[slot] = __ldg(up_words + code);
+            }
+            if (shared_p13_gate_tag == 6) {
+                const auto* gate_words = reinterpret_cast<const int*>(gate_codebook);
+                for (int code = linear_thread;
+                     code < CCCP_Q8_P11_CODES;
+                     code += 32 * WARPS) {
+                    const int slot = cccp_q8_p11_shared_slot(code);
+                    shared_gate_q8_d4[slot] = __ldg(gate_words + code);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    float gate_values[ROWS_PER_WARP] = {};
+    float up_values[ROWS_PER_WARP] = {};
+    if (shared_q8_d4_tag == 7 && shared_p13_gate_tag == 2) {
+        // Two phases stage P12 Gate before replacing the buffer with P13 Up.
+        #pragma unroll
+        for (int item = 0; item < ROWS_PER_WARP; ++item) {
+            const int row = blockIdx.x * (WARPS * ROWS_PER_WARP) +
+                threadIdx.y + item * WARPS;
+            if (row < output_rows)
+                gate_values[item] = vq_gemv_routed_row_q8_p12_d4_shared(
+                    gate_meta.index_address,
+                    shared_gate_q8_d4,
+                    quantized_input,
+                    input_scales[0],
+                    gate_meta.blocks,
+                    static_cast<long>(output_rows) * gate_meta.blocks,
+                    (long)row * gate_meta.blocks,
+                    gate_scale);
+        }
+        __syncthreads();
+        const auto* up_words = reinterpret_cast<const int*>(up_codebook);
+        shared_up_q8_d4 = shared_q8_words;
+        for (int code = linear_thread;
+             code < CCCP_Q8_P13_CODES;
+             code += 32 * WARPS) {
+            const int slot = cccp_q8_p13_shared_slot(code);
+            shared_up_q8_d4[slot] = __ldg(up_words + code);
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int item = 0; item < ROWS_PER_WARP; ++item) {
+        const int row = blockIdx.x * (WARPS * ROWS_PER_WARP) +
+            threadIdx.y + item * WARPS;
+        if (row >= output_rows) continue;
+        if (shared_q8_d4_tag == 4) {
+            vq_gemv_routed_pair_q8_p10_d4_shared(
+                gate_meta.index_address,
+                up_meta.index_address,
+                shared_gate_q8_d4,
+                shared_up_q8_d4,
+                quantized_input,
+                input_scales[0],
+                gate_meta.blocks,
+                static_cast<long>(output_rows) * gate_meta.blocks,
+                (long)row * gate_meta.blocks,
+                gate_scale,
+                up_scale,
+                gate_values[item],
+                up_values[item]);
+        } else if (shared_q8_d4_tag == 6) {
+            vq_gemv_routed_pair_q8_p11_d4_shared(
+                gate_meta.index_address,
+                up_meta.index_address,
+                shared_gate_q8_d4,
+                shared_up_q8_d4,
+                quantized_input,
+                input_scales[0],
+                gate_meta.blocks,
+                static_cast<long>(output_rows) * gate_meta.blocks,
+                (long)row * gate_meta.blocks,
+                gate_scale,
+                up_scale,
+                gate_values[item],
+                up_values[item]);
+        } else if (shared_q8_d4_tag == 7) {
+            if (shared_p13_gate_tag == 2) {
+                // Gate was completed before P13 Up replaced the shared buffer.
+            } else if (shared_p13_gate_tag == 6)
+                gate_values[item] = vq_gemv_routed_row_q8_p11_d4_shared(
+                    gate_meta.index_address,
+                    shared_gate_q8_d4,
+                    quantized_input,
+                    input_scales[0],
+                    gate_meta.blocks,
+                    static_cast<long>(output_rows) * gate_meta.blocks,
+                    (long)row * gate_meta.blocks,
+                    gate_scale);
+            else
+                gate_values[item] = vq_gemv_routed_row_q8_codebook(
+                    gate_meta.index_address,
+                    gate_codebook,
+                    quantized_input,
+                    input_scales,
+                    gate_meta.blocks,
+                    gate_meta.vector,
+                    gate_meta.dtype_tag,
+                    static_cast<long>(output_rows) * gate_meta.blocks,
+                    (long)row * gate_meta.blocks,
+                    gate_scale);
+            up_values[item] = vq_gemv_routed_row_q8_p13_d4_shared(
+                up_meta.index_address,
+                shared_up_q8_d4,
+                quantized_input,
+                input_scales[0],
+                up_meta.blocks,
+                static_cast<long>(output_rows) * up_meta.blocks,
+                (long)row * up_meta.blocks,
+                up_scale);
+        } else if (shared_quantized_layout) {
+            vq_gemv_routed_pair_q8_codebook(
+                gate_meta.index_address,
+                up_meta.index_address,
+                gate_codebook,
+                up_codebook,
+                quantized_input,
+                input_scales,
+                gate_meta.blocks,
+                gate_meta.vector,
+                gate_meta.dtype_tag,
+                up_meta.dtype_tag,
+                static_cast<long>(output_rows) * gate_meta.blocks,
+                (long)row * gate_meta.blocks,
+                gate_scale,
+                up_scale,
+                gate_values[item],
+                up_values[item]);
+        } else {
+            gate_values[item] = vq_gemv_routed_row_q8_codebook(
+                gate_meta.index_address,
+                gate_codebook,
+                quantized_input,
+                input_scales,
+                gate_meta.blocks,
+                gate_meta.vector,
+                gate_meta.dtype_tag,
+                static_cast<long>(output_rows) * gate_meta.blocks,
+                (long)row * gate_meta.blocks,
+                gate_scale);
+            up_values[item] = vq_gemv_routed_row_q8_codebook(
+                up_meta.index_address,
+                up_codebook,
+                quantized_input,
+                input_scales,
+                up_meta.blocks,
+                up_meta.vector,
+                up_meta.dtype_tag,
+                static_cast<long>(output_rows) * up_meta.blocks,
+                (long)row * up_meta.blocks,
+                up_scale);
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        #pragma unroll
+        for (int item = 0; item < ROWS_PER_WARP; ++item) {
+            gate_values[item] += __shfl_down_sync(
+                0xffffffffu, gate_values[item], offset);
+            up_values[item] += __shfl_down_sync(
+                0xffffffffu, up_values[item], offset);
+        }
+    }
+    if (threadIdx.x == 0) {
+        #pragma unroll
+        for (int item = 0; item < ROWS_PER_WARP; ++item) {
+            const int row = blockIdx.x * (WARPS * ROWS_PER_WARP) +
+                threadIdx.y + item * WARPS;
+            if (row < output_rows)
+                activated[(long)position * output_rows + row] =
+                    __float2bfloat16_rn(projection_gate_up_activation(
+                        gate_values[item], up_values[item], activation_kind,
+                        beta, linear_beta, limit));
+        }
+    }
+}
+
+template <int WARPS, int ROWS_PER_WARP>
+__global__ void vq_projection_down_compact_q8_kernel(
+    const uint8_t* __restrict__ quant_workspace,
+    const int64_t* __restrict__ route_ids,
+    const int64_t* __restrict__ metadata,
+    const float* __restrict__ scales,
+    __nv_bfloat16* __restrict__ output,
+    const int top_k,
+    const int expert_count,
+    const int output_rows,
+    const int input_cols)
+{
+    const int position = blockIdx.y;
+    if (position >= top_k) return;
+    const int expert = static_cast<int>(route_ids[position]);
+    const int linear_thread = threadIdx.y * 32 + threadIdx.x;
+    const int quantized_span = (input_cols + 15) & ~15;
+    const uint8_t* route_workspace = quant_workspace +
+        (long)position * 2 * quantized_span;
+    const auto* quantized_input = reinterpret_cast<const int8_t*>(
+        route_workspace);
+    const auto* input_scales = reinterpret_cast<const float*>(
+        route_workspace + quantized_span);
+    __shared__ RoutedBlockMetadata down_meta;
+    __shared__ float down_scale;
+    __shared__ int shared_p12_d4;
+    __shared__ int shared_down_q8_d4[CCCP_Q8_P12_CODES];
+    if (linear_thread == 0) {
+        down_meta.valid = 0;
+        shared_p12_d4 = 0;
+        if (expert >= 0 && expert < expert_count) {
+            down_meta.index_address =
+                metadata[(long)10 * expert_count + expert];
+            down_meta.codebook_address =
+                metadata[(long)11 * expert_count + expert];
+            down_meta.blocks = static_cast<int>(
+                metadata[(long)12 * expert_count + expert]);
+            down_meta.vector = static_cast<int>(
+                metadata[(long)13 * expert_count + expert]);
+            down_meta.dtype_tag = static_cast<int>(
+                metadata[(long)14 * expert_count + expert]);
+            down_meta.valid = down_meta.index_address != 0 &&
+                down_meta.codebook_address != 0 && down_meta.blocks > 0;
+            down_scale = scales[(long)expert * 3 + 2];
+            shared_p12_d4 = down_meta.valid &&
+                down_meta.dtype_tag == 2 && down_meta.vector == 4 &&
+                down_meta.blocks == input_cols / 4;
+        }
+    }
+    __syncthreads();
+    if (!down_meta.valid) return;
+    const auto* codebook = reinterpret_cast<const int8_t*>(
+        static_cast<uintptr_t>(down_meta.codebook_address));
+    if (shared_p12_d4) {
+        const auto* codebook_words = reinterpret_cast<const int*>(codebook);
+        for (int code = linear_thread;
+             code < CCCP_Q8_P12_CODES;
+             code += 32 * WARPS) {
+            const int slot = cccp_q8_p12_shared_slot(code);
+            shared_down_q8_d4[slot] = __ldg(codebook_words + code);
+        }
+        __syncthreads();
+    }
+    float values[ROWS_PER_WARP] = {};
+    #pragma unroll
+    for (int item = 0; item < ROWS_PER_WARP; ++item) {
+        const int row = blockIdx.x * (WARPS * ROWS_PER_WARP) +
+            threadIdx.y + item * WARPS;
+        if (row < output_rows && shared_p12_d4)
+            values[item] = vq_gemv_routed_row_q8_p12_d4_shared(
+                down_meta.index_address,
+                shared_down_q8_d4,
+                quantized_input,
+                input_scales[0],
+                down_meta.blocks,
+                static_cast<long>(output_rows) * down_meta.blocks,
+                (long)row * down_meta.blocks,
+                down_scale);
+        else if (row < output_rows)
+            values[item] = vq_gemv_routed_row_q8_codebook(
+                down_meta.index_address,
+                codebook,
+                quantized_input,
+                input_scales,
+                down_meta.blocks,
+                down_meta.vector,
+                down_meta.dtype_tag,
+                static_cast<long>(output_rows) * down_meta.blocks,
+                (long)row * down_meta.blocks,
+                down_scale);
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        #pragma unroll
+        for (int item = 0; item < ROWS_PER_WARP; ++item)
+            values[item] += __shfl_down_sync(
+                0xffffffffu, values[item], offset);
+    }
+    if (threadIdx.x == 0) {
+        #pragma unroll
+        for (int item = 0; item < ROWS_PER_WARP; ++item) {
+            const int row = blockIdx.x * (WARPS * ROWS_PER_WARP) +
+                threadIdx.y + item * WARPS;
+            if (row < output_rows)
+                output[(long)position * output_rows + row] =
+                    __float2bfloat16_rn(values[item]);
+        }
+    }
+}
+
 // Common three-projection decode path. Gate and Up share the same input, so
 // compute both in one CTA and apply the registered gated activation before
 // writing the BF16 workspace.
@@ -4694,7 +6715,11 @@ inline void launch_vq_projection_gate_up_situ_impl(
                 : 0
         )
     ) * sizeof(__nv_bfloat16);
-    if (shared_bytes > 48 * 1024) {
+    // p10 requests exactly 48 KiB of dynamic shared memory for a 4096-wide
+    // projection, in addition to the kernel's static metadata.  It therefore
+    // still has to opt in to the device's larger shared-memory limit even
+    // though the dynamic portion alone is not greater than 48 KiB.
+    if (stage_p10) {
         const auto status = cccp_gpu_func_set_attribute(
             vq_projection_gate_up_situ_kernel<
                 WARPS, ROWS_PER_WARP, TILE_VIEW>,
@@ -4754,24 +6779,53 @@ inline void launch_vq_projection_gate_up_situ(
     const float limit,
     const bool stage_p10,
     const int metadata_rows,
+    const int p10_rows_per_warp,
     const int generic_rows_per_warp,
     cudaStream_t stream)
 {
     // Large heterogeneous codebooks are latency-bound random gathers.  One
     // row per warp exposes four times as many independent CTAs on H20.  The
     // p10 specialization keeps four rows per warp because staging its small
-    // paired codebooks is the dominant reusable work.
+    // paired codebooks is the dominant reusable work.  A public tuner lets
+    // one CTA reuse that staged pair for more rows without materialising an
+    // expanded weight tensor.
     if (stage_p10) {
-        if (metadata_rows == CCCP_PROJECTION_TILE_META_ROWS)
-            launch_vq_projection_gate_up_situ_impl<WARPS, 4, true>(
+        const int rows = (
+            p10_rows_per_warp == 16 || p10_rows_per_warp == 8
+                ? p10_rows_per_warp
+                : 4);
+        if (metadata_rows == CCCP_PROJECTION_TILE_META_ROWS) {
+            if (rows == 16)
+                launch_vq_projection_gate_up_situ_impl<WARPS, 16, true>(
+                    input, route_ids, metadata, activated, top_k, batch_size, expert_count,
+                    output_rows, input_cols, activation_kind, beta, linear_beta,
+                    limit, true, metadata_rows, stream);
+            else if (rows == 8)
+                launch_vq_projection_gate_up_situ_impl<WARPS, 8, true>(
+                    input, route_ids, metadata, activated, top_k, batch_size, expert_count,
+                    output_rows, input_cols, activation_kind, beta, linear_beta,
+                    limit, true, metadata_rows, stream);
+            else
+                launch_vq_projection_gate_up_situ_impl<WARPS, 4, true>(
+                    input, route_ids, metadata, activated, top_k, batch_size, expert_count,
+                    output_rows, input_cols, activation_kind, beta, linear_beta,
+                    limit, true, metadata_rows, stream);
+        } else if (rows == 16) {
+            launch_vq_projection_gate_up_situ_impl<WARPS, 16, false>(
                 input, route_ids, metadata, activated, top_k, batch_size, expert_count,
                 output_rows, input_cols, activation_kind, beta, linear_beta,
                 limit, true, metadata_rows, stream);
-        else
+        } else if (rows == 8) {
+            launch_vq_projection_gate_up_situ_impl<WARPS, 8, false>(
+                input, route_ids, metadata, activated, top_k, batch_size, expert_count,
+                output_rows, input_cols, activation_kind, beta, linear_beta,
+                limit, true, metadata_rows, stream);
+        } else {
             launch_vq_projection_gate_up_situ_impl<WARPS, 4, false>(
                 input, route_ids, metadata, activated, top_k, batch_size, expert_count,
                 output_rows, input_cols, activation_kind, beta, linear_beta,
                 limit, true, metadata_rows, stream);
+        }
     } else {
         // p16/p14 codebooks are not staged in shared memory.  The generic
         // path can safely compute multiple output rows per warp: the input
@@ -6578,6 +8632,339 @@ __global__ void packed_stage_topk_blob_metadata_kernel(
     staged_metadata[item] = value;
 }
 
+torch::Tensor packed_moe_topk_compact_fp8_codebook(
+    torch::Tensor input,
+    torch::Tensor route_ids,
+    torch::Tensor weights,
+    torch::Tensor metadata,
+    torch::Tensor scales,
+    int64_t activation_kind_value,
+    double beta,
+    double linear_beta,
+    double limit,
+    torch::Tensor hidden_workspace,
+    torch::Tensor out_workspace,
+    torch::Tensor result)
+{
+#if defined(__HIP_PLATFORM_AMD__)
+    TORCH_CHECK(false, "compact E4M3 codebook MoE is unavailable on HIP");
+#else
+    TORCH_CHECK(
+        input.is_cuda() && input.scalar_type() == at::kBFloat16 &&
+        input.is_contiguous() && input.dim() == 2 && input.size(0) == 1,
+        "compact E4M3 MoE input must be CUDA BF16 [1,D]");
+    TORCH_CHECK(
+        route_ids.is_cuda() && route_ids.scalar_type() == at::kLong &&
+        route_ids.is_contiguous() && route_ids.dim() == 1 &&
+        route_ids.numel() > 0 && route_ids.numel() <= MAX_SLOT_EXPERTS,
+        "compact E4M3 MoE route IDs must be CUDA int64 [TopK]");
+    TORCH_CHECK(
+        weights.is_cuda() && weights.scalar_type() == at::kFloat &&
+        weights.is_contiguous() && weights.sizes() == route_ids.sizes(),
+        "compact E4M3 MoE weights must match TopK");
+    TORCH_CHECK(
+        metadata.is_cuda() && metadata.scalar_type() == at::kLong &&
+        metadata.is_contiguous() && metadata.dim() == 2 &&
+        metadata.size(0) == CCCP_PROJECTION_LEGACY_META_ROWS &&
+        metadata.size(1) == route_ids.numel(),
+        "compact E4M3 MoE metadata must be int64 [15,TopK]");
+    TORCH_CHECK(
+        scales.is_cuda() && scales.scalar_type() == at::kFloat &&
+        scales.is_contiguous() && scales.dim() == 2 &&
+        scales.size(0) == route_ids.numel() && scales.size(1) == 3,
+        "compact E4M3 MoE scales must be float32 [TopK,3]");
+    const int top_k = static_cast<int>(route_ids.numel());
+    const int hidden = static_cast<int>(input.size(1));
+    TORCH_CHECK(
+        hidden_workspace.is_cuda() &&
+        hidden_workspace.scalar_type() == at::kBFloat16 &&
+        hidden_workspace.is_contiguous() &&
+        hidden_workspace.dim() == 2 &&
+        hidden_workspace.size(0) == top_k &&
+        hidden_workspace.size(1) % 2 == 0,
+        "compact E4M3 MoE hidden workspace must be BF16 [TopK,2I]");
+    const int intermediate =
+        static_cast<int>(hidden_workspace.size(1) / 2);
+    TORCH_CHECK(
+        out_workspace.is_cuda() &&
+        out_workspace.scalar_type() == at::kBFloat16 &&
+        out_workspace.is_contiguous() &&
+        out_workspace.sizes() == torch::IntArrayRef({top_k, hidden}) &&
+        result.is_cuda() && result.scalar_type() == at::kFloat &&
+        result.is_contiguous() && result.numel() == hidden,
+        "compact E4M3 MoE output workspaces are invalid");
+    const int device = input.get_device();
+    TORCH_CHECK(
+        route_ids.get_device() == device && weights.get_device() == device &&
+        metadata.get_device() == device && scales.get_device() == device &&
+        hidden_workspace.get_device() == device &&
+        out_workspace.get_device() == device && result.get_device() == device,
+        "compact E4M3 MoE tensors must share one CUDA device");
+    TORCH_CHECK(
+        activation_kind_value >= 0 && activation_kind_value <= 1 &&
+        (activation_kind_value != 0 || beta > 0.0),
+        "compact E4M3 MoE activation metadata is invalid");
+
+    constexpr int warps = 16;
+    constexpr int rows_per_warp = 4;
+    const dim3 block(32, warps);
+    auto stream = at::cuda::getCurrentCUDAStream(device);
+    vq_projection_gate_up_compact_fp8_kernel<
+        warps, rows_per_warp><<<
+            dim3(
+                (intermediate + warps * rows_per_warp - 1) /
+                    (warps * rows_per_warp),
+                top_k),
+            block,
+            static_cast<size_t>(hidden) * sizeof(__nv_bfloat16),
+            stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+                route_ids.data_ptr<int64_t>(),
+                metadata.data_ptr<int64_t>(),
+                scales.data_ptr<float>(),
+                reinterpret_cast<__nv_bfloat16*>(
+                    hidden_workspace.data_ptr()),
+                top_k,
+                top_k,
+                intermediate,
+                hidden,
+                static_cast<int>(activation_kind_value),
+                static_cast<float>(beta),
+                static_cast<float>(linear_beta),
+                static_cast<float>(limit));
+    vq_projection_down_compact_fp8_kernel<
+        warps, rows_per_warp><<<
+            dim3(
+                (hidden + warps * rows_per_warp - 1) /
+                    (warps * rows_per_warp),
+                top_k),
+            block,
+            static_cast<size_t>(intermediate) * sizeof(__nv_bfloat16),
+            stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(
+                    hidden_workspace.data_ptr()),
+                route_ids.data_ptr<int64_t>(),
+                metadata.data_ptr<int64_t>(),
+                scales.data_ptr<float>(),
+                reinterpret_cast<__nv_bfloat16*>(out_workspace.data_ptr()),
+                top_k,
+                top_k,
+                hidden,
+                intermediate);
+    routed_weighted_sum_f32_kernel<<<
+        (hidden + 255) / 256, 256, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(
+                out_workspace.data_ptr()),
+            route_ids.data_ptr<int64_t>(),
+            weights.data_ptr<float>(),
+            metadata.data_ptr<int64_t>() + (long)5 * top_k,
+            result.data_ptr<float>(),
+            top_k,
+            top_k,
+            hidden,
+            -1,
+            false);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return result;
+#endif
+}
+
+torch::Tensor packed_moe_topk_compact_q8_codebook(
+    torch::Tensor input,
+    torch::Tensor route_ids,
+    torch::Tensor weights,
+    torch::Tensor metadata,
+    torch::Tensor scales,
+    int64_t activation_kind_value,
+    double beta,
+    double linear_beta,
+    double limit,
+    torch::Tensor gate_quant_workspace,
+    torch::Tensor down_quant_workspace,
+    torch::Tensor hidden_workspace,
+    torch::Tensor out_workspace,
+    torch::Tensor result)
+{
+#if defined(__HIP_PLATFORM_AMD__)
+    TORCH_CHECK(false, "compact Q8 codebook MoE is unavailable on HIP");
+#else
+    TORCH_CHECK(
+        input.is_cuda() && input.scalar_type() == at::kBFloat16 &&
+        input.is_contiguous() && input.dim() == 2 && input.size(0) == 1,
+        "compact Q8 MoE input must be CUDA BF16 [1,D]");
+    TORCH_CHECK(
+        route_ids.is_cuda() && route_ids.scalar_type() == at::kLong &&
+        route_ids.is_contiguous() && route_ids.dim() == 1 &&
+        route_ids.numel() > 0 && route_ids.numel() <= MAX_SLOT_EXPERTS,
+        "compact Q8 MoE route IDs must be CUDA int64 [TopK]");
+    TORCH_CHECK(
+        weights.is_cuda() && weights.scalar_type() == at::kFloat &&
+        weights.is_contiguous() && weights.sizes() == route_ids.sizes(),
+        "compact Q8 MoE weights must match TopK");
+    TORCH_CHECK(
+        metadata.is_cuda() && metadata.scalar_type() == at::kLong &&
+        metadata.is_contiguous() && metadata.dim() == 2 &&
+        metadata.size(0) == CCCP_PROJECTION_LEGACY_META_ROWS &&
+        metadata.size(1) == route_ids.numel(),
+        "compact Q8 MoE metadata must be int64 [15,TopK]");
+    TORCH_CHECK(
+        scales.is_cuda() && scales.scalar_type() == at::kFloat &&
+        scales.is_contiguous() && scales.dim() == 2 &&
+        scales.size(0) == route_ids.numel() && scales.size(1) == 3,
+        "compact Q8 MoE scales must be float32 [TopK,3]");
+    const int top_k = static_cast<int>(route_ids.numel());
+    const int hidden = static_cast<int>(input.size(1));
+    TORCH_CHECK(
+        hidden_workspace.is_cuda() &&
+        hidden_workspace.scalar_type() == at::kBFloat16 &&
+        hidden_workspace.is_contiguous() &&
+        hidden_workspace.dim() == 2 &&
+        hidden_workspace.size(0) == top_k &&
+        hidden_workspace.size(1) % 2 == 0,
+        "compact Q8 MoE hidden workspace must be BF16 [TopK,2I]");
+    const int intermediate =
+        static_cast<int>(hidden_workspace.size(1) / 2);
+    const int gate_quantized_span = (hidden + 15) & ~15;
+    const int down_quantized_span = (intermediate + 15) & ~15;
+    TORCH_CHECK(
+        gate_quant_workspace.is_cuda() &&
+        gate_quant_workspace.scalar_type() == at::kByte &&
+        gate_quant_workspace.is_contiguous() &&
+        gate_quant_workspace.dim() == 2 &&
+        gate_quant_workspace.size(0) == top_k &&
+        gate_quant_workspace.size(1) >= 4 * gate_quantized_span,
+        "compact Q8 Gate/Up quant workspace must be uint8 [TopK,4*align(D)]");
+    TORCH_CHECK(
+        down_quant_workspace.is_cuda() &&
+        down_quant_workspace.scalar_type() == at::kByte &&
+        down_quant_workspace.is_contiguous() &&
+        down_quant_workspace.dim() == 2 &&
+        down_quant_workspace.size(0) == top_k &&
+        down_quant_workspace.size(1) >= 2 * down_quantized_span,
+        "compact Q8 Down quant workspace must be uint8 [TopK,2*align(I)]");
+    TORCH_CHECK(
+        out_workspace.is_cuda() &&
+        out_workspace.scalar_type() == at::kBFloat16 &&
+        out_workspace.is_contiguous() &&
+        out_workspace.sizes() == torch::IntArrayRef({top_k, hidden}) &&
+        result.is_cuda() && result.scalar_type() == at::kFloat &&
+        result.is_contiguous() && result.numel() == hidden,
+        "compact Q8 MoE output workspaces are invalid");
+    const int device = input.get_device();
+    TORCH_CHECK(
+        route_ids.get_device() == device && weights.get_device() == device &&
+        metadata.get_device() == device && scales.get_device() == device &&
+        gate_quant_workspace.get_device() == device &&
+        down_quant_workspace.get_device() == device &&
+        hidden_workspace.get_device() == device &&
+        out_workspace.get_device() == device && result.get_device() == device,
+        "compact Q8 MoE tensors must share one CUDA device");
+    TORCH_CHECK(
+        activation_kind_value >= 0 && activation_kind_value <= 1 &&
+        (activation_kind_value != 0 || beta > 0.0),
+        "compact Q8 MoE activation metadata is invalid");
+
+    constexpr int warps = 16;
+    // H20 A/B: 16 warps is faster than 8 or 32 for the mixed compact expert
+    // signatures used here. One output row per warp also wins on the real
+    // mixed expert distribution, so release intentionally keeps one path.
+    const dim3 block(32, warps);
+    auto stream = at::cuda::getCurrentCUDAStream(device);
+    constexpr int quantize_threads = 256;
+    compact_q8_quantize_rows_global_kernel<<<
+        1,
+        quantize_threads,
+        0,
+        stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+            gate_quant_workspace.data_ptr<uint8_t>(),
+            1,
+            hidden,
+            gate_quantized_span,
+            4 * gate_quantized_span);
+    vq_projection_gate_up_compact_q8_kernel<warps, 1><<<
+        dim3((intermediate + warps - 1) / warps, top_k),
+        block,
+        0,
+        stream>>>(
+            gate_quant_workspace.data_ptr<uint8_t>(),
+            route_ids.data_ptr<int64_t>(),
+            metadata.data_ptr<int64_t>(),
+            scales.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(hidden_workspace.data_ptr()),
+            top_k,
+            top_k,
+            intermediate,
+            hidden,
+            static_cast<int>(activation_kind_value),
+            static_cast<float>(beta),
+            static_cast<float>(linear_beta),
+            static_cast<float>(limit));
+    compact_q8_quantize_rows_global_kernel<<<
+        top_k,
+        quantize_threads,
+        0,
+        stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(
+                hidden_workspace.data_ptr()),
+            down_quant_workspace.data_ptr<uint8_t>(),
+            top_k,
+            intermediate,
+            down_quantized_span,
+            2 * down_quantized_span);
+    vq_projection_down_compact_q8_kernel<warps, 1><<<
+        dim3((hidden + warps - 1) / warps, top_k),
+        block,
+        0,
+        stream>>>(
+            down_quant_workspace.data_ptr<uint8_t>(),
+            route_ids.data_ptr<int64_t>(),
+            metadata.data_ptr<int64_t>(),
+            scales.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(out_workspace.data_ptr()),
+            top_k,
+            top_k,
+            hidden,
+            intermediate);
+    routed_weighted_sum_f32_kernel<<<
+        (hidden + 255) / 256, 256, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(
+                out_workspace.data_ptr()),
+            route_ids.data_ptr<int64_t>(),
+            weights.data_ptr<float>(),
+            metadata.data_ptr<int64_t>() + (long)5 * top_k,
+            result.data_ptr<float>(),
+            top_k,
+            top_k,
+            hidden,
+            -1,
+            false);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return result;
+#endif
+}
+
+bool compact_q8_codebook_l2_prefetch(torch::Tensor metadata)
+{
+#if defined(__HIP_PLATFORM_AMD__)
+    return false;
+#else
+    if (
+        !metadata.is_cuda() || metadata.scalar_type() != at::kLong ||
+        !metadata.is_contiguous() || metadata.dim() != 2 ||
+        metadata.size(0) != CCCP_PROJECTION_LEGACY_META_ROWS ||
+        metadata.size(1) <= 0 || metadata.size(1) > MAX_SLOT_EXPERTS)
+        return false;
+    const int expert_count = static_cast<int>(metadata.size(1));
+    auto stream = at::cuda::getCurrentCUDAStream(metadata.get_device());
+    compact_q8_codebook_l2_prefetch_kernel<<<
+        3 * expert_count, 128, 0, stream>>>(
+            metadata.data_ptr<int64_t>(), expert_count);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return true;
+#endif
+}
+
 torch::Tensor packed_moe_topk(
     torch::Tensor input,
     torch::Tensor route_ids,
@@ -6798,6 +9185,18 @@ torch::Tensor packed_moe_topk(
               projection_warps = h20_routed_kernel ? 16 : 32;
           const char* projection_rows_setting =
               std::getenv("CCCP_PROJECTION_ROWS");
+          const char* p10_rows_setting =
+              std::getenv("CCCP_P10_ROWS");
+          int p10_rows = (
+              p10_rows_setting == nullptr
+              ? 4
+              : std::atoi(p10_rows_setting));
+          if (
+              p10_rows != 4 &&
+              p10_rows != 8 &&
+              p10_rows != 16
+          )
+              p10_rows = 4;
           int projection_rows = (
               projection_rows_setting == nullptr
               ? 1
@@ -6826,6 +9225,7 @@ torch::Tensor packed_moe_topk(
                       static_cast<float>(limit),
                       p10_shared,
                       static_cast<int>(metadata.size(0)),
+                      p10_rows,
                       projection_rows,
                       stream);
               } else if (projection_warps == 32) {
@@ -6845,6 +9245,7 @@ torch::Tensor packed_moe_topk(
                       static_cast<float>(limit),
                       p10_shared,
                       static_cast<int>(metadata.size(0)),
+                      p10_rows,
                       projection_rows,
                       stream);
               } else {
@@ -6864,6 +9265,7 @@ torch::Tensor packed_moe_topk(
                       static_cast<float>(limit),
                       p10_shared,
                       static_cast<int>(metadata.size(0)),
+                      p10_rows,
                       projection_rows,
                       stream);
               }
@@ -10577,7 +12979,8 @@ __global__ void dsv4_attn_decode_controlled_kernel(
     extern __shared__ float smem[];
     float* qsh = smem;
     float* scores = qsh + D;
-    float* osh = scores + S;
+    const int score_span = (S + 3) & ~3;
+    float* osh = scores + score_span;
     float* red = osh + D;
     __shared__ float score_max;
     __shared__ float denom;
@@ -10594,10 +12997,40 @@ __global__ void dsv4_attn_decode_controlled_kernel(
         if (valid) {
             if (window_item) {
                 const float* kv = win_kv + static_cast<long>(s) * D;
-                for (int d = 0; d < D; ++d) acc = fmaf(qsh[d], kv[d], acc);
+                const auto* query4 =
+                    reinterpret_cast<const float4*>(qsh);
+                const auto* key4 =
+                    reinterpret_cast<const float4*>(kv);
+                const int vectors = D >> 2;
+                for (int vector = 0; vector < vectors; ++vector) {
+                    const float4 query_value = query4[vector];
+                    const float4 key_value = key4[vector];
+                    acc = fmaf(query_value.x, key_value.x, acc);
+                    acc = fmaf(query_value.y, key_value.y, acc);
+                    acc = fmaf(query_value.z, key_value.z, acc);
+                    acc = fmaf(query_value.w, key_value.w, acc);
+                }
+                for (int d = vectors << 2; d < D; ++d)
+                    acc = fmaf(qsh[d], kv[d], acc);
             } else {
                 const __nv_bfloat16* kv = comp_kv + static_cast<long>(s - W) * D;
-                for (int d = 0; d < D; ++d)
+                const auto* query4 =
+                    reinterpret_cast<const float4*>(qsh);
+                const auto* key2 =
+                    reinterpret_cast<const __nv_bfloat162*>(kv);
+                const int vectors = D >> 2;
+                for (int vector = 0; vector < vectors; ++vector) {
+                    const float4 query_value = query4[vector];
+                    const float2 first = __bfloat1622float2(
+                        key2[2 * vector]);
+                    const float2 second = __bfloat1622float2(
+                        key2[2 * vector + 1]);
+                    acc = fmaf(query_value.x, first.x, acc);
+                    acc = fmaf(query_value.y, first.y, acc);
+                    acc = fmaf(query_value.z, second.x, acc);
+                    acc = fmaf(query_value.w, second.y, acc);
+                }
+                for (int d = vectors << 2; d < D; ++d)
                     acc = fmaf(qsh[d], __bfloat162float(kv[d]), acc);
             }
         }
@@ -10633,7 +13066,67 @@ __global__ void dsv4_attn_decode_controlled_kernel(
         if (lane == 0) denom = value + expf(sink[h] - score_max);
     }
     __syncthreads();
-    for (int d = tid; d < D; d += blockDim.x) {
+    const int plain = D - rd;
+    const bool vector_rope =
+        (D & 3) == 0 && (plain & 3) == 0 && (rd & 3) == 0;
+    auto* output4 = reinterpret_cast<float4*>(osh);
+    auto* final_output4 = reinterpret_cast<float4*>(
+        out + static_cast<long>(h) * D);
+    const int output_vectors = D >> 2;
+    for (int vector = tid; vector < output_vectors; vector += blockDim.x) {
+        const int d = vector << 2;
+        float4 value = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int s = 0; s < W; ++s) {
+            const float weight = scores[s];
+            const float4 kv = reinterpret_cast<const float4*>(
+                win_kv + static_cast<long>(s) * D)[vector];
+            value.x = fmaf(weight, kv.x, value.x);
+            value.y = fmaf(weight, kv.y, value.y);
+            value.z = fmaf(weight, kv.z, value.z);
+            value.w = fmaf(weight, kv.w, value.w);
+        }
+        for (int s = 0; s < valid_c; ++s) {
+            const float weight = scores[W + s];
+            const auto* kv = reinterpret_cast<const __nv_bfloat162*>(
+                comp_kv + static_cast<long>(s) * D + d);
+            const float2 first = __bfloat1622float2(kv[0]);
+            const float2 second = __bfloat1622float2(kv[1]);
+            value.x = fmaf(weight, first.x, value.x);
+            value.y = fmaf(weight, first.y, value.y);
+            value.z = fmaf(weight, second.x, value.z);
+            value.w = fmaf(weight, second.y, value.w);
+        }
+        const float4 normalized = make_float4(
+            value.x / denom,
+            value.y / denom,
+            value.z / denom,
+            value.w / denom);
+        if (vector_rope) {
+            if (d < plain) {
+                final_output4[vector] = normalized;
+            } else {
+                const int pair = (d - plain) >> 1;
+                const float first_cos = cs[pair];
+                const float first_sin = sn[pair];
+                const float second_cos = cs[pair + 1];
+                const float second_sin = sn[pair + 1];
+                final_output4[vector] = make_float4(
+                    normalized.x * first_cos +
+                        normalized.y * first_sin,
+                    -normalized.x * first_sin +
+                        normalized.y * first_cos,
+                    normalized.z * second_cos +
+                        normalized.w * second_sin,
+                    -normalized.z * second_sin +
+                        normalized.w * second_cos);
+            }
+        } else {
+            output4[vector] = normalized;
+        }
+    }
+    for (int d = (output_vectors << 2) + tid;
+         d < D;
+         d += blockDim.x) {
         float value = 0.0f;
         for (int s = 0; s < W; ++s)
             value = fmaf(scores[s], win_kv[static_cast<long>(s) * D + d], value);
@@ -10644,8 +13137,8 @@ __global__ void dsv4_attn_decode_controlled_kernel(
                 value);
         osh[d] = value / denom;
     }
+    if (vector_rope) return;
     __syncthreads();
-    const int plain = D - rd;
     for (int d = tid; d < D; d += blockDim.x) {
         float value;
         if (d < plain) value = osh[d];
@@ -10691,8 +13184,8 @@ torch::Tensor dsv4_attn_decode_controlled(
         W + C > 0 && W + C <= 4096 && ratio >= 0,
         "controlled DSV4 attention shapes are inconsistent");
     auto output = torch::empty_like(q);
-    const int threads = 128;
-    const size_t shared_bytes = static_cast<size_t>(2 * D + W + C + 4) * sizeof(float);
+    const int threads = D >= 512 ? 256 : 128;
+    const size_t shared_bytes = static_cast<size_t>(2 * D + W + C + 11) * sizeof(float);
     dsv4_attn_decode_controlled_kernel<<<
         H, threads, shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
             q.data_ptr<float>(), win_kv.data_ptr<float>(), win_pos.data_ptr<int64_t>(),
@@ -11276,12 +13769,6 @@ __global__ void dsv4_hc_pre_norm_bf16_kernel(
 // block per token and evaluates the 24-row GEMV in three serial batches of
 // eight warps.  For N=1 that leaves almost the whole GPU idle.  Split the
 // operation into 24 independent GEMV blocks followed by one finish block.
-// The 24 raw float mixes plus one shared input RMS value temporarily occupy
-// the first 100 bytes of the BF16 y output; the finish kernel loads them into
-// shared memory before overwriting y.  Only block zero evaluates the input
-// sum-of-squares.  The previous implementation repeated that identical work
-// in all 24 GEMV blocks, nearly doubling the hot-path memory/FMA traffic.
-
 template <typename wt_t>
 __global__ void dsv4_hc_mix_parallel_bf16_kernel(
     const __nv_bfloat16* __restrict__ x,       // [N,4,D]
@@ -11341,6 +13828,15 @@ __global__ void dsv4_hc_mix_parallel_bf16_kernel(
     }
 }
 
+// The 24 raw float mixes plus one shared input RMS value temporarily occupy
+// the first 100 bytes of the BF16 y output; the finish kernel loads them into
+// shared memory before overwriting y.  Only block zero evaluates the input
+// sum-of-squares.  The previous implementation repeated that identical work
+// in all 24 GEMV blocks, nearly doubling the hot-path memory/FMA traffic.
+
+constexpr int CCCP_DSV4_HC_FINISH_THREADS = 512;
+constexpr int CCCP_DSV4_HC_FINISH_WARPS = 16;
+
 __global__ void dsv4_hc_finish_norm_bf16_kernel(
     const __nv_bfloat16* __restrict__ x,       // [N,4,D]
     const float* __restrict__ scale,            // [3]
@@ -11357,7 +13853,7 @@ __global__ void dsv4_hc_finish_norm_bf16_kernel(
     const int warp = tid >> 5;
     const __nv_bfloat16* xn = x + (long)n * 4 * D;
     __nv_bfloat16* yn = y + (long)n * D;
-    __shared__ float red[8];
+    __shared__ float red[CCCP_DSV4_HC_FINISH_WARPS];
     __shared__ float inv_y_rms;
     __shared__ float mixes[24];
     __shared__ float pre[4];
@@ -11439,7 +13935,7 @@ __global__ void dsv4_hc_finish_norm_bf16_kernel(
     if (lane == 0) red[warp] = yss;
     __syncthreads();
     if (warp == 0) {
-        float v = lane < 8 ? red[lane] : 0.f;
+        float v = lane < CCCP_DSV4_HC_FINISH_WARPS ? red[lane] : 0.f;
         v = warp_sum_f32(v);
         if (lane == 0)
             inv_y_rms = rsqrtf(v / (float)D + eps);
@@ -11472,7 +13968,8 @@ void launch_dsv4_hc_pre_norm_bf16_parallel(
         reinterpret_cast<__nv_bfloat16*>(
             y.data_ptr<at::BFloat16>()),
         D, eps);
-    dsv4_hc_finish_norm_bf16_kernel<<<N, 256, 0, stream>>>(
+    dsv4_hc_finish_norm_bf16_kernel<<<N, CCCP_DSV4_HC_FINISH_THREADS,
+        0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(
             x.data_ptr<at::BFloat16>()),
         scale.data_ptr<float>(),
@@ -12148,6 +14645,170 @@ std::vector<torch::Tensor> sigmoid_route_out(
         static_cast<int>(top_k),
         static_cast<float>(routed_scaling),
         stream);
+    return {weights, indices};
+}
+
+__device__ __forceinline__ float sqrtsoftplus_route_score(
+    const float logit)
+{
+    const float softplus = logit > 20.0f
+        ? logit
+        : log1pf(expf(logit));
+    return sqrtf(fmaxf(softplus, 0.0f));
+}
+
+struct RouteKeyGreater {
+    __device__ __forceinline__ bool operator()(
+        const unsigned long long& left,
+        const unsigned long long& right) const
+    {
+        return left > right;
+    }
+};
+
+// DSV4-style sqrt(softplus) routing used to be expressed as eleven small
+// ATen kernels (score, mask, Top-K, gather, normalize, and fixed-buffer
+// copies) inside every captured layer graph.  One block now performs the
+// exact corrected selection and publishes Graph-stable outputs directly.
+__global__ void sqrtsoftplus_route_radix_kernel(
+    const float* __restrict__ logits,
+    const float* __restrict__ bias,
+    const bool* __restrict__ mask,
+    float* __restrict__ weights,
+    int64_t* __restrict__ indices,
+    const int experts,
+    const int top_k,
+    const bool normalize,
+    const float routed_scaling)
+{
+    constexpr int kThreads = 256;
+    constexpr int kItems = 4;
+    constexpr int kWarps = kThreads / 32;
+    constexpr int kWarpTopK = 6;
+    using FirstSort = cub::WarpMergeSort<
+        unsigned long long, kItems, 32>;
+    using FinalSort = cub::WarpMergeSort<
+        unsigned long long, 2, 32>;
+    __shared__ typename FirstSort::TempStorage first_storage[kWarps];
+    __shared__ typename FinalSort::TempStorage final_storage;
+    __shared__ unsigned long long warp_candidates[8 * 6];
+    __shared__ int selected[16];
+    unsigned long long keys[kItems];
+    #pragma unroll
+    for (int item = 0; item < kItems; ++item) {
+        const int expert = threadIdx.x * kItems + item;
+        float choice = -INFINITY;
+        if (expert < experts && mask[expert]) {
+            const float score = sqrtsoftplus_route_score(logits[expert]);
+            const float corrected = score + bias[expert];
+            choice = isfinite(corrected) ? corrected : -FLT_MAX;
+        }
+        const uint32_t score_key = route_ordered_float(choice);
+        keys[item] =
+            (static_cast<unsigned long long>(score_key) << 32) |
+            static_cast<unsigned long long>(
+                0xffffffffu - static_cast<uint32_t>(expert));
+    }
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    FirstSort first_stage(first_storage[warp]);
+    first_stage.Sort(keys, RouteKeyGreater{});
+    #pragma unroll
+    for (int item = 0; item < kItems; ++item) {
+        const int rank = lane * kItems + item;
+        if (rank < kWarpTopK)
+            warp_candidates[warp * kWarpTopK + rank] = keys[item];
+    }
+    __syncthreads();
+    if (warp == 0) {
+        unsigned long long final_keys[2];
+        #pragma unroll
+        for (int item = 0; item < 2; ++item) {
+            const int rank = lane * 2 + item;
+            final_keys[item] = rank < kWarps * kWarpTopK
+                ? warp_candidates[rank]
+                : 0ull;
+        }
+        FinalSort final_stage(final_storage);
+        final_stage.Sort(final_keys, RouteKeyGreater{});
+        #pragma unroll
+        for (int item = 0; item < 2; ++item) {
+            const int rank = lane * 2 + item;
+            if (rank < top_k)
+                selected[rank] = static_cast<int>(
+                    0xffffffffu - static_cast<uint32_t>(final_keys[item]));
+        }
+        __syncwarp();
+    }
+    if (threadIdx.x == 0) {
+        float sum = 1.0e-20f;
+        for (int rank = 0; rank < top_k; ++rank) {
+            const int expert = selected[rank];
+            const float score = sqrtsoftplus_route_score(logits[expert]);
+            indices[rank] = expert;
+            weights[rank] = isfinite(score) ? score : 0.0f;
+            sum += weights[rank];
+        }
+        const float factor = normalize
+            ? routed_scaling / sum
+            : routed_scaling;
+        for (int rank = 0; rank < top_k; ++rank)
+            weights[rank] *= factor;
+    }
+}
+
+std::vector<torch::Tensor> sqrtsoftplus_route_out(
+    torch::Tensor logits,
+    torch::Tensor bias,
+    torch::Tensor mask,
+    long top_k,
+    bool normalize,
+    double routed_scaling,
+    torch::Tensor weights,
+    torch::Tensor indices)
+{
+    TORCH_CHECK(
+        logits.is_cuda() && bias.is_cuda() && mask.is_cuda() &&
+        weights.is_cuda() && indices.is_cuda(),
+        "sqrtsoftplus router tensors must be CUDA");
+    TORCH_CHECK(
+        logits.scalar_type() == at::kFloat &&
+        bias.scalar_type() == at::kFloat &&
+        mask.scalar_type() == at::kBool &&
+        weights.scalar_type() == at::kFloat &&
+        indices.scalar_type() == at::kLong,
+        "sqrtsoftplus router tensor dtype mismatch");
+    TORCH_CHECK(
+        logits.is_contiguous() && bias.is_contiguous() &&
+        mask.is_contiguous() && weights.is_contiguous() &&
+        indices.is_contiguous() &&
+        logits.dim() == 2 && logits.size(0) == 1,
+        "sqrtsoftplus router tensors must be contiguous and logits [1,E]");
+    const int experts = static_cast<int>(logits.size(1));
+    TORCH_CHECK(
+        experts > 0 && experts <= 1024 &&
+        bias.numel() == experts && mask.numel() == experts &&
+        top_k > 0 && top_k <= 16 && top_k <= experts &&
+        weights.sizes() == torch::IntArrayRef({1, top_k}) &&
+        indices.sizes() == torch::IntArrayRef({1, top_k}),
+        "sqrtsoftplus router buffer shapes do not match");
+    const int device = logits.get_device();
+    TORCH_CHECK(
+        bias.get_device() == device && mask.get_device() == device &&
+        weights.get_device() == device && indices.get_device() == device,
+        "sqrtsoftplus router tensors must share one device");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    sqrtsoftplus_route_radix_kernel<<<1, 256, 0, stream>>>(
+        logits.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        mask.data_ptr<bool>(),
+        weights.data_ptr<float>(),
+        indices.data_ptr<int64_t>(),
+        experts,
+        static_cast<int>(top_k),
+        normalize,
+        static_cast<float>(routed_scaling));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {weights, indices};
 }
 
@@ -14463,6 +17124,122 @@ __global__ void block_fp8_grouped_gemv_f32_kernel(
         output[output_row] = accumulator;
 }
 
+// Decode-sized grouped projections are bandwidth-bound.  Two independent
+// output rows per warp reuse the staged activation and halve CTA/input-stage
+// traffic while preserving the exact block-FP8 scale layout.  The host only
+// selects this path when all groups share one input row, so a projection
+// boundary can never invalidate the shared activation.
+template <typename input_t, int warps>
+__global__ void block_fp8_grouped_gemv_f32_rows2_kernel(
+    const input_t* __restrict__ input,
+    const int64_t* __restrict__ weight_ptrs,
+    const int64_t* __restrict__ scale_ptrs,
+    const int32_t* __restrict__ row_offsets,
+    float* __restrict__ output,
+    const int groups,
+    const int total_rows,
+    const int cols,
+    const int scale_cols)
+{
+    extern __shared__ unsigned char fp8_grouped_rows2_shared_raw[];
+    auto* shared_input = reinterpret_cast<__nv_bfloat16*>(
+        fp8_grouped_rows2_shared_raw);
+    const int lane = threadIdx.x;
+    const int linear_thread = threadIdx.y * 32 + lane;
+    for (int column = linear_thread;
+         column < cols;
+         column += 32 * warps) {
+        shared_input[column] = __float2bfloat16_rn(
+            vq_scalar_to_float(input + column));
+    }
+    __syncthreads();
+
+    const int block_row = blockIdx.x * (2 * warps);
+    const int output_row0 = block_row + threadIdx.y;
+    const int output_row1 = output_row0 + warps;
+    if (output_row0 >= total_rows)
+        return;
+
+    int group0 = 0;
+    while (group0 + 1 < groups &&
+           output_row0 >= row_offsets[group0 + 1])
+        ++group0;
+    int group1 = group0;
+    while (group1 + 1 < groups &&
+           output_row1 >= row_offsets[group1 + 1])
+        ++group1;
+    const int row0 = output_row0 - row_offsets[group0];
+    const int row1 = output_row1 - row_offsets[group1];
+    const auto* weights0 = reinterpret_cast<const uint8_t*>(
+        static_cast<uintptr_t>(weight_ptrs[group0]));
+    const auto* scales0 = reinterpret_cast<const float*>(
+        static_cast<uintptr_t>(scale_ptrs[group0]));
+    const auto* weight_row0 = weights0 + static_cast<long>(row0) * cols;
+    const auto* scale_row0 = scales0 +
+        static_cast<long>(row0 / 128) * scale_cols;
+
+    const bool row1_valid = output_row1 < total_rows;
+    const auto* weights1 = row1_valid
+        ? reinterpret_cast<const uint8_t*>(
+            static_cast<uintptr_t>(weight_ptrs[group1]))
+        : weights0;
+    const auto* scales1 = row1_valid
+        ? reinterpret_cast<const float*>(
+            static_cast<uintptr_t>(scale_ptrs[group1]))
+        : scales0;
+    const auto* weight_row1 = weights1 +
+        static_cast<long>(row1_valid ? row1 : row0) * cols;
+    const auto* scale_row1 = scales1 +
+        static_cast<long>((row1_valid ? row1 : row0) / 128) * scale_cols;
+    const bool shared_scale_row = scale_row0 == scale_row1;
+
+    float accumulator0 = 0.f;
+    float accumulator1 = 0.f;
+    for (int column_block = 0;
+         column_block < scale_cols;
+         ++column_block) {
+        float scale0 = lane == 0 ? scale_row0[column_block] : 0.f;
+        scale0 = __shfl_sync(0xffffffffu, scale0, 0);
+        float scale1 = scale0;
+        if (!shared_scale_row) {
+            scale1 = lane == 0 ? scale_row1[column_block] : 0.f;
+            scale1 = __shfl_sync(0xffffffffu, scale1, 0);
+        }
+        const int begin = column_block * 128;
+        const int end = min(begin + 128, cols);
+        const int column = begin + lane * 4;
+        if (column + 3 < end) {
+            const auto input0 = __bfloat162float(shared_input[column]);
+            const auto input1 = __bfloat162float(shared_input[column + 1]);
+            const auto input2 = __bfloat162float(shared_input[column + 2]);
+            const auto input3 = __bfloat162float(shared_input[column + 3]);
+            const float4 scaled0 = fp8x4_scale_to_f32(
+                __ldg(reinterpret_cast<const uint32_t*>(
+                    weight_row0 + column)),
+                scale0);
+            const float4 scaled1 = fp8x4_scale_to_f32(
+                __ldg(reinterpret_cast<const uint32_t*>(
+                    weight_row1 + column)),
+                scale1);
+            accumulator0 = __fmaf_rn(scaled0.x, input0, accumulator0);
+            accumulator0 = __fmaf_rn(scaled0.y, input1, accumulator0);
+            accumulator0 = __fmaf_rn(scaled0.z, input2, accumulator0);
+            accumulator0 = __fmaf_rn(scaled0.w, input3, accumulator0);
+            accumulator1 = __fmaf_rn(scaled1.x, input0, accumulator1);
+            accumulator1 = __fmaf_rn(scaled1.y, input1, accumulator1);
+            accumulator1 = __fmaf_rn(scaled1.z, input2, accumulator1);
+            accumulator1 = __fmaf_rn(scaled1.w, input3, accumulator1);
+        }
+    }
+    accumulator0 = warp_sum_f32(accumulator0);
+    accumulator1 = warp_sum_f32(accumulator1);
+    if (lane == 0) {
+        output[output_row0] = accumulator0;
+        if (row1_valid)
+            output[output_row1] = accumulator1;
+    }
+}
+
 // Four G64 groups are consumed per loop. Four 8-lane subgroups load their
 // scales and one uint32 of packed codes per lane, while the final full-warp
 // reduction still produces one output row. This keeps row-level occupancy
@@ -15983,7 +18760,7 @@ void launch_block_fp8_gemv_f32(
     cudaStream_t stream)
 {
     const char* setting = std::getenv("CCCP_FP8_GEMV_WARPS");
-    const int warps = setting == nullptr ? 8 : std::atoi(setting);
+    const int warps = setting == nullptr ? 16 : std::atoi(setting);
     if (warps <= 8) {
         launch_block_fp8_gemv_f32_rows<input_t, 8>(
             input, weights, scales, output,
@@ -16126,6 +18903,48 @@ void launch_block_fp8_grouped_gemv_f32_rows(
                 scale_cols);
 }
 
+template <typename input_t, int warps>
+void launch_block_fp8_grouped_gemv_f32_rows2(
+    const input_t* input,
+    const int64_t* weight_ptrs,
+    const int64_t* scale_ptrs,
+    const int32_t* row_offsets,
+    float* output,
+    const int groups,
+    const int total_rows,
+    const int cols,
+    const int scale_cols,
+    cudaStream_t stream)
+{
+    const size_t shared_bytes =
+        static_cast<size_t>(cols) * sizeof(__nv_bfloat16);
+    if (shared_bytes > 48 * 1024) {
+        const auto status = cccp_gpu_func_set_attribute(
+            block_fp8_grouped_gemv_f32_rows2_kernel<input_t, warps>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(shared_bytes));
+        TORCH_CHECK(
+            status == cudaSuccess,
+            "failed to configure two-row grouped block-FP8 GEMV shared "
+            "memory: ",
+            cudaGetErrorString(status));
+    }
+    block_fp8_grouped_gemv_f32_rows2_kernel<input_t, warps><<<
+        (total_rows + 2 * warps - 1) / (2 * warps),
+        dim3(32, warps),
+        shared_bytes,
+        stream>>>(
+            input,
+            weight_ptrs,
+            scale_ptrs,
+            row_offsets,
+            output,
+            groups,
+            total_rows,
+            cols,
+            scale_cols);
+}
+
 template <typename input_t>
 void launch_block_fp8_grouped_gemv_f32(
     const input_t* input,
@@ -16140,8 +18959,30 @@ void launch_block_fp8_grouped_gemv_f32(
     const int scale_cols,
     cudaStream_t stream)
 {
+    const char* rows_setting =
+        std::getenv("CCCP_FP8_GEMV_ROWS_PER_WARP");
+    const int rows_per_warp =
+        rows_setting == nullptr ? 2 : std::atoi(rows_setting);
     const char* setting = std::getenv("CCCP_FP8_GEMV_WARPS");
-    const int warps = setting == nullptr ? 8 : std::atoi(setting);
+    const int warps = setting == nullptr
+        ? (rows_per_warp == 2 ? 8 : 16)
+        : std::atoi(setting);
+    if (rows_per_warp == 2 && input_rows == 1) {
+        if (warps <= 8) {
+            launch_block_fp8_grouped_gemv_f32_rows2<input_t, 8>(
+                input, weight_ptrs, scale_ptrs, row_offsets, output,
+                groups, total_rows, cols, scale_cols, stream);
+        } else if (warps <= 16) {
+            launch_block_fp8_grouped_gemv_f32_rows2<input_t, 16>(
+                input, weight_ptrs, scale_ptrs, row_offsets, output,
+                groups, total_rows, cols, scale_cols, stream);
+        } else {
+            launch_block_fp8_grouped_gemv_f32_rows2<input_t, 32>(
+                input, weight_ptrs, scale_ptrs, row_offsets, output,
+                groups, total_rows, cols, scale_cols, stream);
+        }
+        return;
+    }
     if (warps <= 8) {
         launch_block_fp8_grouped_gemv_f32_rows<
             input_t, 8>(
@@ -19816,6 +22657,614 @@ bool packed_route_slots_out(
     return true;
 }
 
+// Graph-resident segmented LRU for packed routed experts.  The complete
+// ownership table and the fixed-shape output plan stay on the device, so a
+// decode graph does not need route D2H copies or Python OrderedDict updates.
+// One controller thread is intentional: Top-K is at most 16, while keeping
+// the state transition atomic and deterministic is more important than
+// parallelising a few dozen integer operations.
+__global__ void packed_cache_plan_kernel(
+    const int64_t* __restrict__ route_ids,
+    const int route_count,
+    const int layer,
+    const int experts,
+    const int32_t* __restrict__ signature_of_id,
+    const int32_t* __restrict__ segment_offsets,
+    const int signature_count,
+    int32_t* __restrict__ slot_for_id,
+    int32_t* __restrict__ id_of_slot,
+    int64_t* __restrict__ last_used,
+    int64_t* __restrict__ step,
+    int32_t* __restrict__ route_slots,
+    int32_t* __restrict__ source_ids,
+    int32_t* __restrict__ destination_slots,
+    int32_t* __restrict__ counts,
+    const int max_routes) {
+    if (blockIdx.x != 0 || threadIdx.x >= 32)
+        return;
+    const int lane = static_cast<int>(threadIdx.x);
+    __shared__ int32_t unique_ids[16];
+    __shared__ int32_t unique_slots[16];
+    __shared__ int unique_count;
+    __shared__ int hit_count;
+    __shared__ int fetch_count;
+    __shared__ int action;
+    __shared__ int current_expert;
+    __shared__ int current_logical_id;
+    __shared__ int current_slot;
+    __shared__ int segment_begin_shared;
+    __shared__ int segment_end_shared;
+    __shared__ int64_t fast_step_base;
+    __shared__ bool failed;
+
+    if (lane < max_routes) {
+        route_slots[lane] = -1;
+        source_ids[lane] = -1;
+        destination_slots[lane] = -1;
+    }
+    if (lane == 0) {
+        counts[0] = route_count;
+        counts[1] = 0;
+        counts[2] = 0;
+        counts[3] = 0;
+        unique_count = 0;
+        hit_count = 0;
+        fetch_count = 0;
+        failed = false;
+    }
+    __syncwarp();
+
+    // packed-cache all-hit warp fast path.  Decode routes hit the segmented
+    // slab overwhelmingly often; probing all Top-K entries in parallel avoids
+    // the serial controller loop without weakening exact LRU semantics.  A
+    // single miss leaves every timestamp untouched and enters the original
+    // deterministic miss/eviction path below.
+    int32_t fast_logical_id = -1;
+    int32_t fast_slot = -1;
+    bool fast_hit = false;
+    if (lane < route_count) {
+        const int64_t expert64 = route_ids[lane];
+        if (expert64 >= 0 && expert64 < experts) {
+            fast_logical_id = layer * experts + static_cast<int>(expert64);
+            const int signature = signature_of_id[fast_logical_id];
+            if (signature >= 0 && signature < signature_count) {
+                const int segment_begin = segment_offsets[signature];
+                const int segment_end = segment_offsets[signature + 1];
+                fast_slot = slot_for_id[fast_logical_id];
+                fast_hit =
+                    segment_begin >= 0 && segment_end > segment_begin &&
+                    fast_slot >= segment_begin && fast_slot < segment_end &&
+                    id_of_slot[fast_slot] == fast_logical_id;
+            }
+        }
+        unique_ids[lane] = fast_logical_id;
+        unique_slots[lane] = fast_slot;
+    }
+    __syncwarp();
+    const unsigned fast_route_mask = (1u << route_count) - 1u;
+    const unsigned fast_hit_bits = __ballot_sync(
+        0xffffffffu, lane < route_count && fast_hit);
+    if ((fast_hit_bits & fast_route_mask) == fast_route_mask) {
+        bool first_occurrence = lane < route_count;
+        if (first_occurrence) {
+            for (int prior = 0; prior < lane; ++prior) {
+                if (unique_ids[prior] == fast_logical_id) {
+                    first_occurrence = false;
+                    break;
+                }
+            }
+            route_slots[lane] = fast_slot;
+        }
+        const unsigned fast_unique_bits = __ballot_sync(
+            0xffffffffu, first_occurrence);
+        const int fast_unique_count = __popc(
+            fast_unique_bits & fast_route_mask);
+        if (lane == 0) {
+            fast_step_base = *step;
+            *step = fast_step_base + fast_unique_count;
+            counts[0] = route_count;
+            counts[1] = fast_unique_count;
+            counts[2] = fast_unique_count;
+            counts[3] = 0;
+        }
+        __syncwarp();
+        if (first_occurrence) {
+            const unsigned prior_mask = (1u << lane) - 1u;
+            const int recency_rank = __popc(
+                fast_unique_bits & prior_mask);
+            last_used[fast_slot] = fast_step_base + recency_rank + 1;
+        }
+        return;
+    }
+
+    for (int route_index = 0; route_index < route_count; ++route_index) {
+        if (lane == 0) {
+            action = -1;
+            current_slot = -1;
+            const int64_t expert64 = route_ids[route_index];
+            if (expert64 < 0 || expert64 >= experts) {
+                failed = true;
+            } else {
+                current_expert = static_cast<int>(expert64);
+                current_logical_id = layer * experts + current_expert;
+                int duplicate = -1;
+                for (int item = 0; item < unique_count; ++item) {
+                    if (unique_ids[item] == current_logical_id) {
+                        duplicate = item;
+                        break;
+                    }
+                }
+                if (duplicate >= 0) {
+                    route_slots[route_index] = unique_slots[duplicate];
+                    action = 0;
+                } else {
+                    const int signature =
+                        signature_of_id[current_logical_id];
+                    if (signature < 0 || signature >= signature_count) {
+                        failed = true;
+                    } else {
+                        segment_begin_shared = segment_offsets[signature];
+                        segment_end_shared = segment_offsets[signature + 1];
+                        if (segment_begin_shared < 0 ||
+                            segment_end_shared <= segment_begin_shared) {
+                            failed = true;
+                        } else {
+                            current_slot = slot_for_id[current_logical_id];
+                            const bool hit =
+                                current_slot >= segment_begin_shared &&
+                                current_slot < segment_end_shared &&
+                                id_of_slot[current_slot] == current_logical_id;
+                            if (hit) {
+                                ++hit_count;
+                                action = 1;
+                            } else {
+                                current_slot = -1;
+                                action = 2;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        __syncwarp();
+        if (failed)
+            break;
+
+        if (action == 2) {
+            int local_empty = INT_MAX;
+            for (int candidate = segment_begin_shared + lane;
+                 candidate < segment_end_shared;
+                 candidate += 32) {
+                bool reserved = false;
+                for (int item = 0; item < unique_count; ++item) {
+                    reserved = reserved || unique_slots[item] == candidate;
+                }
+                if (!reserved && id_of_slot[candidate] < 0)
+                    local_empty = min(local_empty, candidate);
+            }
+            // A free slot always wins. Otherwise all 32 lanes scan the exact
+            // LRU timestamps and reduce the oldest (then lowest slot) pair.
+            for (int offset = 16; offset > 0; offset >>= 1)
+                local_empty = min(
+                    local_empty,
+                    __shfl_down_sync(0xffffffffu, local_empty, offset));
+            if (lane == 0 && local_empty != INT_MAX)
+                current_slot = local_empty;
+            __syncwarp();
+
+            if (current_slot < 0) {
+                long long local_oldest = LLONG_MAX;
+                int local_slot = -1;
+                for (int candidate = segment_begin_shared + lane;
+                     candidate < segment_end_shared;
+                     candidate += 32) {
+                    bool reserved = false;
+                    for (int item = 0; item < unique_count; ++item) {
+                        reserved = reserved || unique_slots[item] == candidate;
+                    }
+                    const long long age = static_cast<long long>(
+                        last_used[candidate]);
+                    if (!reserved &&
+                        (age < local_oldest ||
+                         (age == local_oldest &&
+                          (local_slot < 0 || candidate < local_slot)))) {
+                        local_oldest = age;
+                        local_slot = candidate;
+                    }
+                }
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    const long long other_oldest = __shfl_down_sync(
+                        0xffffffffu, local_oldest, offset);
+                    const int other_slot = __shfl_down_sync(
+                        0xffffffffu, local_slot, offset);
+                    if (other_oldest < local_oldest ||
+                        (other_oldest == local_oldest && other_slot >= 0 &&
+                         (local_slot < 0 || other_slot < local_slot))) {
+                        local_oldest = other_oldest;
+                        local_slot = other_slot;
+                    }
+                }
+                if (lane == 0)
+                    current_slot = local_slot;
+            }
+            __syncwarp();
+            if (lane == 0) {
+                if (current_slot < 0) {
+                    failed = true;
+                } else {
+                    const int previous = id_of_slot[current_slot];
+                    if (previous >= 0)
+                        slot_for_id[previous] = -1;
+                    id_of_slot[current_slot] = current_logical_id;
+                    slot_for_id[current_logical_id] = current_slot;
+                    source_ids[fetch_count] = current_expert;
+                    destination_slots[fetch_count] = current_slot;
+                    ++fetch_count;
+                }
+            }
+            __syncwarp();
+            if (failed)
+                break;
+        }
+
+        if (lane == 0 && action != 0) {
+            const int64_t timestamp = ++(*step);
+            last_used[current_slot] = timestamp;
+            unique_ids[unique_count] = current_logical_id;
+            unique_slots[unique_count] = current_slot;
+            ++unique_count;
+            route_slots[route_index] = current_slot;
+        }
+        __syncwarp();
+    }
+
+    if (lane == 0) {
+        counts[1] = unique_count;
+        counts[2] = hit_count;
+        counts[3] = failed ? -1 : fetch_count;
+    }
+}
+
+bool packed_cache_plan(
+    torch::Tensor route_ids,
+    int64_t layer,
+    int64_t experts,
+    torch::Tensor signature_of_id,
+    torch::Tensor segment_offsets,
+    torch::Tensor slot_for_id,
+    torch::Tensor id_of_slot,
+    torch::Tensor last_used,
+    torch::Tensor step,
+    torch::Tensor route_slots,
+    torch::Tensor source_ids,
+    torch::Tensor destination_slots,
+    torch::Tensor counts) {
+    const std::array<torch::Tensor, 11> tensors = {
+        route_ids, signature_of_id, segment_offsets, slot_for_id, id_of_slot,
+        last_used, step, route_slots, source_ids, destination_slots, counts};
+    const int device = route_ids.get_device();
+    for (const auto& tensor : tensors) {
+        TORCH_CHECK(tensor.is_cuda(), "packed cache-plan tensors must be CUDA");
+        TORCH_CHECK(tensor.is_contiguous(),
+                    "packed cache-plan tensors must be contiguous");
+        TORCH_CHECK(tensor.get_device() == device,
+                    "packed cache-plan tensors must share one CUDA device");
+    }
+    TORCH_CHECK(route_ids.scalar_type() == at::kLong && route_ids.dim() == 1,
+                "packed cache-plan route_ids must be one-dimensional int64");
+    TORCH_CHECK(route_ids.numel() > 0 && route_ids.numel() <= 16,
+                "packed cache-plan route count must be in [1, 16]");
+    TORCH_CHECK(
+        signature_of_id.scalar_type() == at::kInt &&
+        segment_offsets.scalar_type() == at::kInt &&
+        slot_for_id.scalar_type() == at::kInt &&
+        id_of_slot.scalar_type() == at::kInt &&
+        route_slots.scalar_type() == at::kInt &&
+        source_ids.scalar_type() == at::kInt &&
+        destination_slots.scalar_type() == at::kInt &&
+        counts.scalar_type() == at::kInt,
+        "packed cache-plan index tensors must be int32");
+    TORCH_CHECK(last_used.scalar_type() == at::kLong &&
+                step.scalar_type() == at::kLong,
+                "packed cache-plan recency tensors must be int64");
+    TORCH_CHECK(layer >= 0 && experts > 0 &&
+                signature_of_id.numel() % experts == 0 &&
+                layer < signature_of_id.numel() / experts,
+                "packed cache-plan layer/expert dimensions are invalid");
+    TORCH_CHECK(segment_offsets.dim() == 1 && segment_offsets.numel() >= 2,
+                "packed cache-plan segment offsets are invalid");
+    TORCH_CHECK(slot_for_id.numel() == signature_of_id.numel() &&
+                id_of_slot.numel() == last_used.numel(),
+                "packed cache-plan ownership shapes are invalid");
+    TORCH_CHECK(step.numel() == 1 && counts.numel() >= 4,
+                "packed cache-plan scalar/count shapes are invalid");
+    const int max_routes = static_cast<int>(route_slots.numel());
+    TORCH_CHECK(max_routes >= route_ids.numel() && max_routes <= 16 &&
+                source_ids.numel() == max_routes &&
+                destination_slots.numel() == max_routes,
+                "packed cache-plan output buffers are invalid");
+
+    auto stream = at::cuda::getCurrentCUDAStream(device);
+    packed_cache_plan_kernel<<<1, 32, 0, stream>>>(
+        route_ids.data_ptr<int64_t>(),
+        static_cast<int>(route_ids.numel()),
+        static_cast<int>(layer),
+        static_cast<int>(experts),
+        signature_of_id.data_ptr<int32_t>(),
+        segment_offsets.data_ptr<int32_t>(),
+        static_cast<int>(segment_offsets.numel() - 1),
+        slot_for_id.data_ptr<int32_t>(),
+        id_of_slot.data_ptr<int32_t>(),
+        last_used.data_ptr<int64_t>(),
+        step.data_ptr<int64_t>(),
+        route_slots.data_ptr<int32_t>(),
+        source_ids.data_ptr<int32_t>(),
+        destination_slots.data_ptr<int32_t>(),
+        counts.data_ptr<int32_t>(),
+        max_routes);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return true;
+}
+
+__device__ __forceinline__ uint4 cccp_uva_load16(
+    const uint4* __restrict__ source) {
+#if defined(__HIP_PLATFORM_AMD__)
+    return *source;
+#else
+    uint32_t x, y, z, w;
+    asm volatile(
+        "ld.global.L1::no_allocate.v4.b32 {%0,%1,%2,%3},[%4];"
+        : "=r"(x), "=r"(y), "=r"(z), "=r"(w)
+        : "l"(source));
+    return make_uint4(x, y, z, w);
+#endif
+}
+
+__device__ __forceinline__ void cccp_uva_store16(
+    uint4* __restrict__ destination,
+    const uint4& value) {
+#if defined(__HIP_PLATFORM_AMD__)
+    *destination = value;
+#else
+    asm volatile(
+        "st.global.wt.v4.b32 [%0],{%1,%2,%3,%4};"
+        :
+        : "l"(destination), "r"(value.x), "r"(value.y),
+          "r"(value.z), "r"(value.w));
+#endif
+}
+
+// Fixed-grid mapped-host gather.  ``packed_cache_plan_kernel`` writes the
+// source expert ids, destination slots and device-side valid count consumed
+// here.  Every launch therefore has stable tensor addresses and is suitable
+// for CUDA Graph capture even though the route and miss count change.
+__global__ void packed_cache_uva_copy_kernel(
+    const int64_t* __restrict__ source_ptr_of_id,
+    const int64_t* __restrict__ destination_ptr_of_slot,
+    const int32_t* __restrict__ signature_of_id,
+    const int64_t* __restrict__ signature_bytes,
+    const int32_t* __restrict__ source_ids,
+    const int32_t* __restrict__ destination_slots,
+    const int32_t* __restrict__ counts,
+    const int layer,
+    const int experts,
+    const int max_routes,
+    const int blocks_per_copy) {
+    const int copy_index = static_cast<int>(blockIdx.x) / blocks_per_copy;
+    if (copy_index >= max_routes)
+        return;
+    const int fetch_count = counts[3];
+    if (fetch_count <= 0 || copy_index >= fetch_count)
+        return;
+    const int expert = source_ids[copy_index];
+    const int destination_slot = destination_slots[copy_index];
+    if (expert < 0 || expert >= experts || destination_slot < 0)
+        return;
+    const int logical_id = layer * experts + expert;
+    const int signature = signature_of_id[logical_id];
+    if (signature < 0)
+        return;
+    const int64_t source_value = source_ptr_of_id[logical_id];
+    const int64_t destination_value = destination_ptr_of_slot[destination_slot];
+    const int64_t bytes = signature_bytes[signature];
+    if (source_value == 0 || destination_value == 0 || bytes <= 0)
+        return;
+
+    const auto* source = reinterpret_cast<const uint8_t*>(source_value);
+    auto* destination = reinterpret_cast<uint8_t*>(destination_value);
+    const int block_in_copy = static_cast<int>(blockIdx.x) -
+        copy_index * blocks_per_copy;
+    const int64_t vector_count = bytes >> 4;
+    const int64_t stride =
+        static_cast<int64_t>(blocks_per_copy) * blockDim.x;
+    for (int64_t vector_index =
+             static_cast<int64_t>(block_in_copy) * blockDim.x + threadIdx.x;
+         vector_index < vector_count;
+         vector_index += stride) {
+        const int64_t offset = vector_index << 4;
+        const uint4 value = cccp_uva_load16(
+            reinterpret_cast<const uint4*>(source + offset));
+        cccp_uva_store16(
+            reinterpret_cast<uint4*>(destination + offset), value);
+    }
+    const int64_t tail_begin = vector_count << 4;
+    if (block_in_copy == 0 && threadIdx.x == 0) {
+        for (int64_t offset = tail_begin; offset < bytes; ++offset)
+            destination[offset] = source[offset];
+    }
+}
+
+bool packed_cache_uva_copy(
+    torch::Tensor source_ptr_of_id,
+    torch::Tensor destination_ptr_of_slot,
+    torch::Tensor signature_of_id,
+    torch::Tensor signature_bytes,
+    torch::Tensor source_ids,
+    torch::Tensor destination_slots,
+    torch::Tensor counts,
+    int64_t layer,
+    int64_t experts,
+    int64_t blocks_per_copy) {
+    const std::array<torch::Tensor, 7> tensors = {
+        source_ptr_of_id, destination_ptr_of_slot, signature_of_id,
+        signature_bytes, source_ids, destination_slots, counts};
+    const int device = source_ptr_of_id.get_device();
+    for (const auto& tensor : tensors) {
+        TORCH_CHECK(tensor.is_cuda(), "packed UVA-copy tensors must be CUDA");
+        TORCH_CHECK(tensor.is_contiguous(),
+                    "packed UVA-copy tensors must be contiguous");
+        TORCH_CHECK(tensor.get_device() == device,
+                    "packed UVA-copy tensors must share one CUDA device");
+    }
+    TORCH_CHECK(source_ptr_of_id.scalar_type() == at::kLong &&
+                destination_ptr_of_slot.scalar_type() == at::kLong &&
+                signature_bytes.scalar_type() == at::kLong,
+                "packed UVA-copy pointer/size tensors must be int64");
+    TORCH_CHECK(signature_of_id.scalar_type() == at::kInt &&
+                source_ids.scalar_type() == at::kInt &&
+                destination_slots.scalar_type() == at::kInt &&
+                counts.scalar_type() == at::kInt,
+                "packed UVA-copy index tensors must be int32");
+    TORCH_CHECK(layer >= 0 && experts > 0 &&
+                source_ptr_of_id.numel() % experts == 0 &&
+                layer < source_ptr_of_id.numel() / experts &&
+                signature_of_id.numel() == source_ptr_of_id.numel(),
+                "packed UVA-copy layer/expert dimensions are invalid");
+    TORCH_CHECK(source_ids.numel() > 0 && source_ids.numel() <= 16 &&
+                destination_slots.numel() == source_ids.numel() &&
+                counts.numel() >= 4,
+                "packed UVA-copy plan shapes are invalid");
+    TORCH_CHECK(blocks_per_copy > 0 && blocks_per_copy <= 128,
+                "packed UVA-copy blocks_per_copy must be in [1, 128]");
+
+    auto stream = at::cuda::getCurrentCUDAStream(device);
+    const int max_routes = static_cast<int>(source_ids.numel());
+    packed_cache_uva_copy_kernel<<<
+        max_routes * static_cast<int>(blocks_per_copy), 256, 0, stream>>>(
+        source_ptr_of_id.data_ptr<int64_t>(),
+        destination_ptr_of_slot.data_ptr<int64_t>(),
+        signature_of_id.data_ptr<int32_t>(),
+        signature_bytes.data_ptr<int64_t>(),
+        source_ids.data_ptr<int32_t>(),
+        destination_slots.data_ptr<int32_t>(),
+        counts.data_ptr<int32_t>(),
+        static_cast<int>(layer),
+        static_cast<int>(experts),
+        max_routes,
+        static_cast<int>(blocks_per_copy));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return true;
+}
+
+__global__ void packed_cache_metadata_kernel(
+    const int64_t* __restrict__ route_ids,
+    const int32_t* __restrict__ route_slots,
+    const int32_t* __restrict__ signature_of_id,
+    const int64_t* __restrict__ destination_ptr_of_slot,
+    const int64_t* __restrict__ projection_offsets,
+    const int64_t* __restrict__ metadata_of_id,
+    int64_t* __restrict__ output,
+    const int layer,
+    const int experts,
+    const int route_count,
+    const int metadata_rows,
+    const int projection_count) {
+    const int item = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int total = route_count * metadata_rows;
+    if (item >= total)
+        return;
+    const int row = item / route_count;
+    const int route_index = item - row * route_count;
+    const int expert = static_cast<int>(route_ids[route_index]);
+    if (expert < 0 || expert >= experts) {
+        output[item] = 0;
+        return;
+    }
+    const int logical_id = layer * experts + expert;
+    int64_t value = metadata_of_id[
+        static_cast<int64_t>(logical_id) * metadata_rows + row];
+    if (row < projection_count * 5 && row % 5 == 0) {
+        const int slot = route_slots[route_index];
+        const int signature = signature_of_id[logical_id];
+        if (slot < 0 || signature < 0) {
+            value = 0;
+        } else {
+            value = destination_ptr_of_slot[slot] + projection_offsets[
+                static_cast<int64_t>(signature) * projection_count + row / 5];
+        }
+    }
+    output[item] = value;
+}
+
+bool packed_cache_metadata(
+    torch::Tensor route_ids,
+    torch::Tensor route_slots,
+    torch::Tensor signature_of_id,
+    torch::Tensor destination_ptr_of_slot,
+    torch::Tensor projection_offsets,
+    torch::Tensor metadata_of_id,
+    torch::Tensor output,
+    int64_t layer,
+    int64_t experts) {
+    const std::array<torch::Tensor, 7> tensors = {
+        route_ids, route_slots, signature_of_id, destination_ptr_of_slot,
+        projection_offsets, metadata_of_id, output};
+    const int device = route_ids.get_device();
+    for (const auto& tensor : tensors) {
+        TORCH_CHECK(tensor.is_cuda(), "packed cache-metadata tensors must be CUDA");
+        TORCH_CHECK(tensor.is_contiguous(),
+                    "packed cache-metadata tensors must be contiguous");
+        TORCH_CHECK(tensor.get_device() == device,
+                    "packed cache-metadata tensors must share one CUDA device");
+    }
+    TORCH_CHECK(route_ids.scalar_type() == at::kLong &&
+                destination_ptr_of_slot.scalar_type() == at::kLong &&
+                projection_offsets.scalar_type() == at::kLong &&
+                metadata_of_id.scalar_type() == at::kLong &&
+                output.scalar_type() == at::kLong,
+                "packed cache-metadata values must be int64");
+    TORCH_CHECK(route_slots.scalar_type() == at::kInt &&
+                signature_of_id.scalar_type() == at::kInt,
+                "packed cache-metadata indices must be int32");
+    const int route_count = static_cast<int>(route_ids.numel());
+    TORCH_CHECK(route_ids.dim() == 1 && route_count > 0 && route_count <= 16 &&
+                route_slots.numel() >= route_count,
+                "packed cache-metadata route shapes are invalid");
+    TORCH_CHECK(projection_offsets.dim() == 2 &&
+                (projection_offsets.size(1) == 2 ||
+                 projection_offsets.size(1) == 3),
+                "packed cache-metadata projection offsets are invalid");
+    TORCH_CHECK(layer >= 0 && experts > 0 &&
+                signature_of_id.numel() % experts == 0 &&
+                layer < signature_of_id.numel() / experts,
+                "packed cache-metadata layer/expert dimensions are invalid");
+    TORCH_CHECK(metadata_of_id.dim() == 2 &&
+                metadata_of_id.size(0) == signature_of_id.numel() &&
+                output.dim() == 2 &&
+                output.size(0) == metadata_of_id.size(1) &&
+                output.size(1) == route_count,
+                "packed cache-metadata table/output shapes are invalid");
+
+    auto stream = at::cuda::getCurrentCUDAStream(device);
+    const int metadata_rows = static_cast<int>(output.size(0));
+    const int total = route_count * metadata_rows;
+    packed_cache_metadata_kernel<<<(total + 127) / 128, 128, 0, stream>>>(
+        route_ids.data_ptr<int64_t>(),
+        route_slots.data_ptr<int32_t>(),
+        signature_of_id.data_ptr<int32_t>(),
+        destination_ptr_of_slot.data_ptr<int64_t>(),
+        projection_offsets.data_ptr<int64_t>(),
+        metadata_of_id.data_ptr<int64_t>(),
+        output.data_ptr<int64_t>(),
+        static_cast<int>(layer),
+        static_cast<int>(experts),
+        route_count,
+        metadata_rows,
+        static_cast<int>(projection_offsets.size(1)));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return true;
+}
+
 torch::Tensor packed_moe_topk_grouped_stub(
     torch::Tensor input,
     torch::Tensor token_ids,
@@ -19954,6 +23403,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dense_vq_gemv_grouped_fp8_codebook",
           &dense_vq_gemv_grouped_fp8_codebook,
           "Grouped GGUF-style BF16 Decode directly from packed VQ");
+    m.def("dense_vq_gemv_packed_fp8_codebook",
+          &dense_vq_gemv_packed_fp8_codebook,
+          "Single-projection GEMV directly from packed VQ and E4M3 codebook");
+    m.def("dense_vq_gemv_packed_q8_codebook",
+          &dense_vq_gemv_packed_q8_codebook,
+          "Single-projection DP4A GEMV directly from packed VQ and Q8 codebook");
     m.def("dense_vq_dequant_fp8_packed", &dense_vq_dequant_fp8_packed,
         "Expand packed VQ to FP8 rows with a single tensor scale.");
     m.def("dense_vq_compile_int4_g64", &dense_vq_compile_int4_g64,
@@ -19970,6 +23425,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Expand packed VQ through a pre-quantized E4M3/INT8 codebook");
     m.def("dense_fp8_quantize_rows", &dense_fp8_quantize_rows,
           "Row-wise BF16/F32 to E4M3 activation conversion");
+    m.def("gated_activation_fp8_quantize_rows",
+          &gated_activation_fp8_quantize_rows,
+          "Fused gated BF16 activation and row-wise E4M3 conversion");
+    m.def("routed_weighted_reduce", &routed_weighted_reduce,
+          "Fused routed row reorder, weight and Top-K reduction");
     m.def("kimi_short_conv3", &kimi_short_conv3,
           "Kimi three-way one-token short convolution");
     m.def("qwen35_conv1d_update", &qwen35_conv1d_update,
@@ -19993,6 +23453,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &packed_moe_topk,
           "Packed 8/9/10/12/14/16-bit Top-K routed expert MLP");
     m.def(
+          "packed_moe_topk_compact_fp8_codebook",
+          &packed_moe_topk_compact_fp8_codebook,
+          "Top-K MoE directly from compact VQ and E4M3 codebooks");
+    m.def(
+          "packed_moe_topk_compact_q8_codebook",
+          &packed_moe_topk_compact_q8_codebook,
+          "Top-K MoE directly from compact VQ and Q8 codebooks");
+    m.def(
+          "compact_q8_codebook_l2_prefetch",
+          &compact_q8_codebook_l2_prefetch,
+          "Prefetch selected compact Q8 codebooks into L2");
+    m.def(
           "vq_projection_dequant",
           &vq_projection_dequant,
           "Dequantize packed three-projection experts to dense BF16");
@@ -20012,6 +23484,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "packed_route_slots_out",
           &packed_route_slots_out,
           "Gather stable packed expert slot metadata on CUDA");
+    m.def("packed_cache_plan",
+          &packed_cache_plan,
+          "Plan signature-segmented packed expert LRU entirely on CUDA");
+    m.def("packed_cache_uva_copy",
+          &packed_cache_uva_copy,
+          "Copy planned packed expert misses from mapped host RAM on CUDA");
+    m.def("packed_cache_metadata",
+          &packed_cache_metadata,
+          "Publish planned packed expert metadata entirely on CUDA");
     m.def(
           "packed_h2d_batch",
           &packed_h2d_batch,
@@ -20114,6 +23595,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Sigmoid corrected Top-K with normalized route weights");
     m.def("sigmoid_route_out", &sigmoid_route_out,
           "Sigmoid route into caller-owned decode buffers");
+    m.def("sqrtsoftplus_route_out", &sqrtsoftplus_route_out,
+          "Sqrt-softplus route into caller-owned decode buffers");
     m.def(
           "linear_sigmoid_route_out",
           &linear_sigmoid_route_out,

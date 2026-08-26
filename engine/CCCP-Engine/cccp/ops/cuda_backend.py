@@ -626,6 +626,37 @@ def _persistent_topk_exact(**kwargs):
     values = kwargs.get("values")
     indices = kwargs.get("indices")
     with torch.cuda.device(scores.device):
+        if top_k == int(scores.shape[-1]):
+            # Selecting the complete fixed-width candidate set is an identity
+            # operation.  Sorting all 512 Indexer entries emitted five CUDA
+            # kernels per layer even though sparse attention is permutation
+            # invariant.  Preserve the exact value/index set in two fixed-
+            # workspace writes and leave partial Top-K on the vendor kernel.
+            if values is None:
+                selected_values = scores.clone()
+            else:
+                values.copy_(scores)
+                selected_values = values
+            if indices is None:
+                base = torch.arange(
+                    top_k, dtype=torch.long, device=scores.device
+                )
+                selected_indices = base.view(
+                    *((1,) * (scores.ndim - 1)), top_k
+                ).expand(*scores.shape[:-1], top_k)
+            else:
+                if indices.numel() != top_k:
+                    raise ValueError(
+                        "full-width persistent Top-K requires one candidate row"
+                    )
+                torch.arange(
+                    top_k,
+                    dtype=torch.long,
+                    device=scores.device,
+                    out=indices.reshape(-1),
+                )
+                selected_indices = indices
+            return selected_values, selected_indices
         selected_values, selected_indices = torch.topk(
             scores,
             top_k,
@@ -753,30 +784,23 @@ def _gated_activation(**kwargs):
 
 
 def _route_topk_sqrtsoftplus(**kwargs):
+    from ..fusedext import sqrtsoftplus_route_fused
+
     logits = kwargs["logits"]
-    bias = kwargs["bias"]
-    mask = kwargs["mask"]
     output_buffers = kwargs.get("output_buffers")
-    if (
-        not logits.is_cuda
-        or logits.dtype != torch.float32
-        or bias.dtype != torch.float32
-        or mask.dtype != torch.bool
-        or output_buffers is None
-    ):
+    if output_buffers is None:
         return None
     output_weights, output_indices = output_buffers
     with torch.cuda.device(logits.device):
-        scores = F.softplus(logits).sqrt()
-        choice = scores.add(bias).masked_fill(~mask[None], -1e30)
-        indices = choice.topk(int(kwargs["top_k"]), dim=-1).indices
-        weights = scores.gather(1, indices)
-        if kwargs["normalize"]:
-            weights.div_(weights.sum(dim=-1, keepdim=True) + 1e-20)
-        weights.mul_(float(kwargs["scaling"]))
-        output_indices.copy_(indices)
-        output_weights.copy_(weights)
-    return output_weights, output_indices
+        return sqrtsoftplus_route_fused(
+            logits,
+            kwargs["bias"],
+            kwargs["mask"],
+            int(kwargs["top_k"]),
+            bool(kwargs["normalize"]),
+            float(kwargs["scaling"]),
+            (output_weights, output_indices),
+        )
 
 
 def register(registry: OperatorRegistry) -> None:

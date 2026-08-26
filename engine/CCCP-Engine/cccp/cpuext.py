@@ -378,6 +378,11 @@ def _configure_bundled_windows_toolchain(*, force: bool = False) -> bool:
     toolchain_environment = {
         "DISTUTILS_USE_SDK": "1",
         "MSSdk": "1",
+        # torch.utils.cpp_extension otherwise calls setuptools' private
+        # _get_vc_env and replaces this complete portable INCLUDE/LIB set
+        # with whatever Visual Studio happens to be installed on the host.
+        "VSCMD_ARG_HOST_ARCH": "x64",
+        "VSCMD_ARG_TGT_ARCH": "x64",
         "VisualStudioVersion": "17.0",
         "VCINSTALLDIR": vc_root + os.sep,
         "VCToolsInstallDir": msvc_root + os.sep,

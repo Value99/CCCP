@@ -31,6 +31,7 @@ from .kimi_ops import (
 )
 from .precision import compute_dtype
 from .prefill import (
+    begin_prefill_block,
     end_prefill_block,
     prefill_block_size_with_legacy,
     run_prefill_blocks,
@@ -6069,6 +6070,7 @@ class KimiK3CCCPModel:
             raise RuntimeError(
                 f"context exceeds max_ctx ({self.pos + len(values)} > {self.max_ctx})"
             )
+        begin_prefill_block(self.pool)
         config = self.config
         tokens = len(values)
         hidden = self.embed(values)
@@ -6129,9 +6131,10 @@ class KimiK3CCCPModel:
             config.rms_eps,
             self.w(f"{_ROOT}.model.norm.weight"),
         )
-        # 块级收尾：释放 run_rows 在本块保留的专家展开工作区（Kimi 的
-        # arena 相位由 engine/自身调度管理，这里不触发 decode 重建）。
-        end_prefill_block(self.pool, restore_decode=False)
+        # 块级收尾：释放 Prefill 工作区并恢复覆盖全部 packed 签名的
+        # Decode arena。否则受限显存场景的首个生成 token 仍会访问仅为
+        # 当前 Prefill 层规划的槽池，缺失签名时直接 KeyError。
+        end_prefill_block(self.pool)
         self.pos += tokens
         self.last_layer_profile = []
         self.last_cuda_profile = {}
@@ -7515,14 +7518,17 @@ class KimiK3CCCPModel:
                 return block_hidden[-1:].clone()
             return block_hidden
 
-        outputs = run_prefill_blocks(
-            values,
-            evaluate_block,
-            block_size=block,
-        )
-        # 块级收尾：释放 run_rows 在本块保留的专家展开工作区（TP 各 rank 的
-        # arena 相位由池自身管理，这里不触发 decode 重建）。
-        end_prefill_block(self.pool, restore_decode=False)
+        begin_prefill_block(self.pool)
+        try:
+            outputs = run_prefill_blocks(
+                values,
+                evaluate_block,
+                block_size=block,
+            )
+        finally:
+            # The public phase API owns the packed arena lifecycle for every
+            # projection-VQ model.  Restore Decode even when a TP block fails.
+            end_prefill_block(self.pool)
         self.last_prefill_stats["moe_rows"] = (
             int(getattr(self.pool, "prefill_batch_rows", 0))
             - pool_before[0]

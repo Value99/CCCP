@@ -98,6 +98,21 @@ def _operator_cache_identity(
     return module_name, build_directory, backend, arch
 
 
+def _stage_operator_source(source: str | Path, build_directory: Path) -> Path:
+    """Stage CUDA/HIP source beside Ninja outputs.
+
+    NVIDIA's Windows compiler can terminate without a diagnostic when the
+    original launcher path contains non-ASCII characters.  The operator
+    cache is writable and version-keyed, so compile the exact same bytes from
+    there while retaining the original source digest as the cache identity.
+    """
+    source_path = Path(source)
+    staged = build_directory / source_path.name
+    if not staged.is_file() or staged.read_bytes() != source_path.read_bytes():
+        shutil.copy2(source_path, staged)
+    return staged
+
+
 def _load_extension_binary(module_name: str, binary: Path):
     """Load one exact Python extension binary without invoking a compiler."""
     spec = importlib.util.spec_from_file_location(module_name, binary)
@@ -250,6 +265,82 @@ def _ensure_ninja_on_path() -> None:
         os.environ["PATH"] = bin_dir + (os.pathsep + current if current else "")
 
 
+def _packaged_cuda_root(
+    site_packages: str | Path | None = None,
+) -> Path | None:
+    """Locate the pip-bundled CUDA 13 toolkit on Windows or Linux."""
+    if site_packages is not None:
+        candidates = [Path(site_packages)]
+    else:
+        prefix = Path(sys.prefix)
+        candidates = [prefix / "Lib" / "site-packages"]
+        candidates.extend(sorted(
+            (prefix / "lib").glob("python*/site-packages"),
+            reverse=True,
+        ))
+    for candidate in candidates:
+        cuda_root = candidate / "nvidia" / "cu13"
+        if any(
+            (cuda_root / "bin" / executable).is_file()
+            for executable in ("nvcc.exe", "nvcc")
+        ):
+            return cuda_root
+    return None
+
+
+def _prepend_environment_path(name: str, directory: Path) -> None:
+    if not directory.is_dir():
+        return
+    value = str(directory)
+    current = os.environ.get(name, "")
+    paths = current.split(os.pathsep) if current else []
+    normalized = {os.path.normcase(os.path.abspath(path)) for path in paths}
+    if os.path.normcase(os.path.abspath(value)) not in normalized:
+        os.environ[name] = value + (os.pathsep + current if current else "")
+
+
+def _versioned_cuda_library(cuda_root: str | Path, stem: str) -> Path | None:
+    """Resolve a pip CUDA library even when its unversioned symlink is absent."""
+    root = Path(cuda_root)
+    for directory in (root / "lib", root / "lib64"):
+        unversioned = directory / stem
+        if unversioned.is_file():
+            return unversioned
+        candidates = sorted(
+            (path for path in directory.glob(stem + ".*") if path.is_file()),
+            key=lambda path: path.name,
+            reverse=True,
+        )
+        if candidates:
+            return candidates[0]
+    return None
+
+
+def _ensure_linux_cuda_linker_shim(
+    cuda_root: str | Path,
+    build_directory: str | Path,
+) -> Path:
+    """Provide the unversioned names expected by cpp_extension on Linux."""
+    shim = Path(build_directory) / "cuda-linker"
+    shim.mkdir(parents=True, exist_ok=True)
+    for stem in ("libcudart.so", "libcublas.so"):
+        target = _versioned_cuda_library(cuda_root, stem)
+        if target is None:
+            raise RuntimeError(f"离线 CUDA 13 环境缺少 {stem}")
+        link = shim / stem
+        try:
+            if link.is_symlink() and link.resolve() == target.resolve():
+                continue
+            link.unlink(missing_ok=True)
+            link.symlink_to(target.resolve())
+        except OSError:
+            # GNU ld also accepts a tiny linker script. This fallback keeps a
+            # read-only/no-symlink filesystem usable without copying cuBLAS.
+            escaped = str(target.resolve()).replace('"', '\\"')
+            link.write_text(f'INPUT("{escaped}")\n', encoding="utf-8")
+    return shim
+
+
 def _configure_packaged_gpu_toolchain() -> None:
     """Expose pip-bundled CUDA/ROCm compilers before cpp_extension imports."""
     site_packages = os.path.join(sys.prefix, "Lib", "site-packages")
@@ -273,19 +364,24 @@ def _configure_packaged_gpu_toolchain() -> None:
                     if os.path.isdir(directory):
                         _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(directory))
         return
-    cuda_root = os.path.join(site_packages, "nvidia", "cu13")
-    if os.path.isfile(os.path.join(cuda_root, "bin", "nvcc.exe")):
+    packaged_cuda = _packaged_cuda_root()
+    if packaged_cuda is not None:
+        cuda_root = str(packaged_cuda)
         os.environ["CUDA_HOME"] = cuda_root
         os.environ["CUDA_PATH"] = cuda_root
-        cuda_bins = [
-            os.path.join(cuda_root, "bin"),
-            os.path.join(cuda_root, "bin", "x86_64"),
-        ]
-        os.environ["PATH"] = os.pathsep.join(cuda_bins) + os.pathsep + os.environ.get("PATH", "")
+        cuda_bins = [packaged_cuda / "bin"]
+        if os.name == "nt":
+            cuda_bins.append(packaged_cuda / "bin" / "x86_64")
+        for directory in reversed(cuda_bins):
+            _prepend_environment_path("PATH", directory)
+        if os.name != "nt":
+            _prepend_environment_path("LD_LIBRARY_PATH", packaged_cuda / "lib")
+            _prepend_environment_path("LIBRARY_PATH", packaged_cuda / "lib")
+            _prepend_environment_path("CPATH", packaged_cuda / "include")
         if os.name == "nt" and hasattr(os, "add_dll_directory"):
             for directory in cuda_bins:
-                if os.path.isdir(directory):
-                    _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(directory))
+                if directory.is_dir():
+                    _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(str(directory)))
 
 
 def _launcher_root() -> Path:
@@ -756,12 +852,44 @@ def _build(verbose: bool = False):
         # DLL otherwise compiles but fails at the final Windows link step.
         extra_ldflags: list[str] = []
         if torch.version.hip is None:
-            extra_ldflags.append(
-                _ensure_windows_cublas_import_library()
-                if os.name == "nt" else "-lcublas"
-            )
+            if os.name == "nt":
+                extra_ldflags.append(_ensure_windows_cublas_import_library())
+            else:
+                cuda_root = Path(os.environ.get("CUDA_HOME", ""))
+                linker_shim = _ensure_linux_cuda_linker_shim(
+                    cuda_root, build_directory
+                )
+                extra_ldflags.extend([
+                    f"-L{linker_shim}",
+                    "-lcublas",
+                    f"-Wl,-rpath,{cuda_root / 'lib'}",
+                    f"-Wl,-rpath,{cpp_extension.TORCH_LIB_PATH}",
+                ])
         extra_cflags = ["-std=c++20"] if torch.version.hip is not None else None
         extra_include_paths = None
+        if os.name == "nt":
+            # NVCC's Windows host-compiler bridge does not reliably forward
+            # an INCLUDE value whose launcher root contains non-ASCII text.
+            # Publish the already validated portable MSVC/UCRT paths as
+            # explicit -I arguments as well.  Keep them confined to the
+            # bundled toolchain so a system SDK can never enter the build.
+            toolchain_root = (_launcher_root() / "toolchain").resolve()
+            portable_includes = []
+            for entry in os.environ.get("INCLUDE", "").split(os.pathsep):
+                if not entry or not os.path.isdir(entry):
+                    continue
+                resolved = Path(entry).resolve()
+                if resolved.is_relative_to(toolchain_root):
+                    portable_includes.append(str(resolved))
+            if not portable_includes:
+                raise RuntimeError("离线包内置 MSVC/Windows SDK 头文件不完整")
+            extra_include_paths = portable_includes
+            for entry in os.environ.get("LIB", "").split(os.pathsep):
+                if not entry or not os.path.isdir(entry):
+                    continue
+                resolved = Path(entry).resolve()
+                if resolved.is_relative_to(toolchain_root):
+                    extra_ldflags.append("/LIBPATH:" + str(resolved))
         if torch.version.hip is not None:
             # Header-only rocThrust/hipCUB/rocPRIM are extracted during the
             # AMD environment build to a compact, relocation-safe directory.
@@ -769,10 +897,11 @@ def _build(verbose: bool = False):
                 os.path.join(sys.prefix, "..", "devinclude")
             )
             if os.path.isdir(compact_headers):
-                extra_include_paths = [compact_headers]
+                extra_include_paths = (extra_include_paths or []) + [compact_headers]
         backend_label = "AMD-HIP" if torch.version.hip is not None else "NVIDIA-CUDA"
+        staged_source = _stage_operator_source(src, build_directory)
         with operator_build_progress(backend_label) as build_progress:
-            _EXT = load(name=module_name, sources=[src],
+            _EXT = load(name=module_name, sources=[str(staged_source)],
                         extra_cflags=extra_cflags,
                         extra_cuda_cflags=extra_cuda_cflags,
                         extra_ldflags=extra_ldflags,
@@ -830,6 +959,9 @@ def install_prebuilt() -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     if source_binary != destination.resolve():
         shutil.copy2(source_binary, destination)
+    for obsolete in destination.parent.glob("cccp_vq_gpu_v15_*.pyd"):
+        if obsolete.resolve() != destination.resolve():
+            obsolete.unlink()
     return destination
 
 
@@ -877,6 +1009,58 @@ if _EXT is not None:
             metadata.contiguous(),
             int(total_rows),
         )
+
+    def dense_vq_gemv_packed_fp8_codebook_fused(
+        x_rows: torch.Tensor,
+        payload: torch.Tensor,
+        codebook: torch.Tensor,
+        codebook_scale: float,
+        rows: int,
+        blocks: int,
+        bits: int,
+    ) -> torch.Tensor:
+        """Direct dot from compact VQ indices and an E4M3 codebook.
+
+        This primitive never creates an expanded FP8/BF16 weight row.
+        """
+        if codebook.dtype != torch.float8_e4m3fn:
+            raise ValueError("compact codebook GEMV requires E4M3 codebook")
+        return _EXT.dense_vq_gemv_packed_fp8_codebook(
+            x_rows.to(torch.bfloat16).contiguous(),
+            payload.contiguous().reshape(-1),
+            codebook.contiguous(),
+            float(codebook_scale),
+            int(rows),
+            int(blocks),
+            int(bits),
+        )
+
+    def dense_vq_gemv_packed_q8_codebook_fused(
+        x_rows: torch.Tensor,
+        payload: torch.Tensor,
+        codebook: torch.Tensor,
+        codebook_scale: float,
+        rows: int,
+        blocks: int,
+        bits: int,
+    ) -> torch.Tensor:
+        """Lookup+DP4A directly from compact indices and a Q8 codebook.
+
+        Only the small codebook is quantized.  No decoded expert row or
+        complete INT8/FP8 weight matrix is materialized.
+        """
+        if codebook.dtype != torch.int8:
+            raise ValueError("compact codebook DP4A requires INT8 codebook")
+        return _EXT.dense_vq_gemv_packed_q8_codebook(
+            x_rows.to(torch.bfloat16).contiguous(),
+            payload.contiguous().reshape(-1),
+            codebook.contiguous(),
+            float(codebook_scale),
+            int(rows),
+            int(blocks),
+            int(bits),
+        )
+
 
 
     def dense_vq_dequant_fp8_packed_fused(
@@ -1057,6 +1241,81 @@ if _EXT is not None:
         ):
             return None
         return _EXT.dense_fp8_quantize_rows(value, output, scales)
+
+    def gated_activation_fp8_quantize_rows_fused(
+        gate_up: torch.Tensor,
+        output: torch.Tensor,
+        scales: torch.Tensor,
+        *,
+        activation: str,
+        beta: float,
+        linear_beta: float | None,
+        limit: float = 0.0,
+    ) -> torch.Tensor | None:
+        """Fuse Gate/Up activation and row-wise E4M3 conversion."""
+
+        normalized = activation.strip().lower()
+        if (
+            not gate_up.is_cuda
+            or gate_up.dtype != torch.bfloat16
+            or gate_up.ndim != 2
+            or gate_up.shape[1] % 2
+            or not gate_up.is_contiguous()
+            or not output.is_cuda
+            or output.dtype != torch.float8_e4m3fn
+            or output.shape != (gate_up.shape[0], gate_up.shape[1] // 2)
+            or not output.is_contiguous()
+            or not scales.is_cuda
+            or scales.dtype != torch.float32
+            or scales.shape != (gate_up.shape[0], 1)
+            or not scales.is_contiguous()
+            or normalized not in {"silu", "swiglu", "situ"}
+        ):
+            return None
+        return _EXT.gated_activation_fp8_quantize_rows(
+            gate_up,
+            output,
+            scales,
+            1 if normalized == "situ" else 0,
+            float(beta),
+            -1.0 if linear_beta is None else float(linear_beta),
+            float(limit),
+        )
+
+    def routed_weighted_reduce_fused(
+        rows: torch.Tensor,
+        sorted_positions: torch.Tensor,
+        weights: torch.Tensor,
+        inverse: torch.Tensor,
+        output: torch.Tensor,
+        *,
+        top_k: int,
+    ) -> torch.Tensor | None:
+        """Restore token order and reduce routed rows without atomics."""
+
+        if (
+            not rows.is_cuda
+            or rows.dtype != torch.bfloat16
+            or rows.ndim != 2
+            or not rows.is_contiguous()
+            or sorted_positions.dtype != torch.long
+            or sorted_positions.ndim != 1
+            or weights.dtype != torch.float32
+            or weights.ndim != 1
+            or inverse.dtype != torch.long
+            or inverse.ndim != 1
+            or output.dtype != torch.float32
+            or output.ndim != 2
+        ):
+            return None
+        return _EXT.routed_weighted_reduce(
+            rows,
+            sorted_positions.contiguous(),
+            weights.contiguous(),
+            inverse,
+            output,
+            int(top_k),
+        )
 
     def short_conv3_fused(
         query: torch.Tensor,
@@ -1386,6 +1645,134 @@ if _EXT is not None:
             int(projection_layout_tag),
         )
 
+    def packed_moe_topk_compact_fp8_codebook_fused(
+        value: torch.Tensor,
+        route_ids: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: torch.Tensor,
+        scales: torch.Tensor,
+        activation: str,
+        beta: float,
+        linear_beta: float,
+        limit: float,
+        hidden_workspace: torch.Tensor,
+        out_workspace: torch.Tensor,
+        result: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Run Top-K MoE without materializing full E4M3 expert weights."""
+        activation_kind = {
+            "situ": 0,
+            "silu": 1,
+            "swiglu": 1,
+        }.get(str(activation).strip().lower())
+        if (
+            activation_kind is None
+            or not value.is_cuda
+            or value.dtype != torch.bfloat16
+            or value.shape[0] != 1
+            or route_ids.dtype != torch.long
+            or route_ids.ndim != 1
+            or not 0 < route_ids.numel() <= 16
+            or weights.dtype != torch.float32
+            or weights.shape != route_ids.shape
+            or metadata.dtype != torch.long
+            or metadata.shape != (15, route_ids.numel())
+            or scales.dtype != torch.float32
+            or scales.shape != (route_ids.numel(), 3)
+        ):
+            return None
+        return _EXT.packed_moe_topk_compact_fp8_codebook(
+            value.contiguous(),
+            route_ids.contiguous(),
+            weights.contiguous(),
+            metadata.contiguous(),
+            scales.contiguous(),
+            int(activation_kind),
+            float(beta),
+            float(linear_beta),
+            float(limit),
+            hidden_workspace,
+            out_workspace,
+            result,
+        )
+
+    def packed_moe_topk_compact_q8_codebook_fused(
+        value: torch.Tensor,
+        route_ids: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: torch.Tensor,
+        scales: torch.Tensor,
+        activation: str,
+        beta: float,
+        linear_beta: float,
+        limit: float,
+        gate_quant_workspace: torch.Tensor,
+        down_quant_workspace: torch.Tensor,
+        hidden_workspace: torch.Tensor,
+        out_workspace: torch.Tensor,
+        result: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Run Top-K MoE with packed indices and compact Q8 codebooks."""
+        activation_kind = {
+            "situ": 0,
+            "silu": 1,
+            "swiglu": 1,
+        }.get(str(activation).strip().lower())
+        if (
+            activation_kind is None
+            or not value.is_cuda
+            or value.dtype != torch.bfloat16
+            or value.shape[0] != 1
+            or route_ids.dtype != torch.long
+            or route_ids.ndim != 1
+            or not 0 < route_ids.numel() <= 16
+            or weights.dtype != torch.float32
+            or weights.shape != route_ids.shape
+            or metadata.dtype != torch.long
+            or metadata.shape != (15, route_ids.numel())
+            or scales.dtype != torch.float32
+            or scales.shape != (route_ids.numel(), 3)
+            or gate_quant_workspace.dtype != torch.uint8
+            or gate_quant_workspace.ndim != 2
+            or gate_quant_workspace.shape[0] != route_ids.numel()
+            or down_quant_workspace.dtype != torch.uint8
+            or down_quant_workspace.ndim != 2
+            or down_quant_workspace.shape[0] != route_ids.numel()
+        ):
+            return None
+        return _EXT.packed_moe_topk_compact_q8_codebook(
+            value.contiguous(),
+            route_ids.contiguous(),
+            weights.contiguous(),
+            metadata.contiguous(),
+            scales.contiguous(),
+            int(activation_kind),
+            float(beta),
+            float(linear_beta),
+            float(limit),
+            gate_quant_workspace,
+            down_quant_workspace,
+            hidden_workspace,
+            out_workspace,
+            result,
+        )
+
+    def compact_q8_codebook_l2_prefetch_fused(
+        metadata: torch.Tensor,
+    ) -> bool:
+        """Queue route-local Q8 codebook L2 hints on the current stream."""
+        if (
+            not metadata.is_cuda
+            or metadata.dtype != torch.long
+            or metadata.ndim != 2
+            or metadata.shape[0] != 15
+            or not 0 < metadata.shape[1] <= 16
+        ):
+            return False
+        return bool(
+            _EXT.compact_q8_codebook_l2_prefetch(metadata.contiguous())
+        )
+
     def packed_stage_topk_three_projection_fused(
         route_ids: torch.Tensor,
         metadata: torch.Tensor,
@@ -1488,6 +1875,151 @@ if _EXT is not None:
         if any(target.device != device for target in destinations):
             return False
         return bool(_EXT.packed_h2d_batch(sources, destinations))
+
+    def packed_cache_plan_fused(
+        route_ids: torch.Tensor,
+        layer: int,
+        experts: int,
+        signature_of_id: torch.Tensor,
+        segment_offsets: torch.Tensor,
+        slot_for_id: torch.Tensor,
+        id_of_slot: torch.Tensor,
+        last_used: torch.Tensor,
+        step: torch.Tensor,
+        route_slots: torch.Tensor,
+        source_ids: torch.Tensor,
+        destination_slots: torch.Tensor,
+        counts: torch.Tensor,
+    ) -> bool:
+        """Update the fixed packed-expert cache plan entirely on the GPU."""
+        tensors = (
+            route_ids,
+            signature_of_id,
+            segment_offsets,
+            slot_for_id,
+            id_of_slot,
+            last_used,
+            step,
+            route_slots,
+            source_ids,
+            destination_slots,
+            counts,
+        )
+        if (
+            not 0 < route_ids.numel() <= 16
+            or route_ids.dtype != torch.long
+            or route_ids.ndim != 1
+            or not all(tensor.is_cuda for tensor in tensors)
+            or not all(tensor.is_contiguous() for tensor in tensors)
+            or len({tensor.device for tensor in tensors}) != 1
+        ):
+            return False
+        return bool(
+            _EXT.packed_cache_plan(
+                route_ids,
+                int(layer),
+                int(experts),
+                signature_of_id,
+                segment_offsets,
+                slot_for_id,
+                id_of_slot,
+                last_used,
+                step,
+                route_slots,
+                source_ids,
+                destination_slots,
+                counts,
+            )
+        )
+
+    def packed_cache_uva_copy_fused(
+        source_ptr_of_id: torch.Tensor,
+        destination_ptr_of_slot: torch.Tensor,
+        signature_of_id: torch.Tensor,
+        signature_bytes: torch.Tensor,
+        source_ids: torch.Tensor,
+        destination_slots: torch.Tensor,
+        counts: torch.Tensor,
+        layer: int,
+        experts: int,
+        blocks_per_copy: int = 32,
+    ) -> bool:
+        """Gather planned expert misses from mapped host RAM on the GPU."""
+        tensors = (
+            source_ptr_of_id,
+            destination_ptr_of_slot,
+            signature_of_id,
+            signature_bytes,
+            source_ids,
+            destination_slots,
+            counts,
+        )
+        if (
+            source_ids.numel() <= 0
+            or source_ids.numel() > 16
+            or not all(tensor.is_cuda for tensor in tensors)
+            or not all(tensor.is_contiguous() for tensor in tensors)
+            or len({tensor.device for tensor in tensors}) != 1
+        ):
+            return False
+        return bool(
+            _EXT.packed_cache_uva_copy(
+                source_ptr_of_id,
+                destination_ptr_of_slot,
+                signature_of_id,
+                signature_bytes,
+                source_ids,
+                destination_slots,
+                counts,
+                int(layer),
+                int(experts),
+                int(blocks_per_copy),
+            )
+        )
+
+    def packed_cache_metadata_fused(
+        route_ids: torch.Tensor,
+        route_slots: torch.Tensor,
+        signature_of_id: torch.Tensor,
+        destination_ptr_of_slot: torch.Tensor,
+        projection_offsets: torch.Tensor,
+        metadata_of_id: torch.Tensor,
+        output: torch.Tensor,
+        layer: int,
+        experts: int,
+    ) -> bool:
+        """Build route metadata from logical ids and stable packed slots."""
+        tensors = (
+            route_ids,
+            route_slots,
+            signature_of_id,
+            destination_ptr_of_slot,
+            projection_offsets,
+            metadata_of_id,
+            output,
+        )
+        if (
+            not 0 < route_ids.numel() <= 16
+            or route_ids.dtype != torch.long
+            or route_ids.ndim != 1
+            or not all(tensor.is_cuda for tensor in tensors)
+            or not all(tensor.is_contiguous() for tensor in tensors)
+            or len({tensor.device for tensor in tensors}) != 1
+        ):
+            return False
+        return bool(
+            _EXT.packed_cache_metadata(
+                route_ids,
+                route_slots,
+                signature_of_id,
+                destination_ptr_of_slot,
+                projection_offsets,
+                metadata_of_id,
+                output,
+                int(layer),
+                int(experts),
+            )
+        )
 
     def moe_mlp_slots_fused(
         x_rows: torch.Tensor,
@@ -2360,6 +2892,56 @@ if _EXT is not None:
             int(top_k),
         )
         return weights, indices
+
+    def sqrtsoftplus_route_fused(
+        logits: torch.Tensor,
+        bias: torch.Tensor,
+        mask: torch.Tensor,
+        top_k: int,
+        normalize: bool,
+        routed_scaling: float,
+        output_buffers: tuple[
+            torch.Tensor,
+            torch.Tensor,
+        ] | None = None,
+    ):
+        """Fuse sqrt-softplus scoring, corrected Top-K and normalization."""
+        if (
+            not logits.is_cuda
+            or logits.dtype != torch.float32
+            or logits.dim() != 2
+            or logits.shape[0] != 1
+            or bias.dtype != torch.float32
+            or mask.dtype != torch.bool
+            or bias.numel() != logits.shape[1]
+            or mask.numel() != logits.shape[1]
+            or top_k <= 0
+            or top_k > 16
+            or output_buffers is None
+        ):
+            return None
+        weights, indices = output_buffers
+        if (
+            weights.dtype != torch.float32
+            or weights.shape != (1, top_k)
+            or indices.dtype != torch.long
+            or indices.shape != (1, top_k)
+            or any(
+                tensor.device != logits.device
+                for tensor in (bias, mask, weights, indices)
+            )
+        ):
+            return None
+        return _EXT.sqrtsoftplus_route_out(
+            logits.contiguous(),
+            bias.contiguous(),
+            mask.contiguous(),
+            int(top_k),
+            bool(normalize),
+            float(routed_scaling),
+            weights,
+            indices,
+        )
 
     def route_topk_sigmoid_fused(
         logits: torch.Tensor,
@@ -4126,6 +4708,13 @@ else:
     def dense_vq_gemv_grouped_fp8_codebook_fused(*args, **kwargs):
         raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")
 
+    def dense_vq_gemv_packed_fp8_codebook_fused(*args, **kwargs):
+        raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")
+
+    def dense_vq_gemv_packed_q8_codebook_fused(*args, **kwargs):
+        raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")
+
+
 
     def dense_vq_dequant_fp8_packed_fused(*args, **kwargs):
         raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")
@@ -4141,6 +4730,12 @@ else:
         raise RuntimeError(f"{_EXTENSION_NAME} 扩展不可用：{_ERR}")
 
     def dense_fp8_quantize_rows_fused(*args, **kwargs):
+        return None
+
+    def gated_activation_fp8_quantize_rows_fused(*args, **kwargs):
+        return None
+
+    def routed_weighted_reduce_fused(*args, **kwargs):
         return None
 
     def kda_recurrent_fused(*args, **kwargs):
@@ -4170,6 +4765,15 @@ else:
     def packed_moe_topk_fused(*args, **kwargs):
         return None
 
+    def packed_moe_topk_compact_fp8_codebook_fused(*args, **kwargs):
+        return None
+
+    def packed_moe_topk_compact_q8_codebook_fused(*args, **kwargs):
+        return None
+
+    def compact_q8_codebook_l2_prefetch_fused(*args, **kwargs):
+        return False
+
     def projection_dequant_fused(*args, **kwargs):
         return None
 
@@ -4183,6 +4787,15 @@ else:
         return False
 
     def packed_h2d_batch_fused(*args, **kwargs):
+        return False
+
+    def packed_cache_plan_fused(*args, **kwargs):
+        return False
+
+    def packed_cache_uva_copy_fused(*args, **kwargs):
+        return False
+
+    def packed_cache_metadata_fused(*args, **kwargs):
         return False
 
     def moe_mlp_slots_fused(
@@ -4330,6 +4943,9 @@ else:
     def dsv4_route_post_fused(
         scores, bias, mask, top_k
     ):
+        return None
+
+    def sqrtsoftplus_route_fused(*args, **kwargs):
         return None
 
     def route_topk_sigmoid_fused(

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections import OrderedDict, deque
 from dataclasses import dataclass
-from typing import Hashable, Iterable
+from typing import Hashable, Iterable, Mapping, Sequence
 
 import torch
 
@@ -139,6 +139,189 @@ class SlotBook:
 
     def owner(self, slot: int) -> ExpertKey | None:
         return self._owners[slot]
+
+
+@dataclass(frozen=True)
+class SegmentedCachePlan:
+    """Fixed-shape result produced by one device-cache planning step.
+
+    The production CUDA kernel writes equivalent tensors in place.  Tuples are
+    used here so the CPU reference is deterministic and easy to compare in
+    tests without becoming another runtime cache implementation.
+    """
+
+    num_routes: int
+    num_unique: int
+    num_hits: int
+    num_fetch: int
+    route_slots: tuple[int, ...]
+    src_ids: tuple[int, ...]
+    evict_slots: tuple[int, ...]
+
+
+class SegmentedCacheReference:
+    """Exact CPU oracle for the graph-resident heterogeneous expert LRU.
+
+    Recency is global across layers while physical victims stay inside the
+    compatible packed-signature segment.  This class is deliberately not used
+    by production inference; the CUDA controller is validated against it.
+    """
+
+    def __init__(
+        self,
+        *,
+        n_layers: int,
+        n_experts: int,
+        signature_of_id: Sequence[int],
+        slots_per_signature: Mapping[int, int],
+        max_routes: int,
+    ):
+        self.n_layers = int(n_layers)
+        self.n_experts = int(n_experts)
+        self.max_routes = int(max_routes)
+        if self.n_layers <= 0 or self.n_experts <= 0:
+            raise ValueError("cache dimensions must be positive")
+        if self.max_routes <= 0:
+            raise ValueError("max_routes must be positive")
+        expected = self.n_layers * self.n_experts
+        self.signature_of_id = tuple(int(value) for value in signature_of_id)
+        if len(self.signature_of_id) != expected:
+            raise ValueError(
+                "signature_of_id must contain one entry per logical expert"
+            )
+
+        offset = 0
+        self._segments: dict[int, range] = {}
+        self._signature_for_slot: list[int] = []
+        for signature, raw_count in sorted(
+            (int(key), int(value))
+            for key, value in slots_per_signature.items()
+        ):
+            if raw_count <= 0:
+                raise ValueError("each signature segment must have slots")
+            segment = range(offset, offset + raw_count)
+            self._segments[signature] = segment
+            self._signature_for_slot.extend([signature] * raw_count)
+            offset += raw_count
+        missing = set(self.signature_of_id) - self._segments.keys()
+        if missing:
+            raise ValueError(
+                "missing slot segment for signatures: "
+                + ", ".join(str(value) for value in sorted(missing))
+            )
+
+        self._slot_for_id = [-1] * expected
+        self._id_of_slot = [-1] * offset
+        self._last_used = [0] * offset
+        self._step = 0
+
+    def _logical_id(self, layer: int, expert: int) -> int:
+        layer = int(layer)
+        expert = int(expert)
+        if layer < 0 or layer >= self.n_layers:
+            raise IndexError(f"layer out of range: {layer}")
+        if expert < 0 or expert >= self.n_experts:
+            raise IndexError(f"expert out of range: {expert}")
+        return layer * self.n_experts + expert
+
+    def slot_for(self, layer: int, expert: int) -> int:
+        return self._slot_for_id[self._logical_id(layer, expert)]
+
+    def signature_for_slot(self, slot: int) -> int:
+        return self._signature_for_slot[int(slot)]
+
+    def _touch(self, slot: int) -> None:
+        self._step += 1
+        self._last_used[slot] = self._step
+
+    def plan(
+        self,
+        layer: int,
+        expert_ids: Sequence[int],
+    ) -> SegmentedCachePlan:
+        route = tuple(int(expert) for expert in expert_ids)
+        if len(route) > self.max_routes:
+            raise ValueError(
+                f"route count {len(route)} exceeds max_routes={self.max_routes}"
+            )
+        logical_route = tuple(
+            self._logical_id(layer, expert) for expert in route
+        )
+        unique_logical = tuple(dict.fromkeys(logical_route))
+
+        required: dict[int, int] = {}
+        for logical in unique_logical:
+            signature = self.signature_of_id[logical]
+            required[signature] = required.get(signature, 0) + 1
+        for signature, count in required.items():
+            capacity = len(self._segments[signature])
+            if count > capacity:
+                raise RuntimeError(
+                    "simultaneous routes exceed compatible signature segment: "
+                    f"signature={signature}, need={count}, have={capacity}"
+                )
+
+        assigned: dict[int, int] = {}
+        reserved_slots: set[int] = set()
+        misses: list[tuple[int, int]] = []
+        hits = 0
+        for logical in unique_logical:
+            existing = self._slot_for_id[logical]
+            if existing >= 0:
+                hits += 1
+                assigned[logical] = existing
+                reserved_slots.add(existing)
+                self._touch(existing)
+                continue
+
+            signature = self.signature_of_id[logical]
+            segment = self._segments[signature]
+            free = next(
+                (
+                    slot for slot in segment
+                    if self._id_of_slot[slot] < 0
+                    and slot not in reserved_slots
+                ),
+                None,
+            )
+            if free is None:
+                candidates = [
+                    slot for slot in segment if slot not in reserved_slots
+                ]
+                if not candidates:
+                    raise RuntimeError(
+                        "simultaneous routes cannot share one cache slot"
+                    )
+                free = min(
+                    candidates,
+                    key=lambda slot: (self._last_used[slot], slot),
+                )
+            previous = self._id_of_slot[free]
+            if previous >= 0:
+                self._slot_for_id[previous] = -1
+            self._id_of_slot[free] = logical
+            self._slot_for_id[logical] = free
+            assigned[logical] = free
+            reserved_slots.add(free)
+            self._touch(free)
+            misses.append((logical, free))
+
+        route_slots = [assigned[logical] for logical in logical_route]
+        route_slots.extend([-1] * (self.max_routes - len(route_slots)))
+        src_ids = [logical % self.n_experts for logical, _slot in misses]
+        evict_slots = [slot for _logical, slot in misses]
+        padding = self.max_routes - len(misses)
+        src_ids.extend([-1] * padding)
+        evict_slots.extend([-1] * padding)
+        return SegmentedCachePlan(
+            num_routes=len(route),
+            num_unique=len(unique_logical),
+            num_hits=hits,
+            num_fetch=len(misses),
+            route_slots=tuple(route_slots),
+            src_ids=tuple(src_ids),
+            evict_slots=tuple(evict_slots),
+        )
 
 
 @dataclass(frozen=True)

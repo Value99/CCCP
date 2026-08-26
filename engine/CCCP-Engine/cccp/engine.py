@@ -322,16 +322,24 @@ def _safe_expert_budget(*, limit_bytes: int, allocated_bytes: int,
     return max(int(min_bytes), min(int(requested_bytes), room))
 
 
-def _use_hip_short_reset_decode(token_count: int) -> bool:
-    """Select fused Decode for a tiny AMD prompt starting from empty KV.
+def _use_short_reset_decode(pool, token_count: int) -> bool:
+    """Use exact Decode when a pool declares batch Prefill disruptive.
 
-    The short prompt has too few rows to amortize Windows HIP grouped-Prefill
-    setup and its final asynchronous synchronization boundary. Decode is the
-    production kernel used immediately afterwards and advances the identical
-    KV state. The HIP-only 16-token boundary leaves CUDA, CPU and 4096-token
-    long-context Prefill unchanged.
+    Bounded hybrid pools keep a much larger hot-expert arena for Decode than
+    for long batch Prefill.  Repartitioning that arena for a tiny prompt costs
+    more than executing the prompt through the ordinary exact Decode kernel
+    and also destroys the cache needed by generation.  Full-resident HIP
+    retains its established 16-token rule without changing CUDA full-resident
+    or CPU scheduling.
     """
-    return torch.version.hip is not None and 0 < int(token_count) <= 16
+    limit = max(0, int(getattr(pool, "short_reset_decode_tokens", 0)))
+    if (
+        limit == 0
+        and torch.version.hip is not None
+        and bool(getattr(pool, "full_resident", False))
+    ):
+        limit = 16
+    return 0 < int(token_count) <= limit
 
 
 def _initial_expert_vram_request_gb(
@@ -1800,8 +1808,17 @@ class Engine:
         """Build canonical DSV4 state independently of request boundaries."""
         self.reset()
         pool = getattr(self.model, "pool", None)
-        if manage_arena:
+        short_exact_decode = _use_short_reset_decode(pool, baseline_len)
+        arena_active = False
+        if short_exact_decode:
+            # A freshly loaded bounded pool starts in its long-Prefill layout.
+            # Initialize the Decode layout once before the exact short path;
+            # activate_decode_arena is idempotent once the runtime directory
+            # is valid, so subsequent short prompts retain their hot slots.
+            end_prefill_block(pool)
+        elif manage_arena:
             begin_prefill_block(pool)
+            arena_active = True
         # A reset prompt is canonical batch prefill, not incremental replay.
         # The old one-token seed followed by ``_dsv4_prefill_range`` forced
         # every remaining prompt token through a complete 43-layer decode and
@@ -1810,17 +1827,16 @@ class Engine:
         # exact layer-first batch implementation (4096-token outer blocks for
         # long prompts), while the conservative sequential primitive remains
         # in place for live/rollback suffixes whose KV begins at pos > 0.
-        hip_short_decode = _use_hip_short_reset_decode(baseline_len)
         try:
-            if hip_short_decode:
+            if short_exact_decode:
                 # ``reset`` above deliberately removed the KV state. Allocate
                 # it once, then let the normal compiled Decode path commit
                 # every short-prompt token in order. This is a scheduler, not
                 # a numerical fallback: all resident experts stay GPU-only.
                 self.model._alloc(1)
                 print(
-                    "[cccp-prefill] scheduler=hip-short-fused-decode "
-                    f"tokens={baseline_len}; resident_experts=GPU-only; H2D=0",
+                    "[cccp-prefill] scheduler=short-exact-decode "
+                    f"tokens={baseline_len}; arena=decode-preserved",
                     flush=True,
                 )
                 logits = self._with_kv_capacity_retry(
@@ -1837,7 +1853,7 @@ class Engine:
             # layouts.  Restore the large heat/previous-route arena only after
             # the expanded BF16 expert scratch has been released.  A failed
             # Prefill also restores it so the next request starts cleanly.
-            if manage_arena:
+            if arena_active:
                 end_prefill_block(pool)
         if self.model.pos != baseline_len:
             raise RuntimeError(
@@ -1853,8 +1869,8 @@ class Engine:
                 )
             )
             scheduler = (
-                "hip-short-fused-decode"
-                if hip_short_decode
+                "short-exact-decode"
+                if short_exact_decode
                 else "batched-layer-first"
             )
             print(
@@ -1863,8 +1879,8 @@ class Engine:
                 flush=True,
             )
         self.model._last_prefill_scheduler = (
-            "hip-short-fused-decode"
-            if hip_short_decode
+            "short-exact-decode"
+            if short_exact_decode
             else "batched-layer-first"
         )
         return logits
@@ -2105,27 +2121,14 @@ class Engine:
             return logits, snapshot_bytes
 
         pool = getattr(self.model, "pool", None)
-        try:
-            short_decode_limit = max(
-                0,
-                int(os.environ.get(
-                    "CCCP_DSV4_SHORT_PREFILL_DECODE_TOKENS",
-                    "16",
-                )),
-            )
-        except (TypeError, ValueError):
-            short_decode_limit = 16
-        if strategy == "full":
-            batch_arena_required = True
-        else:
-            planned_ranges = []
-            if start < baseline_len:
-                planned_ranges.append(baseline_len - start)
-            if baseline_len < len(ids):
-                planned_ranges.append(len(ids) - baseline_len)
-            batch_arena_required = any(
-                count > short_decode_limit for count in planned_ranges
-            )
+        # Only a fresh long prompt uses the batch-Prefill arena. Live and
+        # rollback suffixes always use the exact Decode executor, while a
+        # short reset can explicitly keep the existing Decode layout through
+        # the pool capability above. No environment tuning switch is needed.
+        batch_arena_required = bool(
+            strategy == "full"
+            and not _use_short_reset_decode(pool, baseline_len)
+        )
         arena_active = False
         try:
             if batch_arena_required:

@@ -3234,6 +3234,7 @@ class ExpertPool:
         self.ram: OrderedDict[tuple[int, int], tuple[VQWeight, VQWeight]] = OrderedDict()
         self.bytes = 0
         self.ram_bytes = 0
+        self._host_pinned_bytes = 0
         self.hits = 0
         self.miss = 0
         self.stage = PinnedStage(self.device) if self.gpu else None
@@ -3908,15 +3909,17 @@ class ExpertPool:
         复制整个模型。
         """
         if not self.gpu or not self.pinned:
+            self._host_pinned_bytes = 0
             return 0.0
+        total = sum(g.nbytes + d.nbytes for g, d in self.pinned.values())
         if budget_gb is None:
             raw = os.environ.get("CCCP_HOST_PIN_GB", "auto").strip().lower()
             if raw in ("", "auto"):
                 import psutil
-                total = sum(g.nbytes + d.nbytes for g, d in self.pinned.values())
                 avail = psutil.virtual_memory().available
                 reserve = 2 * 2**30
                 if avail < total + reserve:
+                    self._host_pinned_bytes = 0
                     print("[cccp] 锁页专家内存自动关闭："
                           f"可用 {avail / 2**30:.1f}GB < 专家 {total / 2**30:.1f}GB"
                           f" + 安全余量 {reserve / 2**30:.1f}GB",
@@ -3930,6 +3933,7 @@ class ExpertPool:
         else:
             budget = max(0, int(budget_gb * 2**30))
         if budget == 0:
+            self._host_pinned_bytes = 0
             return 0.0
 
         import time as _time
@@ -3960,6 +3964,7 @@ class ExpertPool:
         print(f"[cccp] 锁页专家内存完成：{pinned_count} 个 / "
               f"{pinned_bytes / 2**30:.1f}GB（{_time.time() - t0:.1f}s）",
               flush=True)
+        self._host_pinned_bytes = pinned_bytes
         if pinned_bytes >= total:
             print(
                 "[cccp-dma] mode=direct-pinned cpu_bridge=disabled "

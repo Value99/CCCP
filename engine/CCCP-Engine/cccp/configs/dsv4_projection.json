@@ -22,8 +22,6 @@
     "CCCP_DENSE_BF16": "none",
     "CCCP_FUSED": "1",
     "CCCP_PROJECTION_FUSED": "1",
-    "CCCP_PROJECTION_TILE_VIEW": "0",
-    "CCCP_PROJECTION_TILE_FUSED": "0",
     "CCCP_PROJECTION_DOWN_REDUCE": "0",
     "CCCP_STATIC_DECODE_GRAPHS": "1",
     "CCCP_STATIC_FFN_GRAPH": "1",
@@ -77,18 +75,6 @@
         "CCCP_SINGLE_GPU_LAYER_GRAPH": "0",
         "CCCP_DSV4_TOKEN_GRAPH": "0",
         "CCCP_TP_LAYER_GRAPH": "0"
-      }
-    },
-    "resident_tile_experimental": {
-      "description": "Marlin式静态packed tile view与两段Top-K融合实验；仅用于CLI回归，不替代更快的resident基线",
-      "tp": 1,
-      "environment": {
-        "CCCP_PACKED_FULL_GPU": "1",
-        "CCCP_RAM_MIRROR": "0",
-        "CCCP_DENSE_BF16": "all",
-        "CCCP_SINGLE_GPU_LAYER_GRAPH": "1",
-        "CCCP_PROJECTION_TILE_VIEW": "1",
-        "CCCP_PROJECTION_TILE_FUSED": "1"
       }
     },
     "parallel": {

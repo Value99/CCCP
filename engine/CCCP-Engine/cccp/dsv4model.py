@@ -54,6 +54,36 @@ _DENSE_BF16_ALIASES = {
 }
 
 
+def _resolve_native_tensor_fp8_execution(
+    mode: str,
+    *,
+    available: bool,
+) -> bool:
+    """Resolve the public fixed-projection Tensor-FP8 policy exactly.
+
+    ``auto`` is capability based.  Explicit ``on`` is strict so an
+    unsupported machine never grows a hidden BF16 execution image or silently
+    changes the requested compute route.
+    """
+
+    normalized = str(mode).strip().lower()
+    if normalized in ("", "auto"):
+        return bool(available)
+    if normalized in ("0", "false", "off", "no", "none"):
+        return False
+    if normalized in ("1", "true", "on", "yes"):
+        if not available:
+            raise RuntimeError(
+                "CCCP_GPU_FP8_EXECUTION=on，但当前硬件/运行时不支持 "
+                "Tensor Core E4M3 scaled-MM"
+            )
+        return True
+    raise ValueError(
+        "CCCP_GPU_FP8_EXECUTION 仅支持 auto/on/off，"
+        f"当前值为 {mode!r}"
+    )
+
+
 def _automatic_prefetch_policy(
     *,
     resident_all: bool,
@@ -176,6 +206,93 @@ def _prefill_sliding_window(
     if values.shape[:3] != (batch, query_count, window):
         raise RuntimeError("invalid block-prefill sliding-window shape")
     return values, valid
+
+
+def _flashmla_prefill_kv_and_indices(
+    ring_values: torch.Tensor,
+    ring_positions: torch.Tensor,
+    current_values: torch.Tensor,
+    pos0: int,
+    compressed_values: torch.Tensor | None,
+    selected_positions: torch.Tensor | None,
+    selected_valid: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Publish exact sparse-Prefill KV rows without a gathered value tensor.
+
+    FlashMLA consumes one compact KV bank and an int32 index list per query.
+    The first bank segment keeps the fixed sliding-window ring, the second the
+    current causal block, and the optional third the compressed history.  This
+    replaces the old ``[T, window/top-k, D]`` gathers and their four einsums.
+    """
+
+    if ring_values.ndim != 3 or current_values.ndim != 3:
+        raise ValueError("FlashMLA Prefill expects [B,T,D] KV tensors")
+    batch, window, width = ring_values.shape
+    if batch != 1 or current_values.shape[0] != 1:
+        raise ValueError("FlashMLA sparse Prefill currently requires batch=1")
+    tokens = int(current_values.shape[1])
+    if tokens <= 0 or int(current_values.shape[2]) != int(width):
+        raise ValueError("FlashMLA Prefill received an invalid current block")
+    device = current_values.device
+    query_positions = torch.arange(
+        int(pos0), int(pos0) + tokens, device=device, dtype=torch.long
+    )
+    offsets = torch.arange(
+        window - 1, -1, -1, device=device, dtype=torch.long
+    )
+    key_positions = query_positions[:, None] - offsets[None, :]
+    current_mask = key_positions >= int(pos0)
+    current_indices = window + key_positions - int(pos0)
+    ring_slots = key_positions.remainder(window)
+    ring_valid = ring_positions[0].index_select(
+        0, ring_slots.reshape(-1)
+    ).view(tokens, window) == key_positions
+    raw_valid = (
+        (key_positions >= 0)
+        & (
+            current_mask
+            | ring_valid
+        )
+    )
+    raw_indices = torch.where(
+        current_mask,
+        current_indices,
+        ring_slots,
+    )
+    raw_indices = torch.where(
+        raw_valid,
+        raw_indices,
+        torch.full_like(raw_indices, -1),
+    )
+
+    banks = [
+        ring_values[0].to(torch.bfloat16),
+        current_values[0].to(torch.bfloat16),
+    ]
+    index_parts = [raw_indices]
+    if compressed_values is not None:
+        if compressed_values.ndim != 3 or compressed_values.shape[0] != 1:
+            raise ValueError("compressed FlashMLA KV must be [1,S,D]")
+        compressed_count = int(compressed_values.shape[1])
+        banks.append(compressed_values[0].to(torch.bfloat16))
+        if selected_positions is None:
+            raise ValueError("compressed FlashMLA KV requires sparse indices")
+        compressed_indices = selected_positions[0].long() + window + tokens
+        valid = (
+            (selected_positions[0] >= 0)
+            & (selected_positions[0] < compressed_count)
+        )
+        if selected_valid is not None:
+            valid &= selected_valid[0]
+        compressed_indices = torch.where(
+            valid,
+            compressed_indices,
+            torch.full_like(compressed_indices, -1),
+        )
+        index_parts.append(compressed_indices)
+    kv_bank = torch.cat(banks, dim=0).unsqueeze(1).contiguous()
+    indices = torch.cat(index_parts, dim=1).unsqueeze(1).to(torch.int32)
+    return kv_bank, indices.contiguous()
 
 
 def _tp1_token_graph_bucket(
@@ -1332,9 +1449,17 @@ class DSV4CCCPModel:
                 device=str(self.device),
                 ram_gb=cache_gb if gpu else 0.0,
             )
+        self._hybrid_fixed_token_graph = bool(
+            self._single_gpu_layer_graph_requested
+            and not self._packed_full_gpu
+            and getattr(self.pool, "fixed_token_graph_candidate", False)
+        )
         self._single_gpu_layer_graph = bool(
             self._single_gpu_layer_graph_requested
-            and self._packed_full_gpu
+            and (
+                self._packed_full_gpu
+                or self._hybrid_fixed_token_graph
+            )
         )
         if (
             torch.version.hip is not None
@@ -1367,9 +1492,8 @@ class DSV4CCCPModel:
             os.environ.setdefault("CCCP_TP_LAYER_GRAPH", "1")
         elif self._single_gpu_layer_graph_requested:
             print(
-                "[cccp] RAM+VRAM packed experts keep dynamic slot assignment; "
-                "using the safe fixed Attention projection packet instead of "
-                "capturing stale expert pointers",
+                "[cccp] packed pool lacks the fixed device-cache graph "
+                "capability; TP1 TokenGraph is unavailable",
                 flush=True,
             )
         # Benchmark/API diagnostics must distinguish a real all-rank packed
@@ -1409,6 +1533,7 @@ class DSV4CCCPModel:
         self._cpu_fused_resident_moe: dict[int, object | bool] = {}
         self._cpu_head_group = None
         self._tp_shared_mlp = None
+        self._heterogeneous_shared_mlp = None
         self._tp_router = None
         self._tp_moe_finalizer = None
         self._tp_collective = None
@@ -1464,6 +1589,7 @@ class DSV4CCCPModel:
         self._tp1_token_logits: dict[str, torch.Tensor] = {}
         self._tp1_graph_dependencies: list[object] = []
         self._tp1_graph_build_error: str | None = None
+        self._tp1_pool_graph_generation = -1
         self.tp_token_graph_info: dict[str, object] = {}
         self._tp_states_ready = False
         self._tp_stage_profile: dict[str, object] = {}
@@ -1530,30 +1656,37 @@ class DSV4CCCPModel:
                                         half=os.environ.get("CCCP_INT4_HALF", "0") == "1")
                 else:
                     native_fp8_mode = os.environ.get(
-                        "CCCP_GPU_FP8_EXECUTION", "off"
+                        "CCCP_GPU_FP8_EXECUTION", "auto"
                     ).strip().lower()
-                    native_fp8_requested = native_fp8_mode not in (
-                        "", "0", "false", "off", "none"
-                    )
                     # Grouped O-LoRA consumes independent input rows.  Its
                     # existing BF16 grouped operator is already a single
                     # launch, whereas splitting it into scalar scaled-MM
                     # calls would regress.  Keep that capability on BF16
                     # until the public grouped tensor-FP8 row kernel exists.
                     grouped_o_projection = ".attn.wo_a" in name
-                    if (
-                        use_bf16
-                        and native_fp8_requested
-                        and isinstance(wt, BlockFP8Weight)
+                    native_fp8_candidate = (
+                        isinstance(wt, BlockFP8Weight)
                         and not grouped_o_projection
-                    ):
+                    )
+                    native_fp8_enabled = (
+                        native_fp8_candidate
+                        and _resolve_native_tensor_fp8_execution(
+                            native_fp8_mode,
+                            available=BlockFP8Weight.native_tensor_fp8_available(
+                                self.device
+                            ),
+                        )
+                    )
+                    if native_fp8_enabled:
                         compact = wt.to(self.device)
                         compiled = compact.compile_gpu_tensor_fp8()
-                        if compiled.layout == "tensor-fp8":
-                            wt = compiled
-                            self._native_tensor_fp8_weights += 1
-                        else:
-                            wt = wt.to(self.device, dtype=torch.bfloat16)
+                        if compiled.layout != "tensor-fp8":
+                            raise RuntimeError(
+                                "native Tensor-FP8 compile returned "
+                                f"unexpected layout {compiled.layout!r}"
+                            )
+                        wt = compiled
+                        self._native_tensor_fp8_weights += 1
                     else:
                         wt = wt.to(
                             self.device, dtype=torch.bfloat16
@@ -1722,6 +1855,10 @@ class DSV4CCCPModel:
                     int(win), dtype=torch.int32, device=device
                 ).view(1, 1, -1)
                 st["sparse_features"] = sparse_features
+                # Sparse Prefill also accelerates the five uncompressed
+                # sliding-window layers, so every layer owns a runner.  The
+                # decode scheduler metadata remains lazy and shape-specific.
+                st["sparse_runner"] = FlashMLASparseRunner.create()
             if ratio:
                 st["compressed"] = PagedKV(
                     batch=B,
@@ -1738,7 +1875,6 @@ class DSV4CCCPModel:
                         page_items=min(256, max_compressed),
                         device=device,
                     )
-                    st["sparse_runner"] = FlashMLASparseRunner.create()
                 if ratio == 4:
                     st["indexer"] = IndexerState(
                         batch=B,
@@ -2098,6 +2234,7 @@ class DSV4CCCPModel:
                 for layer in range(int(self.cfg["n_layers"]))
             }
         self._prepare_tp_shared_mlp()
+        self._prepare_heterogeneous_shared_mlp()
         self._prepare_single_gpu_static_graphs()
         self._prepare_tp_decode_metadata()
         if extreme_resident_all is not None:
@@ -2236,6 +2373,97 @@ class DSV4CCCPModel:
             flush=True,
         )
 
+    def _prepare_heterogeneous_shared_mlp(self) -> None:
+        """Keep exact shared experts on CPU for GPU-routed overlap.
+
+        This path is capability based: a single CUDA device, a dynamic packed
+        expert pool, exact Block-FP8 shared projections, and the public CPU
+        fused operator.  It is intentionally disabled for full-resident/TP,
+        HIP and Windows paths until their host-mapping contracts provide the
+        same routed prelaunch boundary.
+        """
+
+        # The current Python-coordinated CPU/GPU branch is a diagnostics-only
+        # implementation.  It is exact, but it adds one host rendezvous per
+        # layer and regresses H20 Decode.  Keep it explicitly opt-in until the
+        # stream-memory-op persistent worker replaces that rendezvous.
+        enabled = os.environ.get(
+            "CCCP_HETEROGENEOUS_SHARED", "0"
+        ).strip().lower()
+        if enabled in ("0", "false", "off", "none"):
+            return
+        if (
+            self.device.type != "cuda"
+            or torch.version.hip is not None
+            or os.name == "nt"
+            or self.tp_size != 1
+            or not self._packed_device_pool
+            or self._packed_full_gpu
+            or not self.store.man.projection_vq
+        ):
+            return
+        from . import cpuext
+        from .kernels import BlockFP8Weight
+        from .ops.heterogeneous import HeterogeneousSharedExpertExecutor
+
+        status = cpuext.extension_status()
+        if not bool(status.get("available")):
+            if enabled not in ("", "auto"):
+                raise RuntimeError(
+                    "heterogeneous shared expert requires the fused CPU "
+                    f"operator: {status.get('error')}"
+                )
+            print(
+                "[cccp-heterogeneous] CPU shared disabled: "
+                f"{status.get('error')}",
+                flush=True,
+            )
+            return
+        executor = HeterogeneousSharedExpertExecutor(
+            device=self.device,
+            hidden_size=int(self.cfg["hidden"]),
+            dtype=torch.bfloat16,
+        )
+
+        def owned_exact(weight: BlockFP8Weight) -> BlockFP8Weight:
+            # Block-major is an exact byte permutation.  Clone both payload
+            # and scales because Engine releases the dense mmap after preload.
+            optimized = weight.to_block_major()
+            return BlockFP8Weight(
+                optimized.q.clone(),
+                optimized.s.clone(),
+                optimized.cols,
+                optimized.block,
+                rows=optimized.rows,
+                layout=optimized.layout,
+            )
+
+        retained = 0
+        for layer in range(int(self.cfg["n_layers"])):
+            prefix = f"layers.{layer}.ffn.shared_experts"
+            weights = [
+                self.store.get_dense(f"{prefix}.w{index}.weight")
+                for index in (1, 3, 2)
+            ]
+            if not all(isinstance(weight, BlockFP8Weight) for weight in weights):
+                if enabled not in ("", "auto"):
+                    raise RuntimeError(
+                        "heterogeneous shared expert requires exact "
+                        "Block-FP8 weights"
+                    )
+                return
+            exact = [owned_exact(weight) for weight in weights]
+            retained += sum(weight.nbytes for weight in exact)
+            executor.add_layer(layer, exact[0], exact[1], exact[2])
+        self._heterogeneous_shared_mlp = executor
+        print(
+            "[cccp-heterogeneous] shared=CPU exact Block-FP8；"
+            "routed=GPU packed；schedule=parallel-DAG；"
+            f"threads={status.get('threads')}；"
+            f"host_resident={retained / 2**30:.2f}GiB",
+            flush=True,
+        )
+
     def _prepare_single_gpu_static_graphs(self) -> None:
         """Capture exact TP1 work around the dynamic packed-expert boundary.
 
@@ -2331,12 +2559,15 @@ class DSV4CCCPModel:
             ):
                 limit = float(self.cfg.get("swiglu_limit", 0.0))
 
+                include_shared = self._heterogeneous_shared_mlp is None
+
                 def ffn(
                     *,
                     item=weights,
                     item_cfg=base_cfg,
                     layer_index=layer,
                     activation_limit=limit,
+                    compute_shared=include_shared,
                 ):
                     normalized, post, comb = _hc_pre_norm_cccp(
                         source,
@@ -2347,11 +2578,6 @@ class DSV4CCCPModel:
                         item_cfg,
                     )
                     rows = normalized.reshape(1, hidden)
-                    shared = _shared_expert_mlp_cccp(
-                        rows,
-                        item,
-                        activation_limit,
-                    )
                     route_weights, route_ids = self._route_cccp(
                         rows.float(),
                         item,
@@ -2359,11 +2585,24 @@ class DSV4CCCPModel:
                         token,
                         layer_index,
                     )
+                    if compute_shared:
+                        shared = _shared_expert_mlp_cccp(
+                            rows,
+                            item,
+                            activation_limit,
+                        )
+                        return (
+                            normalized,
+                            post,
+                            comb,
+                            shared,
+                            route_weights,
+                            route_ids,
+                        )
                     return (
                         normalized,
                         post,
                         comb,
-                        shared,
                         route_weights,
                         route_ids,
                     )
@@ -2375,6 +2614,7 @@ class DSV4CCCPModel:
                         pool=pool,
                     ),
                     "source": source,
+                    "includes_shared": include_shared,
                 }
         print(
             "[cccp] TP1 fixed decode packets ready: "
@@ -2889,6 +3129,56 @@ class DSV4CCCPModel:
             flush=True,
         )
 
+    def _ensure_hybrid_tp1_graph_runtime(self) -> None:
+        """Lazily bind the dynamic packed cache into the common TP1 graph.
+
+        DSV4 starts with a wider, temporary Prefill arena.  Registered-host UVA
+        and the device segmented LRU become authoritative only after that arena
+        switches to Decode.  Build expert child graphs at that point, and
+        rebuild the parent graph if KV pressure later resizes the same slab.
+        """
+
+        if not getattr(self, "_hybrid_fixed_token_graph", False):
+            return
+        activate = getattr(self.pool, "activate_decode_arena", None)
+        if activate is None:
+            raise RuntimeError(
+                "hybrid TP1 TokenGraph requires a Decode arena capability"
+            )
+        activate()
+        if not getattr(self.pool, "fixed_token_graph_capable", False):
+            raise RuntimeError(
+                "hybrid TP1 TokenGraph requires Linux registered-host UVA, "
+                "device segmented LRU and compact Q8 Decode"
+            )
+        prepare = getattr(self.pool, "prepare_fixed_token_graphs", None)
+        if prepare is None or not prepare(
+            activation=self.operator_config.expert_activation,
+            activation_beta=float(self.cfg.get("situ_beta", 4.0)),
+            activation_linear_beta=self.cfg.get("situ_linear_beta"),
+            limit=float(self.cfg.get("swiglu_limit", 0.0)),
+        ):
+            raise RuntimeError("hybrid fixed expert graph construction failed")
+        generation = int(getattr(self.pool, "fixed_graph_generation", -1))
+        if (
+            generation == self._tp1_pool_graph_generation
+            and self._tp_moe_finalizer is not None
+        ):
+            return
+        if self._tp1_token_graphs:
+            with torch.cuda.device(self.device):
+                torch.cuda.synchronize(self.device)
+            self._tp1_token_graphs.clear()
+            self._tp1_token_logits.clear()
+            self._tp1_graph_dependencies.clear()
+            self.tp_token_graph_info = {}
+        self._tp1_graph_build_error = None
+        self._tp_route_packed_plan = None
+        self._tp_moe_finalizer = None
+        self._tp_collective = None
+        self._prepare_tp_packed_finalizer()
+        self._tp1_pool_graph_generation = generation
+
     def forward(self, ids: list[int]) -> torch.Tensor:
         """前向一段 token（prefill 或单步 decode），返回最后位置 logits [vocab]。"""
         t = torch.tensor([ids], device=self.device)
@@ -3269,9 +3559,21 @@ class DSV4CCCPModel:
                     precomputed_shared
                     if precomputed_shared is not None
                     else (
-                        self._tp_shared_mlp.run(layer, x_rows)
-                        if self._tp_shared_mlp is not None and B * T == 1
-                        else _shared_expert_mlp_cccp(x_rows, w, limit)
+                        self._heterogeneous_shared_mlp.run(
+                            layer,
+                            x_rows,
+                            limit=limit,
+                        )
+                        if (
+                            self._heterogeneous_shared_mlp is not None
+                            and B * T == 1
+                            and pending_routed is not None
+                        )
+                        else (
+                            self._tp_shared_mlp.run(layer, x_rows)
+                            if self._tp_shared_mlp is not None and B * T == 1
+                            else _shared_expert_mlp_cccp(x_rows, w, limit)
+                        )
                     )
                 )
             except BaseException:
@@ -3620,6 +3922,14 @@ class DSV4CCCPModel:
                 else:
                     events.append((name, time.perf_counter()))
 
+        if h.is_cuda and ids.shape[-1] > 1:
+            prepare_prefill_layer = getattr(
+                self.pool,
+                "prepare_prefill_layer",
+                None,
+            )
+            if callable(prepare_prefill_layer):
+                prepare_prefill_layer(layer)
         mark("start")
         hc_workspace = self._hc_decode_workspace(h)
         hc_post_workspace = self._hc_post_workspace(h)
@@ -3704,8 +4014,12 @@ class DSV4CCCPModel:
         if ffn_packet is not None:
             ffn_packet["source"].copy_(h)
             packet_outputs = ffn_packet["graph"].replay()
-            y, post, comb, precomputed_shared = packet_outputs[:4]
-            precomputed_route = packet_outputs[4:6]
+            if ffn_packet.get("includes_shared", True):
+                y, post, comb, precomputed_shared = packet_outputs[:4]
+                precomputed_route = packet_outputs[4:6]
+            else:
+                y, post, comb = packet_outputs[:3]
+                precomputed_route = packet_outputs[3:5]
         else:
             y, post, comb = _hc_pre_norm_cccp(
                 h,
@@ -4398,6 +4712,73 @@ class DSV4CCCPModel:
                 if selected_positions is not None
                 else 0
             )
+            flashmla_prefill = (
+                q.is_cuda
+                and torch.version.hip is None
+                and int(hd) == 512
+                and B == 1
+                and "sparse_runner" in st
+                and os.environ.get("CCCP_FLASHMLA_PREFILL", "1") != "0"
+            )
+            if flashmla_prefill:
+                compressed_bank = (
+                    st["compressed"].contiguous_prefix(compressed_count)
+                    if compressed_count
+                    else None
+                )
+                flash_kv, flash_indices = (
+                    _flashmla_prefill_kv_and_indices(
+                        prefill_ring_values,
+                        prefill_ring_positions,
+                        kv,
+                        pos0,
+                        compressed_bank,
+                        selected_positions,
+                        selected_valid,
+                    )
+                )
+                sparse_output = st["sparse_runner"].prefill(
+                    query=q[0].to(torch.bfloat16).contiguous(),
+                    key_cache=flash_kv,
+                    indices=flash_indices,
+                    sink=w["attn_sink"].float().contiguous(),
+                    scale=float(scale),
+                )
+                if sparse_output.shape != (T, H, hd):
+                    raise RuntimeError(
+                        "FlashMLA sparse Prefill returned invalid output"
+                    )
+                if not getattr(
+                    self, "_flashmla_prefill_executor_announced", False
+                ):
+                    print(
+                        "[cccp-prefill] attention="
+                        "flashmla.sparse-prefill-fused; "
+                        f"outer tokens={T}; topk={flash_indices.shape[-1]}; "
+                        "gathered_values=0",
+                        flush=True,
+                    )
+                    self._flashmla_prefill_executor_announced = True
+                o = sparse_output.unsqueeze(0)
+                o[..., hd - rd:] = rope_apply(
+                    o[..., hd - rd:], out_cos, out_sin, inverse=True
+                )
+                return _d._o_proj_hook(o.flatten(2), w, cfg)
+
+            if (
+                q.is_cuda
+                and torch.version.hip is None
+                and torch.cuda.get_device_capability(q.device) == (9, 0)
+                and T >= 512
+            ):
+                reason = st.get(
+                    "sparse_splitkv_unavailable_reason",
+                    "FlashMLA sparse Prefill backend unavailable",
+                )
+                raise RuntimeError(
+                    "H20/SM90 长批 Prefill 必须使用 FlashMLA sparse "
+                    f"Prefill：{reason}"
+                )
             try:
                 process_limit_gb = float(
                     os.environ.get("CCCP_VRAM_LIMIT_GB", "0") or 0
@@ -5459,18 +5840,23 @@ class DSV4CCCPModel:
         if self._tp1_graph_build_error is not None:
             return
         hip_runtime = torch.version.hip is not None
+        dynamic_hybrid = bool(
+            getattr(self, "_hybrid_fixed_token_graph", False)
+        )
         requested_bucket = _tp1_token_graph_bucket(
             capture_position,
             hip_runtime=hip_runtime,
         )
         if self._tp1_token_graphs:
-            if not hip_runtime or requested_bucket in self._tp1_token_graphs:
+            if (
+                (not hip_runtime and not dynamic_hybrid)
+                or requested_bucket in self._tp1_token_graphs
+            ):
                 return
             self._retire_hip_tp1_token_graphs(requested_bucket)
         if (
             self.tp_size != 1
             or not self._single_gpu_layer_graph
-            or not self._packed_full_gpu
             or os.environ.get("CCCP_DSV4_TOKEN_GRAPH", "1") == "0"
         ):
             return
@@ -5572,12 +5958,13 @@ class DSV4CCCPModel:
             and sparse_splitkv_available
         ):
             bucket_specs.append(("topk512", 512, True))
-        if hip_runtime:
-            # Windows HIP previously captured all four 43-layer variants on
-            # the first token. Their simultaneous LLVM/graph allocations can
-            # exhaust host memory even though model VRAM is sufficient. Keep
-            # one active bucket and replace it only when context crosses a
-            # fixed-shape boundary; replay still has one parent launch/token.
+        if hip_runtime or dynamic_hybrid:
+            # HIP graph executables are host-memory heavy.  A hybrid cache also
+            # owns a large fixed 32-GiB process budget and must not retain three
+            # otherwise identical 43-layer parent graphs. Keep one active
+            # context bucket and replace it only at a shape boundary; replay
+            # still has one parent launch per token. AMD/HIP 按需单 bucket and
+            # the dynamic hybrid cache intentionally share this bounded rule.
             bucket_specs = [
                 spec for spec in bucket_specs
                 if spec[0] == requested_bucket
@@ -5663,29 +6050,57 @@ class DSV4CCCPModel:
                     done_event = torch.cuda.Event()
                     source_event = torch.cuda.Event()
                     source_event.record(torch.cuda.current_stream(device))
+                    branch_dependencies = []
                     if hash_route_graph is None:
                         expert_raw = expert_batch.raw_graphs()[0]
-                        parallel_stage = [
-                            shared_state.graphs[0].raw_cuda_graph(),
-                            router_state.graphs[0].raw_cuda_graph(),
-                        ]
+                        router_raw = router_state.graphs[0].raw_cuda_graph()
                     else:
                         expert_raw = (
                             self.pool.fixed_layer_child_graphs(layer)[0][-1]
                             .raw_cuda_graph()
                         )
-                        parallel_stage = [
-                            shared_state.graphs[0].raw_cuda_graph(),
-                            hash_route_graph.raw_cuda_graph(),
-                        ]
-                    layer_batch = make_tp_raw_graph_dag_batch(
+                        router_raw = hash_route_graph.raw_cuda_graph()
+                    # The shared MLP and routed branch consume the same
+                    # normalized hidden but have no data dependency.  A
+                    # nested route->expert child graph lets the expert begin
+                    # as soon as routing finishes while the independent
+                    # shared branch is still running.
+                    branch_stream = torch.cuda.Stream(device=device)
+                    branch_done = torch.cuda.Event()
+                    branch_source = torch.cuda.Event()
+                    branch_source.record(torch.cuda.current_stream(device))
+                    route_expert_batch = make_tp_raw_graph_dag_batch(
                         [int(device.index)],
                         [[
-                            [attention_graph.raw_cuda_graph()],
-                            parallel_stage,
+                            [router_raw],
                             [expert_raw],
-                            [final_graph.raw_cuda_graph()],
                         ]],
+                        [branch_stream],
+                        [branch_done],
+                        branch_source,
+                    )
+                    if route_expert_batch is None:
+                        raise RuntimeError(
+                            "TP1 route/expert branch graph unavailable"
+                        )
+                    parallel_stage = [
+                        shared_state.graphs[0].raw_cuda_graph(),
+                        route_expert_batch.raw_graphs()[0],
+                    ]
+                    branch_dependencies.extend((
+                        branch_stream,
+                        branch_done,
+                        branch_source,
+                        route_expert_batch,
+                    ))
+                    layer_stages = [
+                        [attention_graph.raw_cuda_graph()],
+                        parallel_stage,
+                        [final_graph.raw_cuda_graph()],
+                    ]
+                    layer_batch = make_tp_raw_graph_dag_batch(
+                        [int(device.index)],
+                        [layer_stages],
                         [launch_stream],
                         [done_event],
                         source_event,
@@ -5701,6 +6116,7 @@ class DSV4CCCPModel:
                         launch_stream,
                         done_event,
                         source_event,
+                        *branch_dependencies,
                     ))
                     if hash_route_graph is not None:
                         bucket_dependencies.extend((
@@ -5794,7 +6210,8 @@ class DSV4CCCPModel:
                 f"bucket={','.join(self._tp1_token_graphs)}；"
                 "每 token 一次主 cudaGraphLaunch；"
                 f"sparse={self.tp_token_graph_info['sparse_attention']}；"
-                f"策略={'AMD/HIP 按需单 bucket' if hip_runtime else '全 bucket 预捕获'}；"
+                "策略="
+                f"{'按需单 bucket' if hip_runtime or dynamic_hybrid else '全 bucket 预捕获'}；"
                 f"capture={(time.perf_counter() - capture_started) * 1000:.1f}ms",
                 flush=True,
             )
@@ -6196,6 +6613,7 @@ class DSV4CCCPModel:
         from .dsv4 import hc_head, hc_post
         from .ops import TPHiddenStageProfiler
 
+        self._ensure_hybrid_tp1_graph_runtime()
         if (
             self._tp_attention_contexts is None
             or self._tp_route_weights is None
@@ -6598,8 +7016,6 @@ class DSV4CCCPModel:
         if self._tp_attention_contexts is not None:
             return self._decode_tp(ids, pos)
         self.ensure_position(pos)
-        # token 级全层预取：上一 token 各层路由专家在本 token 计算窗口内并行读盘/DMA
-        # （时序局部性 70-90%；逐层预取窗口只有 attention 一段，全层预取窗口是整个 token）
         if self._prev_ids and self._token_prefetch_enabled():
             for l, es in self._prev_ids.items():
                 self.pool.prefetch([(l, e) for e in es])

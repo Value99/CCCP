@@ -617,8 +617,24 @@ class BlockFP8Weight:
         )
         if fused is None:
             raise RuntimeError("native tensor FP8 activation kernel unavailable")
-        result = torch._scaled_mm(
+        return self._tensor_fp8_matmul_prequantized(
             fused,
+            activation_scale,
+            output=output,
+        )
+
+    def _tensor_fp8_matmul_prequantized(
+        self,
+        quantized: torch.Tensor,
+        activation_scale: torch.Tensor,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Consume one shared FP8 activation image without requantizing it."""
+
+        if self.layout != "tensor-fp8" or not quantized.is_cuda:
+            raise ValueError("native tensor FP8 requires a CUDA execution image")
+        result = torch._scaled_mm(
+            quantized,
             self.q.view(torch.float8_e4m3fn).t(),
             scale_a=activation_scale,
             scale_b=self.s.reshape(1, 1),
@@ -1453,8 +1469,37 @@ class ProjectionGroup:
                 for weight in self.weights
             )
         ):
+            from .fusedext import dense_fp8_quantize_rows_fused
+
+            source = x.to(torch.bfloat16).contiguous()
+            first = self.weights[0]
+            if source.shape[0] == 1:
+                quantized = first._fp8_decode_input
+                activation_scale = first._fp8_decode_scale
+            else:
+                quantized = torch.empty_like(
+                    source, dtype=torch.float8_e4m3fn
+                )
+                activation_scale = torch.empty(
+                    (1, 1), dtype=torch.float32, device=source.device
+                )
+            if quantized is None or activation_scale is None:
+                raise RuntimeError(
+                    "native tensor FP8 workspace is unavailable"
+                )
+            fused = dense_fp8_quantize_rows_fused(
+                source, quantized, activation_scale
+            )
+            if fused is None:
+                raise RuntimeError(
+                    "native tensor FP8 activation kernel unavailable"
+                )
             parts = tuple(
-                weight._tensor_fp8_matmul(x) for weight in self.weights
+                weight._tensor_fp8_matmul_prequantized(
+                    fused,
+                    activation_scale,
+                )
+                for weight in self.weights
             )
             result = torch.cat(parts, dim=-1)
             if output is not None:

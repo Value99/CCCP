@@ -19,6 +19,7 @@ import subprocess
 import time
 from typing import Any
 
+from .prefill import begin_prefill_block, end_prefill_block
 from .presets import resolve_capacity_profile, resolve_preset
 
 
@@ -155,6 +156,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--kernel-cols", type=int, default=8192)
     parser.add_argument("--kernel-iterations", type=int, default=20)
     parser.add_argument("--kernel-batch", type=int, default=8)
+    parser.add_argument(
+        "--kernel-gate-bits", type=int, choices=range(8, 17), default=10
+    )
+    parser.add_argument(
+        "--kernel-gate-vector", type=int, choices=(4, 8, 16), default=8
+    )
+    parser.add_argument(
+        "--kernel-down-bits", type=int, choices=range(8, 17), default=8
+    )
+    parser.add_argument(
+        "--kernel-down-vector", type=int, choices=(4, 8, 16), default=4
+    )
     parser.add_argument(
         "--kernel-dtype",
         choices=("fp32", "bf16"),
@@ -399,6 +412,54 @@ def _steps(
     return _host_steps(model, logits, count)
 
 
+def _model_prefill(model: Any, tokens: list[int]):
+    """Run a benchmark Prefill through the production arena lifecycle."""
+
+    pool = getattr(model, "pool", None)
+    arena_active = begin_prefill_block(pool)
+    try:
+        return model.forward(tokens)
+    finally:
+        if arena_active:
+            end_prefill_block(pool)
+
+
+def _save_route_scores(pool: Any, output: str | Path) -> dict[str, Any]:
+    """Persist measured Prefill routes before Decode graph construction."""
+
+    store = getattr(pool, "store", None)
+    counts = getattr(pool, "route_counts", None)
+    if store is None or counts is None:
+        raise RuntimeError(
+            "the selected public expert pool cannot export route scores"
+        )
+    layers = sorted(int(layer) for layer in store.man.expert_files)
+    expert_count = int(store.cfg["n_experts"])
+    score_payload = {
+        "format": "cccp-expert-residency-scores-v1",
+        "scores": {
+            f"{layer}:{expert}": float(counts.get((layer, expert), 0))
+            for layer in layers
+            for expert in range(expert_count)
+        },
+        "observations": int(sum(counts.values())),
+        "source": "cccp benchmark CLI measured routes",
+    }
+    score_path = Path(output)
+    score_path.parent.mkdir(parents=True, exist_ok=True)
+    score_path.write_text(
+        json.dumps(score_payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "path": str(score_path),
+        "observations": score_payload["observations"],
+        "nonzero_experts": sum(
+            value > 0 for value in score_payload["scores"].values()
+        ),
+    }
+
+
 def _parse_cpu_thread_sweep(value: str | None) -> tuple[int, ...]:
     if not value:
         return ()
@@ -590,7 +651,7 @@ def _measure_stage_probe(
                 )
             if replay_ids is not None:
                 engine.reset()
-                logits = engine.model.forward(replay_ids)
+                logits = _model_prefill(engine.model, replay_ids)
             continue
         return logits, probe, discarded
 
@@ -617,7 +678,7 @@ def _measure_cpu_thread_count(
     effective_threads = int(torch.get_num_threads())
     engine.reset()
     prefill_started = time.perf_counter()
-    logits = engine.model.forward(prompt_ids)
+    logits = _model_prefill(engine.model, prompt_ids)
     prefill_ms = (time.perf_counter() - prefill_started) * 1000.0
     logits, warmup_tokens = _steps(
         architecture,
@@ -680,7 +741,8 @@ def _measure_cpu_thread_count(
                     "已拒绝生成误导性跑分"
                 )
             engine.reset()
-            logits = engine.model.forward(
+            logits = _model_prefill(
+                engine.model,
                 prompt_ids + warmup_tokens + decoded_tokens
             )
             continue
@@ -785,18 +847,27 @@ def main(argv: list[str] | None = None) -> None:
                         "CUDA packed-moe-three requires 1 <= batch/top-k <= 16"
                     )
 
-                def pack10(indices: torch.Tensor) -> torch.Tensor:
-                    groups = indices.reshape(-1, 4).to(torch.int64)
-                    words = torch.zeros(groups.shape[0], dtype=torch.int64)
-                    for offset in range(4):
-                        words.bitwise_or_(groups[:, offset] << (10 * offset))
+                def pack_indices(
+                    indices: torch.Tensor, bits: int
+                ) -> torch.Tensor:
+                    from math import gcd
+
+                    group_size = 8 // gcd(bits, 8)
+                    groups = indices.reshape(-1, group_size).to(torch.int64)
+                    bytes_per_group = bits * group_size // 8
                     packed = torch.empty(
-                        groups.shape[0], 5, dtype=torch.uint8
+                        groups.shape[0], bytes_per_group, dtype=torch.uint8
                     )
-                    for offset in range(5):
-                        packed[:, offset] = (
-                            (words >> (8 * offset)) & 0xFF
-                        ).to(torch.uint8)
+                    for byte in range(bytes_per_group):
+                        bit_start = byte * 8
+                        item = bit_start // bits
+                        offset = bit_start % bits
+                        value = groups[:, item] >> offset
+                        if offset + 8 > bits and item + 1 < group_size:
+                            value.bitwise_or_(
+                                groups[:, item + 1] << (bits - offset)
+                            )
+                        packed[:, byte] = (value & 0xFF).to(torch.uint8)
                     return packed.reshape(-1)
 
                 torch.manual_seed(8202)
@@ -811,22 +882,53 @@ def main(argv: list[str] | None = None) -> None:
                 route_weights = (
                     route_weights / route_weights.sum()
                 ).float()
+                gate_bits = int(args.kernel_gate_bits)
+                gate_vector = int(args.kernel_gate_vector)
+                down_bits = int(args.kernel_down_bits)
+                down_vector = int(args.kernel_down_vector)
+                if hidden % gate_vector or intermediate % down_vector:
+                    raise SystemExit(
+                        "packed-moe-three dimensions must be divisible by "
+                        "their VQ vectors"
+                    )
                 gate_cb = torch.randn(
-                    1024, 8, dtype=torch.bfloat16, device=device
+                    1 << gate_bits,
+                    gate_vector,
+                    dtype=torch.bfloat16,
+                    device=device,
                 )
                 up_cb = torch.randn(
-                    1024, 8, dtype=torch.bfloat16, device=device
+                    1 << gate_bits,
+                    gate_vector,
+                    dtype=torch.bfloat16,
+                    device=device,
                 )
                 down_cb = torch.randn(
-                    256, 4, dtype=torch.bfloat16, device=device
+                    1 << down_bits,
+                    down_vector,
+                    dtype=torch.bfloat16,
+                    device=device,
                 )
                 metadata = torch.zeros(15, top_k, dtype=torch.long)
                 retained: list[torch.Tensor] = [gate_cb, up_cb, down_cb]
                 definitions = (
-                    (10, 8, 1024, intermediate, hidden, gate_cb),
-                    (10, 8, 1024, intermediate, hidden, up_cb),
-                    (8, 4, 256, hidden, intermediate, down_cb),
+                    (
+                        gate_bits, gate_vector, 1 << gate_bits,
+                        intermediate, hidden, gate_cb,
+                    ),
+                    (
+                        gate_bits, gate_vector, 1 << gate_bits,
+                        intermediate, hidden, up_cb,
+                    ),
+                    (
+                        down_bits, down_vector, 1 << down_bits,
+                        hidden, intermediate, down_cb,
+                    ),
                 )
+                dtype_tags = {
+                    8: 0, 16: 1, 12: 2, 14: 3, 10: 4,
+                    9: 5, 11: 6, 13: 7, 15: 8,
+                }
                 for expert in range(top_k):
                     for projection, (
                         bits,
@@ -841,11 +943,7 @@ def main(argv: list[str] | None = None) -> None:
                             (rows, columns // dimension),
                             dtype=torch.int64,
                         )
-                        packed_cpu = (
-                            pack10(indices)
-                            if bits == 10
-                            else indices.to(torch.uint8).reshape(-1)
-                        ).contiguous()
+                        packed_cpu = pack_indices(indices, bits).contiguous()
                         packed = packed_cpu.to(device)
                         retained.append(packed)
                         base = 5 * projection
@@ -855,7 +953,7 @@ def main(argv: list[str] | None = None) -> None:
                                 codebook.data_ptr(),
                                 columns // dimension,
                                 dimension,
-                                4 if bits == 10 else 0,
+                                dtype_tags[bits],
                             ],
                             dtype=torch.long,
                         )
@@ -889,9 +987,14 @@ def main(argv: list[str] | None = None) -> None:
                         output_workspace=output_workspace,
                         result=result,
                         grouped_prefix=-1,
-                        packed_formats=("p10", "p10", "p8"),
-                        code_dims=(8, 8, 4),
-                        codebook_sizes=(1024, 1024, 256),
+                        packed_formats=(
+                            f"p{gate_bits}", f"p{gate_bits}",
+                            f"p{down_bits}",
+                        ),
+                        code_dims=(gate_vector, gate_vector, down_vector),
+                        codebook_sizes=(
+                            1 << gate_bits, 1 << gate_bits, 1 << down_bits,
+                        ),
                     )
 
                 original_down = os.environ.get(
@@ -942,9 +1045,18 @@ def main(argv: list[str] | None = None) -> None:
                             limit=0.0,
                             top_k=top_k,
                             grouped_prefix=-1,
-                            packed_formats=("p10", "p10", "p8"),
-                            code_dims=(8, 8, 4),
-                            codebook_sizes=(1024, 1024, 256),
+                            packed_formats=(
+                                f"p{gate_bits}", f"p{gate_bits}",
+                                f"p{down_bits}",
+                            ),
+                            code_dims=(
+                                gate_vector, gate_vector, down_vector,
+                            ),
+                            codebook_sizes=(
+                                1 << gate_bits,
+                                1 << gate_bits,
+                                1 << down_bits,
+                            ),
                         ),
                     )
                     graph.capture()
@@ -1034,13 +1146,23 @@ def main(argv: list[str] | None = None) -> None:
                 output = {
                     "kernel": "packed-moe-three",
                     "device": "cuda",
-                    "layout": "p10d8/p10d8/p8d4",
+                    "layout": (
+                        f"p{gate_bits}d{gate_vector}/"
+                        f"p{gate_bits}d{gate_vector}/"
+                        f"p{down_bits}d{down_vector}"
+                    ),
                     "hidden": hidden,
                     "intermediate": intermediate,
                     "top_k": top_k,
                     "iterations": int(args.kernel_iterations),
                     "warps": int(
                         os.environ.get("CCCP_PROJECTION_WARPS", "16")
+                    ),
+                    "p10_shared": os.environ.get(
+                        "CCCP_P10_SHARED", "1"
+                    ) != "0",
+                    "p10_rows_per_warp": int(
+                        os.environ.get("CCCP_P10_ROWS", "4")
                     ),
                     "split_down_ms": split_ms,
                     "reduce_down_ms": reduce_ms,
@@ -1352,7 +1474,7 @@ def main(argv: list[str] | None = None) -> None:
                 raise ValueError(
                     "packed-moe-three requires cols%8=0 and rows%4=0"
                 )
-            top_k = 16
+            top_k = int(args.kernel_batch)
             gate_codebook = torch.randn(1024, 8, dtype=torch.float32)
             up_codebook = torch.randn(1024, 8, dtype=torch.float32)
             down_codebook = torch.randn(256, 4, dtype=torch.float32)
@@ -2029,10 +2151,24 @@ def main(argv: list[str] | None = None) -> None:
             )
         start_profile()
     prefill_started = time.perf_counter()
-    logits = engine.model.forward(prompt_ids)
+    logits = _model_prefill(engine.model, prompt_ids)
     if args.device == "cuda":
         torch.cuda.synchronize()
     prefill_ms = (time.perf_counter() - prefill_started) * 1000.0
+    route_score_summary = (
+        _save_route_scores(
+            getattr(engine.model, "pool", None),
+            args.save_route_scores,
+        )
+        if args.save_route_scores
+        else None
+    )
+    print(
+        "[cccp-benchmark-prefill] "
+        f"tokens={len(prompt_ids)} elapsed={prefill_ms / 1000.0:.6f}s "
+        f"throughput={len(prompt_ids) / max(prefill_ms / 1000.0, 1e-9):.2f}tok/s",
+        flush=True,
+    )
     if args.probe_prefill:
         finish_profile = getattr(engine.model, "finish_profile", None)
         if not callable(finish_profile):
@@ -2134,7 +2270,8 @@ def main(argv: list[str] | None = None) -> None:
             # state. Rebuild the exact accepted prefix before retrying so the
             # next result keeps the same position and routing workload.
             engine.reset()
-            logits = engine.model.forward(
+            logits = _model_prefill(
+                engine.model,
                 prompt_ids + warmup_tokens + all_tokens
             )
             print(
@@ -2460,6 +2597,14 @@ def main(argv: list[str] | None = None) -> None:
             "device_route_fallbacks": int(
                 getattr(pool, "device_route_fallbacks", 0)
             ),
+            "device_cache_telemetry": (
+                pool.device_cache_telemetry()
+                if callable(getattr(pool, "device_cache_telemetry", None))
+                else {}
+            ),
+            "decode_executor": str(
+                getattr(pool, "decode_executor_name", "unavailable")
+            ),
             "uploaded_gib": (
                 getattr(pool, "uploaded_bytes", 0) / 2**30
             ),
@@ -2548,40 +2693,8 @@ def main(argv: list[str] | None = None) -> None:
         route_tier_profile = getattr(pool, "route_tier_profile", None)
         if route_tier_profile is not None:
             result["expert_cache"]["route_tiers"] = route_tier_profile()
-        if args.save_route_scores:
-            store = getattr(pool, "store", None)
-            counts = getattr(pool, "route_counts", None)
-            if store is None or counts is None:
-                raise RuntimeError(
-                    "the selected public expert pool cannot export route scores"
-                )
-            layers = sorted(int(layer) for layer in store.man.expert_files)
-            expert_count = int(store.cfg["n_experts"])
-            score_payload = {
-                "format": "cccp-expert-residency-scores-v1",
-                "scores": {
-                    f"{layer}:{expert}": float(
-                        counts.get((layer, expert), 0)
-                    )
-                    for layer in layers
-                    for expert in range(expert_count)
-                },
-                "observations": int(sum(counts.values())),
-                "source": "cccp benchmark CLI measured routes",
-            }
-            score_path = Path(args.save_route_scores)
-            score_path.parent.mkdir(parents=True, exist_ok=True)
-            score_path.write_text(
-                json.dumps(score_payload, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            result["route_scores"] = {
-                "path": str(score_path),
-                "observations": score_payload["observations"],
-                "nonzero_experts": sum(
-                    value > 0 for value in score_payload["scores"].values()
-                ),
-            }
+        if route_score_summary is not None:
+            result["route_scores"] = route_score_summary
     print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
     if args.json:
         output = Path(args.json)

@@ -8,29 +8,29 @@
   <a href="README.md">简体中文</a> · <a href="README_EN.md">English</a> · <strong>Русский</strong>
 </p>
 
-## ⬇️ Полный автономный пакет для Windows (v0.9.10)
+## ⬇️ Полный автономный пакет для Windows (v0.9.11)
 
 > [!IMPORTANT]
 > Для первого запуска загрузите полный автономный пакет, а не только `CCCP-Launcher.exe`. Python, Miniconda, среды CPU/CUDA/AMD, готовые операторы NVIDIA и зависимости уже включены.
 
-### [👉 Открыть страницу загрузки GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.10)
+### [👉 Открыть страницу загрузки GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.11)
 
 Сохраните эти **6 файлов** в одной папке:
 
-1. `CCCP-Launcher-0.9.10-Offline-Setup.exe`
-2. `CCCP-Launcher-v0.9.10-offline.parts.json`
-3. `CCCP-Launcher-v0.9.10-win-x64-offline.zip.001`
-4. `CCCP-Launcher-v0.9.10-win-x64-offline.zip.002`
-5. `CCCP-Launcher-v0.9.10-win-x64-offline.zip.003`
-6. `CCCP-Launcher-v0.9.10-win-x64-offline.zip.004`
+1. `CCCP-Launcher-0.9.11-Offline-Setup.exe`
+2. `CCCP-Launcher-v0.9.11-offline.parts.json`
+3. `CCCP-Launcher-v0.9.11-win-x64-offline.zip.001`
+4. `CCCP-Launcher-v0.9.11-win-x64-offline.zip.002`
+5. `CCCP-Launcher-v0.9.11-win-x64-offline.zip.003`
+6. `CCCP-Launcher-v0.9.11-win-x64-offline.zip.004`
 
-Запустите `CCCP-Launcher-0.9.10-Offline-Setup.exe`. Установщик проверит, объединит и распакует пакет. Веса моделей распространяются отдельно.
+Запустите `CCCP-Launcher-0.9.11-Offline-Setup.exe`. Установщик проверит, объединит и распакует пакет. Веса моделей распространяются отдельно.
 
-### Главное в версии 0.9.10
+### Главное в версии 0.9.11
 
-- Исправлены ошибки `cudaErrorIllegalAddress` во время Prefill на потребительских NVIDIA: ограничен обход 2 ГиБ смещения, рабочая область переиспользуется блоком, пакетные H2D-копии в Windows ограничены 8 на группу.
-- Рабочие области Kimi/MTP освобождаются единым блоковым помощником и не попадают в Decode.
-- Добавлен диагностический канал `data/runtime/debug_env.txt` для процесса serve.
+- Зафиксирован общий двойной путь VQ: слитый packed-VQ Decode и автоматический выбор packed-VQ либо Native8/FP8 grouped Prefill.
+- DSV4, Qwen, GLM и Kimi используют общие операторы, планирование памяти и кэш через манифест модели без удаления экспертов.
+- Удалены экспериментальные старые ветви; исправлены жизненный цикл Kimi/MTP и сборка CUDA из путей с не-ASCII символами.
 
 ## Основные преимущества
 
@@ -124,7 +124,7 @@ CCCP использует настройку маршрутизации: кор�
 
 ## Быстрый старт
 
-1. Скачайте Offline Setup, манифест частей и все четыре части из [GitHub Release v0.9.10](https://github.com/Value99/CCCP/releases/tag/v0.9.10).
+1. Скачайте Offline Setup, манифест частей и все четыре части из [GitHub Release v0.9.11](https://github.com/Value99/CCCP/releases/tag/v0.9.11).
 2. Запустите Offline Setup из каталога с правом записи и дождитесь проверки и распаковки.
 3. Поместите совместимую модель с файлом `cccp.json` в каталог `models` рядом с приложением.
 4. Дважды щёлкните `CCCP-Launcher.exe`.
@@ -210,7 +210,7 @@ for chunk in stream:
 | Windows 11 · NVIDIA RTX 3090 (лимит процесса 20 GiB) · CUDA 13 | DeepSeek-V4 в режиме ограниченной VRAM CUDA/RAM, прямая передача из locked RAM, strict LRU, fused decode и многотуровая генерация | **Аппаратный тест 0.9.2 пройден** |
 | NVIDIA RTX 5090 | Реальные CUDA/RAM-тесты DeepSeek-V4 и GLM-5.2 | **Движок протестирован** |
 | NVIDIA H20-3e (одна и несколько GPU) | DeepSeek-V4 TP1/TP4, GLM-5.2 TP2, Kimi K3 GPU+RAM/TP8 | **Движок протестирован** |
-| Двухсокетный CPU-сервер (96 физических ядер) | Qwen3.5 27B Dense VQ, NUMA-разделение Q4 и 64-токенный Decode | **В 0.9.10 измерено 9,77 token/s, примерно +38,6% к стабильной базе; обещания 30 token/s нет** |
+| Двухсокетный CPU-сервер (96 физических ядер) | Qwen3.5 27B Dense VQ, NUMA-разделение Q4 и 64-токенный Decode | **В 0.9.11 измерено 9,77 token/s, примерно +38,6% к стабильной базе; обещания 30 token/s нет** |
 | Windows CUDA 13.0 / `sm_120` | Полная компиляция NVCC, линковка и загрузка модуля | **Цепочка сборки пройдена**; граница проверки — загрузка модуля |
 | Windows ROCm 7.2.1 / `gfx1151` | HIPIFY, генерация кода устройства, линковка и загрузка модуля | **Цепочка сборки пройдена**; аппаратная проверка AMD запланирована |
 | macOS | Runtime и пакет выпуска находятся в дорожной карте | **Запланировано** |
@@ -253,7 +253,7 @@ $release.launcher.sha256
 
 ## Ссылки
 
-- Скачать: [GitHub Release v0.9.10](https://github.com/Value99/CCCP/releases/tag/v0.9.10)
+- Скачать: [GitHub Release v0.9.11](https://github.com/Value99/CCCP/releases/tag/v0.9.11)
 - Сообщество: [Discord](https://discord.gg/eNnwmAUY4M)
 - Модели: [ModelScope · ValueFX](https://www.modelscope.cn/profile/ValueFX)
 - Страница проекта: [GitHub · Value99/CCCP](https://github.com/Value99/CCCP)
