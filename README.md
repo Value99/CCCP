@@ -209,11 +209,11 @@ for chunk in stream:
 
 | 平台/硬件 | 当前验证情况 | 结论 |
 | --- | --- | --- |
-| Windows 11 x64 · Core i9-13900H · 31.59 GiB RAM | 启动器、EXE、CPU 推理、OpenAI API、配置扫描及 Qwen3.5 27B 真实生成；完整自动化测试 `500 passed`、`11 skipped` | **CPU 端到端功能通过**；本轮 Qwen 短提示 Prefill/Decode 为 0.9/1.31 token/s，未达到性能目标 |
+| Windows 11 x64 · Core i9-13900H · 31.59 GiB RAM | 启动器、EXE、CPU 推理、OpenAI API、配置扫描与真实生成；完整自动化及封装冒烟 | **CPU 端到端功能通过**；超大模型 CPU 速度取决于内存带宽，不与 H20 成绩混用 |
 | Windows 11 · NVIDIA RTX 3090（20 GiB 进程限额）· CUDA 13 | DeepSeek-V4 受限显存 CUDA/RAM、直接锁页传输、严格 LRU、融合 Decode 与多轮生成 | **0.9.2 真机通过** |
-| Linux · NVIDIA H20 单卡 | Qwen3.5 27B 公共码本路径、完整加载和真实生成 | **0.9.13 本轮 Decode 53.76 token/s；达到 Qwen 当前红线** |
+| Linux · NVIDIA H20-3e · TP1 | 随包 CUDA 13，4096-token Prefill / 4096 上下文 Decode | **Qwen 2323.66/55.18、DSV4 2611.86/46.22 token/s**；均通过 0.9.13 性能与有限值门禁 |
 | NVIDIA RTX 5090 | DeepSeek-V4 和 GLM-5.2 的 CUDA/RAM 路径实机回归 | **引擎实测通过** |
-| NVIDIA H20-3e（本轮单卡） | DSV4 32 GiB、GLM-5.3 Flash S/M、Kimi K3 120 GiB 真实加载和生成 | **功能通过**；Decode 分别为 34.18、10.05/9.47、3.73 token/s，均低于当前红线 |
+| NVIDIA H20-3e · 多并行协议 | GLM Flash S TP1、GLM Flash M TP2、Kimi TP4（GPU 2/3/4/5），4096-token Prefill / 4096 上下文 Decode | **GLM S 1503.56/30.01、GLM M 1268.54/20.27、Kimi 608.03/15.25 token/s**；均通过 0.9.13 性能与有限值门禁 |
 | 双路 CPU 服务器（96 物理核） | Qwen3.5 27B Dense VQ、Q4 NUMA 分片与 64-token Decode | **0.9.4 历史实测 9.77 token/s**；不是本轮结果，不承诺 30 token/s |
 | Windows CUDA 13.0 / `sm_120` | 完整 NVCC 编译、链接和模块加载 | **编译链通过**；验证范围到模块加载 |
 | Windows ROCm 7.2.1 / `gfx1151` | 无 AMD GPU 构建机上的 HIPIFY、设备代码生成、链接和模块加载 | **编译链通过**，AMD 硬件端到端验证仍待补充 |

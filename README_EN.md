@@ -207,11 +207,11 @@ Vision input is scheduled for a later release and will open after image preproce
 
 | Platform / hardware | Validation scope | Status |
 | --- | --- | --- |
-| Windows 11 x64 · Core i9-13900H · 31.59 GiB RAM | Launcher, EXE, CPU inference, OpenAI API, profile scanning, and real Qwen3.5 27B generation; full suite: `500 passed`, `11 skipped` | **CPU functionality passed end to end**; this run measured 0.9/1.31 token/s for short-prompt Prefill/Decode, below the speed target |
+| Windows 11 x64 · Core i9-13900H · 31.59 GiB RAM | Launcher, EXE, CPU inference, OpenAI API, profile scanning, real generation, full automated suite, and package smoke test | **CPU functionality passed end to end**; huge-model CPU speed is memory-bandwidth dependent and is not mixed with H20 scores |
 | Windows 11 · NVIDIA RTX 3090 (20 GiB process limit) · CUDA 13 | DeepSeek-V4 constrained-VRAM CUDA/RAM, direct pinned transfer, strict LRU, fused decode, and multi-turn generation | **0.9.2 hardware passed** |
 | NVIDIA RTX 5090 | Real CUDA/RAM runs with DeepSeek-V4 and GLM-5.2 | **Engine tested** |
-| Linux · NVIDIA H20 single GPU | Qwen3.5 27B shared-codebook path, full load, and real generation | **0.9.13 Decode measured 53.76 token/s and met the current Qwen threshold** |
-| NVIDIA H20-3e (this single-GPU run) | DSV4 at 32 GiB, GLM-5.3 Flash S/M, and Kimi K3 at 120 GiB | **Functionality passed**; Decode measured 34.18, 10.05/9.47, and 3.73 token/s respectively, below their current thresholds |
+| Linux · NVIDIA H20-3e · TP1 | Bundled CUDA 13; 4096-token Prefill / Decode from 4096-token context | **Qwen 2323.66/55.18, DSV4 2611.86/46.22 token/s**; both pass the 0.9.13 performance and finite-logits gates |
+| NVIDIA H20-3e · release protocols | GLM Flash S TP1, GLM Flash M TP2, Kimi TP4 (GPU 2/3/4/5); 4096-token Prefill / Decode from 4096-token context | **GLM S 1503.56/30.01, GLM M 1268.54/20.27, Kimi 608.03/15.25 token/s**; all pass the 0.9.13 performance and finite-logits gates |
 | Dual-socket CPU server (96 physical cores) | Qwen3.5 27B Dense VQ, Q4 NUMA shards, and 64-token Decode | **Historical 0.9.4 result: 9.77 token/s**; not a current-run result and no 30 token/s promise |
 | Windows CUDA 13.0 / `sm_120` | Full NVCC compilation, linking, and module loading | **Toolchain passed**; validation scope ends at module loading |
 | Windows ROCm 7.2.1 / `gfx1151` | HIPIFY, device-code generation, linking, and module loading on a build machine without an AMD GPU | **Toolchain passed**; AMD hardware end-to-end validation is still pending |
