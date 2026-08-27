@@ -234,7 +234,6 @@ class TensorParallelVocab:
                     rows[i] = embedded[offset]
             return torch.stack(rows)
         rank = ranks.pop()
-        rank = ranks.pop()
         local_ids = torch.as_tensor(
             [token - self.offsets[rank] for token in values],
             dtype=torch.long,
@@ -1119,7 +1118,9 @@ class TensorParallelGatedMLP:
         )
         if hidden.fixed_addresses != expected_addresses:
             raise ValueError(
-                "TP gated MLP input must use captured fixed addresses"
+                "TP gated MLP input must use captured fixed addresses: "
+                f"layer={layer}, expected={expected_addresses}, "
+                f"actual={hidden.fixed_addresses}"
             )
         rank_order = _no_owner_rank_order(self, state)
         state.graph_batch.launch_all_rank_from_events(
@@ -3737,21 +3738,31 @@ class TensorParallelKDA:
                     event = torch.cuda.Event()
                     event.record(torch.cuda.current_stream(device))
                     state.input_events.append(event)
-            state.output_replicas = []
-            state.output_events = []
-            for device in self.devices:
-                with torch.cuda.device(device):
-                    state.output_replicas.append(
-                        torch.empty(
-                            1,
-                            spec.hidden_size,
-                            dtype=torch.bfloat16,
-                            device=device,
+            # Kimi performs one final KDA recapture after the retained MLP
+            # and MoE plans have been assembled.  Those parent plans read
+            # these exact buffers and wait on these exact events, so a
+            # recapture must only replace the KDA graph handles.  Replacing
+            # either list here leaves the already-captured parents pointing
+            # at stale storage/events.
+            if state.output_replicas is None:
+                state.output_replicas = []
+                for device in self.devices:
+                    with torch.cuda.device(device):
+                        state.output_replicas.append(
+                            torch.empty(
+                                1,
+                                spec.hidden_size,
+                                dtype=torch.bfloat16,
+                                device=device,
+                            )
                         )
-                    )
-                    event = torch.cuda.Event()
-                    event.record(torch.cuda.current_stream(device))
-                    state.output_events.append(event)
+            if state.output_events is None:
+                state.output_events = []
+                for device in self.devices:
+                    with torch.cuda.device(device):
+                        event = torch.cuda.Event()
+                        event.record(torch.cuda.current_stream(device))
+                        state.output_events.append(event)
             state.contributions = contributions
             state.graph_batch = make_tp_graph_launch_batch(
                 [

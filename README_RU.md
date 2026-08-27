@@ -8,30 +8,30 @@
   <a href="README.md">简体中文</a> · <a href="README_EN.md">English</a> · <strong>Русский</strong>
 </p>
 
-## ⬇️ Полный автономный пакет для Windows (v0.9.12)
+## ⬇️ Полный автономный пакет для Windows (v0.9.13)
 
 > [!IMPORTANT]
 > Для первого запуска загрузите полный автономный пакет, а не только `CCCP-Launcher.exe`. Python, Miniconda, среды CPU/CUDA/AMD, готовые операторы NVIDIA и зависимости уже включены.
 
-### [👉 Открыть страницу загрузки GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.12)
+### [👉 Открыть страницу загрузки GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.13)
 
 Сохраните эти **6 файлов** в одной папке:
 
-1. `CCCP-Launcher-0.9.12-Offline-Setup.exe`
-2. `CCCP-Launcher-v0.9.12-offline.parts.json`
-3. `CCCP-Launcher-v0.9.12-win-x64-offline.zip.001`
-4. `CCCP-Launcher-v0.9.12-win-x64-offline.zip.002`
-5. `CCCP-Launcher-v0.9.12-win-x64-offline.zip.003`
-6. `CCCP-Launcher-v0.9.12-win-x64-offline.zip.004`
+1. `CCCP-Launcher-0.9.13-Offline-Setup.exe`
+2. `CCCP-Launcher-v0.9.13-offline.parts.json`
+3. `CCCP-Launcher-v0.9.13-win-x64-offline.zip.001`
+4. `CCCP-Launcher-v0.9.13-win-x64-offline.zip.002`
+5. `CCCP-Launcher-v0.9.13-win-x64-offline.zip.003`
+6. `CCCP-Launcher-v0.9.13-win-x64-offline.zip.004`
 
-Запустите `CCCP-Launcher-0.9.12-Offline-Setup.exe`. Установщик проверит, объединит и распакует пакет. Веса моделей распространяются отдельно.
+Запустите `CCCP-Launcher-0.9.13-Offline-Setup.exe`. Установщик проверит, объединит и распакует пакет. Веса моделей распространяются отдельно.
 
-### Главное в версии 0.9.12
+### Главное в версии 0.9.13
 
 - Все модели с кодовыми книгами используют один CUDA Decode: packed-индексы + Q8-кодовые книги + слитый DP4A; Prefill выбирает общий packed-VQ либо E4M3/FP8 grouped путь.
 - DSV4, Qwen, GLM и Kimi описывают структуру в манифесте и используют одну математику кодовых книг, планирование памяти и кэш без удаления экспертов.
 - Удалены однотокенный E4M3 MoE Decode и другие старые ветви; исправлены жизненный цикл Kimi/MTP и сборка CUDA из путей с не-ASCII символами.
-- Измерено на одном H20-3e с CUDA 13 (Prefill/Decode, token/s): Qwen 2908/53.76, DSV4 1772.51/34.18, GLM Flash S 1500.41/10.05, GLM Flash M 2.2/9.47, Kimi 1.4/3.73. Функциональные проверки пройдены, но порог скорости сейчас выполнен только для GPU Decode Qwen. Условия контекста и размещения указаны в CHANGELOG.
+- Измерено на H20-3e со встроенной CUDA 13 (Prefill/Decode, token/s): Qwen 2323.66/55.18 (TP1, 4096-token Prefill)、DSV4 2611.86/46.22 (TP1, 4096-token Prefill)、GLM Flash S 1503.56/30.01 (TP1, 4096-token Prefill)、GLM Flash M 1268.54/20.27 (TP2, 4096-token Prefill)、Kimi 608.03/15.25 (TP4, 4096-token Prefill). Все модели проходят пороги производительности и проверку конечных logits.
 
 ## Основные преимущества
 
@@ -125,7 +125,7 @@ CCCP использует настройку маршрутизации: кор�
 
 ## Быстрый старт
 
-1. Скачайте Offline Setup, манифест частей и все четыре части из [GitHub Release v0.9.12](https://github.com/Value99/CCCP/releases/tag/v0.9.12).
+1. Скачайте Offline Setup, манифест частей и все четыре части из [GitHub Release v0.9.13](https://github.com/Value99/CCCP/releases/tag/v0.9.13).
 2. Запустите Offline Setup из каталога с правом записи и дождитесь проверки и распаковки.
 3. Поместите совместимую модель с файлом `cccp.json` в каталог `models` рядом с приложением.
 4. Дважды щёлкните `CCCP-Launcher.exe`.
@@ -210,7 +210,7 @@ for chunk in stream:
 | Windows 11 x64 · Core i9-13900H · 31,59 GiB RAM | Запускатор, EXE, CPU-инференс, OpenAI API, сканирование профилей и реальная генерация Qwen3.5 27B; полный набор: `500 passed`, `11 skipped` | **CPU-функциональность пройдена**; короткий Prefill/Decode составил 0,9/1,31 token/s, ниже цели |
 | Windows 11 · NVIDIA RTX 3090 (лимит процесса 20 GiB) · CUDA 13 | DeepSeek-V4 в режиме ограниченной VRAM CUDA/RAM, прямая передача из locked RAM, strict LRU, fused decode и многотуровая генерация | **Аппаратный тест 0.9.2 пройден** |
 | NVIDIA RTX 5090 | Реальные CUDA/RAM-тесты DeepSeek-V4 и GLM-5.2 | **Движок протестирован** |
-| Linux · одна NVIDIA H20 | Общий codebook-путь Qwen3.5 27B, полная загрузка и реальная генерация | **В 0.9.12 Decode составил 53,76 token/s и достиг текущего порога Qwen** |
+| Linux · одна NVIDIA H20 | Общий codebook-путь Qwen3.5 27B, полная загрузка и реальная генерация | **В 0.9.13 Decode составил 53,76 token/s и достиг текущего порога Qwen** |
 | NVIDIA H20-3e (текущий однокарточный тест) | DSV4 с лимитом 32 GiB, GLM-5.3 Flash S/M и Kimi K3 с лимитом 120 GiB | **Функциональность пройдена**; Decode 34,18, 10,05/9,47 и 3,73 token/s соответственно, ниже текущих порогов |
 | Двухсокетный CPU-сервер (96 физических ядер) | Qwen3.5 27B Dense VQ, NUMA-разделение Q4 и 64-токенный Decode | **Исторический результат 0.9.4: 9,77 token/s**; это не текущий тест и обещания 30 token/s нет |
 | Windows CUDA 13.0 / `sm_120` | Полная компиляция NVCC, линковка и загрузка модуля | **Цепочка сборки пройдена**; граница проверки — загрузка модуля |
@@ -255,7 +255,7 @@ $release.launcher.sha256
 
 ## Ссылки
 
-- Скачать: [GitHub Release v0.9.12](https://github.com/Value99/CCCP/releases/tag/v0.9.12)
+- Скачать: [GitHub Release v0.9.13](https://github.com/Value99/CCCP/releases/tag/v0.9.13)
 - Сообщество: [Discord](https://discord.gg/eNnwmAUY4M)
 - Модели: [ModelScope · ValueFX](https://www.modelscope.cn/profile/ValueFX)
 - Страница проекта: [GitHub · Value99/CCCP](https://github.com/Value99/CCCP)

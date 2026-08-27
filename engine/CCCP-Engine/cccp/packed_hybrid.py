@@ -5986,12 +5986,30 @@ class PackedHybridPool:
         self._prefill_workspace = cached
         return cached
 
-    def _prefill_dequant_chunk_capacity(self, expert_count: int) -> int:
+    def _prefill_dequant_chunk_capacity(
+        self,
+        expert_count: int,
+        *,
+        routed_rows: int = 0,
+    ) -> int:
         """Choose a dense expert scratch that stays inside the VRAM cap."""
 
         cached = getattr(self, "_prefill_dequant_workspace", None)
         if cached is not None:
             return max(1, min(int(expert_count), int(cached[0].shape[0])))
+        native8_cached = getattr(self, "_prefill_native8_workspace", None)
+        if (
+            getattr(self, "_native8_prefill_enabled", False)
+            and native8_cached is not None
+            and int(native8_cached["routed_rows"]) >= int(routed_rows)
+        ):
+            # ``mem_get_info`` excludes this live workspace from free VRAM.
+            # Replanning from that reduced number would progressively shrink
+            # every following layer even though no new allocation is needed.
+            return max(
+                1,
+                min(int(expert_count), int(native8_cached["capacity"])),
+            )
         # The previous layer deliberately releases its expanded-BF16 expert
         # scratch so Attention and MoE can share the same limited VRAM.  Under
         # a per-process memory fraction PyTorch may retain that differently
@@ -6133,6 +6151,17 @@ class PackedHybridPool:
             and int(cached["routed_rows"]) >= int(routed_rows)
         ):
             return cached
+        if cached is not None:
+            # A longer following prompt needs larger row workspaces.  Drop
+            # the old CUDA tensors before allocating their replacements;
+            # otherwise the caching allocator must temporarily hold both
+            # complete FP8/DeepGEMM workspaces and can OOM even though either
+            # workspace independently fits the planned Prefill reserve.
+            self._prefill_native8_workspace = None
+            del cached
+            torch.cuda.synchronize(self.device)
+            gc.collect()
+            torch.cuda.empty_cache()
         cached = {
             "capacity": int(capacity),
             "routed_rows": int(routed_rows),
@@ -6531,7 +6560,8 @@ class PackedHybridPool:
                     unique_count
                     if compact_grouped_prefill
                     else self._prefill_dequant_chunk_capacity(
-                        int(self.store.cfg["n_experts"])
+                        int(self.store.cfg["n_experts"]),
+                        routed_rows=count * top_k,
                     )
                 )
                 chunk_capacity = min(unique_count, planned_capacity)

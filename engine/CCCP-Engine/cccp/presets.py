@@ -130,13 +130,13 @@ def choose_ep_layout(manifest: dict[str, Any], tp: int) -> str:
         for value in quant.get("vq", {}).values()
     }
     if quant.get("method") == "projection-vq":
-        used_layouts = {
-            str(layout)
-            for projections in quant.get(
-                "projection_layouts", {}
-            ).values()
-            for layout in projections.values()
-        }
+        projection_layouts = quant.get("projection_layouts", {})
+        used_layouts = set()
+        for projections in projection_layouts.values():
+            if isinstance(projections, dict):
+                used_layouts.update(str(layout) for layout in projections.values())
+            else:
+                used_layouts.add(str(projections))
         heterogeneous = quant.get(
             "heterogeneous_expert_tiering"
         ) or {}
@@ -147,10 +147,17 @@ def choose_ep_layout(manifest: dict[str, Any], tp: int) -> str:
             ).values()
             for layout in projections.values()
         )
-        dims.update(
-            int(quant["layouts"][layout]["dim"])
-            for layout in used_layouts
-        )
+        declared_layouts = quant.get("layouts", {})
+        for layout in used_layouts:
+            item = declared_layouts.get(layout)
+            if isinstance(item, dict) and "dim" in item:
+                dims.add(int(item["dim"]))
+                continue
+            prefix = str(layout).split("-", 1)[0].lower()
+            if prefix.startswith("d") and prefix[1:].isdigit():
+                dims.add(int(prefix[1:]))
+                continue
+            raise ValueError(f"无法解析专家布局维度：{layout}")
     tensor_ok = intermediate % tp == 0
     if tensor_ok:
         local = intermediate // tp

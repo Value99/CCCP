@@ -155,6 +155,25 @@ def _glm5_next_pool_phase(executor, *, rows: int):
     return executor.phase(rows=int(rows))
 
 
+def _glm5_next_linear_decode_graph_eligible(
+    block_type: str,
+    hidden_states,
+    cache_params,
+    *,
+    layer: int,
+) -> bool:
+    """Return whether a recurrent single-token layer has fixed CUDA state."""
+    if (
+        block_type != "linear_attention"
+        or hidden_states.device.type != "cuda"
+        or tuple(hidden_states.shape[:2]) != (1, 1)
+        or cache_params is None
+    ):
+        return False
+    has_previous = getattr(cache_params, "has_previous_state", None)
+    return bool(callable(has_previous) and has_previous(int(layer)))
+
+
 def _glm5_next_static_pool_states(
     indexer: nn.Module,
     packed_states: torch.Tensor,
@@ -260,7 +279,7 @@ def _glm5_next_hc_post(
 class GLM5NextDecoderLayerRuntime(nn.Module):
     """Topology-only adapter using public H/C, Attention and routed-VQ math."""
 
-    def __init__(self, layer: nn.Module) -> None:
+    def __init__(self, layer: nn.Module, *, decode_graph_pool=None) -> None:
         super().__init__()
         self.block_type = layer.block_type
         self.self_attn = layer.self_attn
@@ -269,6 +288,149 @@ class GLM5NextDecoderLayerRuntime(nn.Module):
         self.post_attention_layernorm = layer.post_attention_layernorm
         self.attn_hc = layer.attn_hc
         self.ffn_hc = layer.ffn_hc
+        self._decode_graph_pool = decode_graph_pool
+        self._linear_decode_graph = None
+        self._linear_decode_cache_id: int | None = None
+        self._linear_decode_hidden: torch.Tensor | None = None
+        self._linear_decode_attention_mask: torch.Tensor | None = None
+        self._linear_decode_kwargs: dict[str, object] = {}
+
+    def reset_decode_graph(self) -> None:
+        self._linear_decode_graph = None
+        self._linear_decode_cache_id = None
+        self._linear_decode_hidden = None
+        self._linear_decode_attention_mask = None
+        self._linear_decode_kwargs.clear()
+
+    def _linear_decode_prefix(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        cache_params,
+        kwargs: dict[str, object],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        residual = hidden_states
+        normalized, post, combine = _glm5_next_hc_pre_norm(
+            hidden_states,
+            self.attn_hc,
+            self.input_layernorm,
+        )
+        attended = self.self_attn(
+            hidden_states=normalized,
+            cache_params=cache_params,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+        hidden_states = _glm5_next_hc_post(
+            attended,
+            residual,
+            post,
+            combine,
+        )
+        residual = hidden_states
+        normalized, post, combine = _glm5_next_hc_pre_norm(
+            hidden_states,
+            self.ffn_hc,
+            self.post_attention_layernorm,
+        )
+        return normalized, residual, post, combine
+
+    @staticmethod
+    def _snapshot_recurrent_cache(cache_params, layer: int):
+        state = cache_params.layers[int(layer)]
+        snapshots = []
+        for name in ("conv_states", "recurrent_states"):
+            for tensor in getattr(state, name, ()):
+                if isinstance(tensor, torch.Tensor):
+                    snapshots.append((tensor, tensor.clone()))
+        return snapshots
+
+    def _capture_linear_decode_graph(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        cache_params,
+        kwargs: dict[str, object],
+    ) -> None:
+        from .ops import FixedAddressCudaGraph
+
+        layer = int(self.self_attn.layer_idx)
+        self._linear_decode_hidden = torch.empty_like(hidden_states)
+        self._linear_decode_hidden.copy_(hidden_states)
+        self._linear_decode_attention_mask = (
+            torch.empty_like(attention_mask)
+            if isinstance(attention_mask, torch.Tensor)
+            else None
+        )
+        if self._linear_decode_attention_mask is not None:
+            self._linear_decode_attention_mask.copy_(attention_mask)
+        fixed_kwargs: dict[str, object] = {}
+        for name, value in kwargs.items():
+            if isinstance(value, torch.Tensor):
+                fixed_value = torch.empty_like(value)
+                fixed_value.copy_(value)
+                fixed_kwargs[name] = fixed_value
+            else:
+                fixed_kwargs[name] = value
+        self._linear_decode_kwargs = fixed_kwargs
+
+        def function():
+            hidden = self._linear_decode_hidden
+            if hidden is None:
+                raise RuntimeError("linear Decode graph input was released")
+            return self._linear_decode_prefix(
+                hidden,
+                self._linear_decode_attention_mask,
+                cache_params,
+                self._linear_decode_kwargs,
+            )
+
+        snapshots = self._snapshot_recurrent_cache(cache_params, layer)
+        try:
+            self._linear_decode_graph = FixedAddressCudaGraph(
+                hidden_states.device,
+                function,
+                pool=self._decode_graph_pool,
+            )
+        finally:
+            for target, snapshot in snapshots:
+                target.copy_(snapshot)
+        self._linear_decode_cache_id = id(cache_params)
+
+    def _forward_linear_decode_graph(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        cache_params,
+        kwargs: dict[str, object],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if (
+            self._linear_decode_graph is None
+            or self._linear_decode_cache_id != id(cache_params)
+        ):
+            self.reset_decode_graph()
+            self._capture_linear_decode_graph(
+                hidden_states,
+                attention_mask,
+                cache_params,
+                kwargs,
+            )
+        fixed_hidden = self._linear_decode_hidden
+        graph = self._linear_decode_graph
+        if fixed_hidden is None or graph is None:
+            raise RuntimeError("linear Decode graph capture failed")
+        fixed_hidden.copy_(hidden_states)
+        if self._linear_decode_attention_mask is not None:
+            if not isinstance(attention_mask, torch.Tensor):
+                raise ValueError("linear Decode attention mask changed type")
+            self._linear_decode_attention_mask.copy_(attention_mask)
+        for name, target in self._linear_decode_kwargs.items():
+            source = kwargs[name]
+            if isinstance(target, torch.Tensor):
+                if not isinstance(source, torch.Tensor):
+                    raise ValueError(f"linear Decode kwarg {name} changed type")
+                target.copy_(source)
+        return graph.replay()
 
     def forward(
         self,
@@ -281,6 +443,34 @@ class GLM5NextDecoderLayerRuntime(nn.Module):
         prev_topk_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        layer = int(getattr(self.self_attn, "layer_idx", -1))
+        if (
+            self._decode_graph_pool is not None
+            and _glm5_next_linear_decode_graph_eligible(
+                self.block_type,
+                hidden_states,
+                past_key_values,
+                layer=layer,
+            )
+        ):
+            normalized, residual, post, combine = (
+                self._forward_linear_decode_graph(
+                    hidden_states,
+                    attention_mask,
+                    past_key_values,
+                    kwargs,
+                )
+            )
+            output = self.mlp(normalized)
+            return (
+                _glm5_next_hc_post(
+                    output,
+                    residual,
+                    post,
+                    combine,
+                ),
+                None,
+            )
         residual = hidden_states
         hidden_states, post, combine = _glm5_next_hc_pre_norm(
             hidden_states,
@@ -393,6 +583,143 @@ class CCCPLinear(nn.Module):
         return result
 
 
+class GLM5NextTopkRouterRuntime(nn.Module):
+    """Bind GLM's standard sigmoid Top-K math to the public router operator."""
+
+    def __init__(self, router: nn.Module) -> None:
+        super().__init__()
+        self.top_k = int(router.top_k)
+        self.num_experts = int(router.num_experts)
+        self.hidden_dim = int(router.hidden_dim)
+        self.routed_scaling_factor = float(router.routed_scaling_factor)
+        self.num_group = int(router.num_group)
+        self.topk_group = int(router.topk_group)
+        self.norm_topk_prob = bool(router.norm_topk_prob)
+        self.weight = nn.Parameter(
+            router.weight.detach().float(),
+            requires_grad=False,
+        )
+        self.register_buffer(
+            "e_score_correction_bias",
+            router.e_score_correction_bias.detach().float(),
+            persistent=False,
+        )
+        self._decode_buffers: dict[
+            tuple[str, int | None],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = {}
+
+    def _decode_route_buffers(
+        self,
+        value: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        key = (value.device.type, value.device.index)
+        buffers = self._decode_buffers.get(key)
+        if buffers is None:
+            buffers = (
+                torch.empty(
+                    1,
+                    self.num_experts,
+                    dtype=torch.float32,
+                    device=value.device,
+                ),
+                torch.empty(
+                    1,
+                    self.top_k,
+                    dtype=torch.float32,
+                    device=value.device,
+                ),
+                torch.empty(
+                    1,
+                    self.top_k,
+                    dtype=torch.long,
+                    device=value.device,
+                ),
+                torch.ones(
+                    self.num_experts,
+                    dtype=torch.bool,
+                    device=value.device,
+                ),
+            )
+            self._decode_buffers[key] = buffers
+        return buffers
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        rows = hidden_states.reshape(-1, self.hidden_dim)
+        if rows.shape[0] == 1:
+            from .ops import linear_route_topk
+
+            logits, weights, indices, mask = self._decode_route_buffers(rows)
+            routed = linear_route_topk(
+                rows,
+                self.weight,
+                self.e_score_correction_bias,
+                mask,
+                scoring_func="sigmoid",
+                top_k=self.top_k,
+                normalize=self.norm_topk_prob,
+                scaling=self.routed_scaling_factor,
+                n_group=self.num_group,
+                topk_group=self.topk_group,
+                output_buffers=(logits, weights, indices),
+            )
+            if routed is not None:
+                return logits, routed[0], routed[1]
+
+        router_logits = torch.nn.functional.linear(
+            rows.float(),
+            self.weight,
+        )
+        scores = router_logits.sigmoid()
+        scores_for_choice = scores + self.e_score_correction_bias
+        group_scores = (
+            scores_for_choice.view(
+                -1,
+                self.num_group,
+                self.num_experts // self.num_group,
+            )
+            .topk(2, dim=-1)[0]
+            .sum(dim=-1)
+        )
+        group_idx = torch.topk(
+            group_scores,
+            k=self.topk_group,
+            dim=-1,
+            sorted=False,
+        )[1]
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(1, group_idx, 1)
+        score_mask = (
+            group_mask.unsqueeze(-1)
+            .expand(
+                -1,
+                self.num_group,
+                self.num_experts // self.num_group,
+            )
+            .reshape(-1, self.num_experts)
+        )
+        scores_for_choice = scores_for_choice.masked_fill(
+            ~score_mask.bool(),
+            float("-inf"),
+        )
+        indices = torch.topk(
+            scores_for_choice,
+            k=self.top_k,
+            dim=-1,
+            sorted=False,
+        )[1]
+        weights = scores.gather(1, indices)
+        if self.norm_topk_prob:
+            weights = weights / (
+                weights.sum(dim=-1, keepdim=True) + 1.0e-20
+            )
+        weights = weights * self.routed_scaling_factor
+        return router_logits, weights, indices
+
+
 class GLM5NextPackedExperts(nn.Module):
     """Thin topology adapter for the common packed routed-expert pool."""
 
@@ -441,16 +768,32 @@ class GLM5NextCCCPModel:
         vram_cache_gb: float = 4.0,
         tp_size: int = 1,
     ) -> None:
-        if int(tp_size) != 1:
-            raise ValueError("GLM-5.3 currently requires tp_size=1")
+        self.tp_size = int(tp_size)
+        if self.tp_size <= 0:
+            raise ValueError("GLM-5.3 tp_size must be positive")
         self.root = root
-        self.device = torch.device(device)
-        if self.device.type == "cuda" and self.device.index is None:
-            self.device = torch.device("cuda", torch.cuda.current_device())
+        requested = torch.device(device)
+        if requested.type == "cuda" and requested.index is None:
+            requested = torch.device("cuda", torch.cuda.current_device())
+        if self.tp_size > 1:
+            if requested.type != "cuda":
+                raise ValueError("GLM-5.3 routed TP requires CUDA")
+            primary = int(requested.index or 0)
+            self.devices = tuple(
+                torch.device("cuda", primary + rank)
+                for rank in range(self.tp_size)
+            )
+            if self.devices[-1].index >= torch.cuda.device_count():
+                raise ValueError(
+                    f"GLM-5.3 tp={self.tp_size} exceeds visible CUDA devices"
+                )
+        else:
+            self.devices = (requested,)
+        self.device = self.devices[0]
         self.store = CCCPStore(root)
         self.cfg = self.store.cfg
         self.max_ctx = int(max_ctx)
-        self.effective_tp_size = 1
+        self.effective_tp_size = self.tp_size
         self._cache_gb = float(cache_gb)
         self._vram_cache_gb = float(vram_cache_gb)
         self._model: nn.Module | None = None
@@ -469,6 +812,8 @@ class GLM5NextCCCPModel:
         codebook_runtime = create_routed_vq_runtime(
             self.store,
             device=self.device,
+            devices=self.devices,
+            tp_size=self.tp_size,
             cache_gb=self._cache_gb,
             vram_cache_gb=self._vram_cache_gb,
         )
@@ -527,6 +872,17 @@ class GLM5NextCCCPModel:
                 swiglu_limit=limit,
             )
 
+    @staticmethod
+    def _replace_sparse_routers(model: nn.Module) -> int:
+        replaced = 0
+        for decoder in model.layers:
+            gate = getattr(getattr(decoder, "mlp", None), "gate", None)
+            if gate is None:
+                continue
+            decoder.mlp.gate = GLM5NextTopkRouterRuntime(gate)
+            replaced += 1
+        return replaced
+
     def _replace_linears(self, model: nn.Module) -> int:
         replaced = 0
         for name, module in list(model.named_modules()):
@@ -551,10 +907,21 @@ class GLM5NextCCCPModel:
             replaced += 1
         return replaced
 
-    @staticmethod
-    def _install_public_decoder_layers(model: nn.Module) -> None:
+    def _install_public_decoder_layers(self, model: nn.Module) -> None:
+        decode_graph_enabled = (
+            self.device.type == "cuda"
+            and self.tp_size > 1
+            and os.environ.get("CCCP_GLM_LINEAR_DECODE_GRAPH", "1") != "0"
+        )
         for index, layer in enumerate(model.layers):
-            model.layers[index] = GLM5NextDecoderLayerRuntime(layer)
+            decode_graph_pool = None
+            if decode_graph_enabled and layer.block_type == "linear_attention":
+                with torch.cuda.device(self.device):
+                    decode_graph_pool = torch.cuda.graph_pool_handle()
+            model.layers[index] = GLM5NextDecoderLayerRuntime(
+                layer,
+                decode_graph_pool=decode_graph_pool,
+            )
 
     @staticmethod
     def _install_static_sparse_index_pools(model: nn.Module) -> None:
@@ -639,6 +1006,7 @@ class GLM5NextCCCPModel:
         self._replace_sparse_experts(model)
         linears = self._replace_linears(model)
         state = self._assign_remaining_state(model)
+        routers = self._replace_sparse_routers(model)
         self._install_static_sparse_index_pools(model)
         self._install_public_decoder_layers(model)
         lm_head = self._place_weight(
@@ -650,7 +1018,8 @@ class GLM5NextCCCPModel:
         self._text_config = config
         print(
             "[cccp-glm5-next] 官方文本拓扑绑定完成："
-            f"公共 Linear={linears}，非线性状态={state}；"
+            f"公共 Linear={linears}，公共 Router={routers}，"
+            f"非线性状态={state}；"
             "视觉塔未载入",
             flush=True,
         )
@@ -691,6 +1060,7 @@ class GLM5NextCCCPModel:
     def _fixed_token_graph_enabled(self) -> bool:
         return bool(
             self.device.type == "cuda"
+            and self.tp_size == 1
             and self.routed_vq.full_resident
             and os.environ.get("CCCP_FIXED_TOKEN_GRAPH", "1") != "0"
         )
@@ -868,6 +1238,11 @@ class GLM5NextCCCPModel:
             self._past_key_values.reset()
         else:
             self._past_key_values = None
+            if self._model is not None:
+                for decoder in self._model.layers:
+                    reset_graph = getattr(decoder, "reset_decode_graph", None)
+                    if callable(reset_graph):
+                        reset_graph()
         self._token_history.clear()
         self.pos = 0
 
@@ -942,10 +1317,12 @@ __all__ = [
     "GLM5NextCCCPModel",
     "GLM5NextDecoderLayerRuntime",
     "GLM5NextPackedExperts",
+    "GLM5NextTopkRouterRuntime",
     "_glm5_next_delta_rule",
     "_glm5_next_hc_post",
     "_glm5_next_hc_pre_norm",
     "_glm5_next_kda_raw_inputs",
+    "_glm5_next_linear_decode_graph_eligible",
     "_glm5_next_pool_phase",
     "_glm5_next_static_pool_states",
 ]

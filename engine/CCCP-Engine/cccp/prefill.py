@@ -22,9 +22,12 @@ def prefill_ranges(tokens: int, chunk_size: int = 4096):
 
 def batched_packed_prefill_available(pool, full_gpu: bool) -> bool:
     """Require an explicit row-batched packed-MoE capability."""
+    dispatch = getattr(pool, "execute", None)
+    if not callable(dispatch):
+        dispatch = getattr(pool, "run_rows", None)
     return bool(
         getattr(pool, "prefill_rows_supported", False)
-        and callable(getattr(pool, "run_rows", None))
+        and callable(dispatch)
     )
 
 

@@ -97,6 +97,7 @@ def plan_routed_vq_pool(
     full_gpu_requested: bool,
     tensor_hybrid_requested: bool,
     layer_graph_requested: bool,
+    parallelism_requested: str | None = None,
 ) -> RoutedVQPoolPlan:
     """Select routed-codebook storage only from format and capabilities.
 
@@ -108,6 +109,15 @@ def plan_routed_vq_pool(
     tp_size = int(tp_size)
     if tp_size <= 0:
         raise ValueError("tp_size must be positive")
+    requested_parallelism = (
+        str(parallelism_requested).strip().lower()
+        if parallelism_requested is not None
+        else ""
+    )
+    if requested_parallelism not in {"", "pipeline", "expert", "tensor"}:
+        raise ValueError(
+            "routed VQ parallelism must be pipeline, expert, or tensor"
+        )
     projection_vq = bool(getattr(manifest, "projection_vq", False))
     packed_cpu = bool(
         getattr(manifest, "packed_expert_vq", projection_vq)
@@ -146,7 +156,12 @@ def plan_routed_vq_pool(
             packed_device_pool=True,
             packed_full_gpu=True,
             parallelism=(
-                "tensor" if layer_graph_requested or tp_size > 1 else "pipeline"
+                requested_parallelism
+                or (
+                    "tensor"
+                    if layer_graph_requested or tp_size > 1
+                    else "pipeline"
+                )
             ),
         )
     return RoutedVQPoolPlan(
@@ -244,6 +259,7 @@ def create_routed_vq_runtime(
         full_gpu_requested=full_gpu,
         tensor_hybrid_requested=tensor_hybrid,
         layer_graph_requested=layer_graph,
+        parallelism_requested=os.environ.get("CCCP_MOE_PARALLELISM"),
     )
     topology_plan = None
     if plan.kind in {"packed_full", "packed_tensor_hybrid"} or layer_graph:

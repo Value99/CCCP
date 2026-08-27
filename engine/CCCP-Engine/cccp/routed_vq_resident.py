@@ -46,6 +46,47 @@ def _dequant_scratch_bytes(
     )
 
 
+def _native8_residency_supported(
+    masks: tuple[torch.Tensor, ...],
+    parallelism: str,
+) -> bool:
+    """Validate the rank residency contract used by grouped Native8 Prefill."""
+
+    if not masks:
+        return False
+    normalized = str(parallelism).strip().lower()
+    if normalized == "tensor":
+        return all(bool(mask.all()) for mask in masks)
+    if normalized != "expert":
+        return False
+    shape = tuple(masks[0].shape)
+    if any(tuple(mask.shape) != shape for mask in masks):
+        return False
+    coverage = torch.zeros_like(masks[0], dtype=torch.int16)
+    for mask in masks:
+        coverage.add_(mask.to(device=coverage.device, dtype=coverage.dtype))
+    return bool((coverage == 1).all())
+
+
+def _partition_expert_parallel_routes(
+    route_ids: torch.Tensor,
+    *,
+    layer: int,
+    rank: int,
+    ranks: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return flat route positions and global ids owned by one expert rank."""
+
+    if int(ranks) <= 0 or not 0 <= int(rank) < int(ranks):
+        raise ValueError("expert-parallel rank must be inside the rank count")
+    flat_ids = route_ids.reshape(-1)
+    positions = torch.nonzero(
+        torch.remainder(flat_ids + int(layer), int(ranks)) == int(rank),
+        as_tuple=False,
+    ).reshape(-1)
+    return positions, flat_ids.index_select(0, positions)
+
+
 _CUDA_HOST_REGISTER_MAPPED = 2
 _CUDA_MEMCPY_HOST_TO_DEVICE = 1
 _CUDART_LIBRARY = None
@@ -203,6 +244,18 @@ class _PackedPrefillWorkspace:
     route_weights: torch.Tensor
     hidden: torch.Tensor
     output: torch.Tensor
+    result: torch.Tensor
+
+
+@dataclass
+class _Native8PrefillRankWorkspace:
+    """Small TP transport scratch; FP8 GEMM owns the projection buffers."""
+
+    capacity: int
+    top_k: int
+    inputs: torch.Tensor
+    route_ids: torch.Tensor
+    route_weights: torch.Tensor
     result: torch.Tensor
 
 
@@ -536,7 +589,7 @@ class ResidentRoutedVQPool:
             and os.environ.get("CCCP_MAPPED_ELASTIC_CACHE", "0") == "1"
         )
         self.hidden_mode = (
-            parallelism == "tensor"
+            parallelism in {"expert", "tensor"}
             and os.environ.get("CCCP_TP_HIDDEN", "0") != "0"
             and os.environ.get("CCCP_TP_NO_OWNER", "1") != "0"
         )
@@ -664,7 +717,13 @@ class ResidentRoutedVQPool:
         self._native8_scales: dict[
             int, tuple[torch.Tensor, ...]
         ] = {}
+        self._native8_expert_ids: dict[
+            int, tuple[torch.Tensor, ...]
+        ] = {}
         self._native8_workspaces: dict[int, dict[str, object]] = {}
+        self._native8_prefill_workspaces: dict[
+            int, _Native8PrefillRankWorkspace
+        ] = {}
         self._compact_decode_enabled = False
         self._compact_decode_codebooks: dict[int, torch.Tensor] = {}
         self._compact_decode_metadata: dict[
@@ -1950,7 +2009,6 @@ class ResidentRoutedVQPool:
             if (
                 capture_graphs
                 and os.environ.get("CCCP_TP_GRAPH", "1") != "0"
-                and not self._compact_decode_enabled
             ):
                 self._prepare_expert_graphs()
         self._prepare_native8_prefill()
@@ -2497,7 +2555,8 @@ class ResidentRoutedVQPool:
 
         capability = torch.cuda.get_device_capability(self.devices[0])
         backend = select_grouped_fp8_backend(
-            (int(capability[0]), int(capability[1]))
+            (int(capability[0]), int(capability[1])),
+            multi_device=len(self.devices) > 1,
         )
         if backend is None:
             return
@@ -2531,9 +2590,11 @@ class ResidentRoutedVQPool:
 
         metadata_by_layer: dict[int, tuple[torch.Tensor, ...]] = {}
         scales_by_layer: dict[int, tuple[torch.Tensor, ...]] = {}
+        expert_ids_by_layer: dict[int, tuple[torch.Tensor, ...]] = {}
         for layer, rank_metadata in self._metadata.items():
             native_metadata = []
             native_scales = []
+            native_expert_ids = []
             for rank, (device, metadata) in enumerate(
                 zip(self.devices, rank_metadata)
             ):
@@ -2541,12 +2602,28 @@ class ResidentRoutedVQPool:
                     metadata,
                     replacement_by_rank[rank],
                 )
+                if self.parallelism == "expert":
+                    expert_ids = torch.nonzero(
+                        self._grouped_local_mask(int(layer), rank),
+                        as_tuple=False,
+                    ).reshape(-1).to(device=rewritten.device)
+                    rewritten = rewritten.index_select(1, expert_ids)
+                    scales = scales.index_select(0, expert_ids)
+                else:
+                    expert_ids = torch.arange(
+                        int(rewritten.shape[1]),
+                        dtype=torch.long,
+                        device=rewritten.device,
+                    )
                 native_metadata.append(rewritten.to(device=device))
                 native_scales.append(scales.to(device=device))
+                native_expert_ids.append(expert_ids.to(device=device))
             metadata_by_layer[int(layer)] = tuple(native_metadata)
             scales_by_layer[int(layer)] = tuple(native_scales)
+            expert_ids_by_layer[int(layer)] = tuple(native_expert_ids)
         self._native8_metadata = metadata_by_layer
         self._native8_scales = scales_by_layer
+        self._native8_expert_ids = expert_ids_by_layer
         self._native8_grouped_backend = backend
         self._native8_prefill_enabled = bool(metadata_by_layer)
         if self._native8_prefill_enabled:
@@ -2560,9 +2637,12 @@ class ResidentRoutedVQPool:
     def _native8_layer_supported(self, layer: int) -> bool:
         if not self._native8_prefill_enabled:
             return False
-        return all(
-            bool(self._grouped_local_mask(int(layer), rank).all())
-            for rank in range(len(self.devices))
+        return _native8_residency_supported(
+            tuple(
+                self._grouped_local_mask(int(layer), rank)
+                for rank in range(len(self.devices))
+            ),
+            self.parallelism,
         )
 
     def _prepare_compact_decode(self) -> None:
@@ -2732,6 +2812,17 @@ class ResidentRoutedVQPool:
         ):
             return cached
         device = self.devices[int(rank)]
+        if cached is not None:
+            # Growing after a shorter request used to retain the complete old
+            # E4M3 image while allocating its larger replacement.  Kimi TP4
+            # then failed despite the final workspace fitting.  Resizing is a
+            # rare context-boundary event, so synchronize and release first.
+            with torch.cuda.device(device):
+                torch.cuda.synchronize(device)
+            self._native8_workspaces.pop(int(rank), None)
+            del cached
+            with torch.cuda.device(device):
+                torch.cuda.empty_cache()
         options = {"dtype": torch.float8_e4m3fn, "device": device}
         cached = {
             "expert_count": int(expert_count),
@@ -2908,9 +2999,43 @@ class ResidentRoutedVQPool:
             if self.parallelism in {"tensor", "hybrid"}
             else intermediate
         )
-        routed_rows = int(count) * int(top_k)
+        flat_weights = route_weights_mb.reshape(-1)
+        if self.parallelism == "expert":
+            route_positions, global_route_ids = (
+                _partition_expert_parallel_routes(
+                    route_ids_mb,
+                    layer=int(layer),
+                    rank=int(rank),
+                    ranks=len(self.devices),
+                )
+            )
+            if int(route_positions.numel()) == 0:
+                result.zero_()
+                return result
+            resident_ids = self._native8_expert_ids[int(layer)][int(rank)]
+            local_route_ids = torch.searchsorted(
+                resident_ids,
+                global_route_ids,
+            )
+            if not bool(
+                (
+                    resident_ids.index_select(0, local_route_ids)
+                    == global_route_ids
+                ).all()
+            ):
+                raise RuntimeError(
+                    "expert-parallel Native8 route is not resident on its owner"
+                )
+        else:
+            route_positions = torch.arange(
+                int(count) * int(top_k),
+                dtype=torch.long,
+                device=device,
+            )
+            local_route_ids = route_ids_mb.reshape(-1)
+        routed_rows = int(local_route_ids.numel())
         route_groups = build_active_grouped_routes(
-            route_ids_mb.reshape(-1),
+            local_route_ids,
             group_capacity=expert_capacity,
             bucketed=(
                 self._native8_grouped_backend == "deepgemm-sm90"
@@ -2973,13 +3098,16 @@ class ResidentRoutedVQPool:
 
         order = route_groups.order
         sorted_experts = route_groups.sorted_group_ids
-        token_ids = (
-            torch.arange(count, dtype=torch.long, device=device)
-            .view(-1, 1)
-            .expand(count, top_k)
-            .reshape(-1)
-        )
-        sorted_tokens = token_ids[order].contiguous()
+        sorted_route_positions = route_positions.index_select(0, order)
+        sorted_tokens = torch.div(
+            sorted_route_positions,
+            int(top_k),
+            rounding_mode="floor",
+        ).contiguous()
+        sorted_weights = flat_weights.index_select(
+            0,
+            sorted_route_positions,
+        ).float().contiguous()
         grouped_input = inputs.index_select(0, sorted_tokens).contiguous()
         native_input = workspace["input"][:routed_rows]
         input_scales = workspace["input_scales"][:routed_rows]
@@ -3088,6 +3216,14 @@ class ResidentRoutedVQPool:
             ),
             output=down_output,
         )
+        if self.parallelism == "expert":
+            result.zero_()
+            result.index_add_(
+                0,
+                sorted_tokens,
+                routed.float() * sorted_weights.unsqueeze(1),
+            )
+            return result
         reduced = routed_weighted_reduce_fused(
             routed,
             order,
@@ -3191,11 +3327,7 @@ class ResidentRoutedVQPool:
         )
         for rank, device in enumerate(self.devices):
             metadata = self._metadata[layer][rank]
-            stream = (
-                self._streams[rank]
-                if self._streams
-                else torch.cuda.current_stream(device)
-            )
+            stream = self._prefill_expansion_stream(rank, device)
             with torch.cuda.device(device), torch.cuda.stream(stream):
                 gu, down = self._dequant_scratch(
                     rank,
@@ -3205,6 +3337,16 @@ class ResidentRoutedVQPool:
                     device,
                 )
                 projection_dequant(metadata, gu, down)
+
+    def _prefill_expansion_stream(
+        self,
+        rank: int,
+        device: torch.device,
+    ):
+        """Use the eventual GEMM consumer stream for packed expansion."""
+        if len(self.devices) == 1 or not self._streams:
+            return torch.cuda.current_stream(device)
+        return self._streams[int(rank)]
 
     def _run_rows_dequant_rank(
         self,
@@ -3362,6 +3504,56 @@ class ResidentRoutedVQPool:
             hidden_workspace=hidden_workspace[: int(sorted_tokens.numel())],
             result=result,
         )
+
+    def _native8_prefill_rank_workspace(
+        self,
+        rank: int,
+        *,
+        capacity: int,
+        top_k: int,
+        hidden: int,
+    ) -> _Native8PrefillRankWorkspace:
+        """Return the shared rank-local Native8 prefill transport buffers."""
+        cached = self._native8_prefill_workspaces.get(int(rank))
+        if (
+            cached is not None
+            and cached.capacity >= int(capacity)
+            and cached.top_k == int(top_k)
+            and cached.result.shape[1] == int(hidden)
+        ):
+            return cached
+        device = self.devices[int(rank)]
+        with torch.cuda.device(device):
+            cached = _Native8PrefillRankWorkspace(
+                capacity=int(capacity),
+                top_k=int(top_k),
+                inputs=torch.empty(
+                    capacity,
+                    hidden,
+                    dtype=torch.bfloat16,
+                    device=device,
+                ),
+                route_ids=torch.empty(
+                    capacity,
+                    top_k,
+                    dtype=torch.long,
+                    device=device,
+                ),
+                route_weights=torch.empty(
+                    capacity,
+                    top_k,
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                result=torch.empty(
+                    capacity,
+                    hidden,
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            )
+        self._native8_prefill_workspaces[int(rank)] = cached
+        return cached
 
     def run_rows(
         self,
@@ -3574,7 +3766,17 @@ class ResidentRoutedVQPool:
         from .fusedext import tp_all_rank_reduce_from_events_fused
 
         rank_order = tuple(range(len(self.devices)))
-        rank_workspaces = tuple(workspace(rank) for rank in rank_order)
+        rank_workspaces = tuple(
+            self._native8_prefill_rank_workspace(
+                rank,
+                capacity=micro_batch,
+                top_k=top_k,
+                hidden=hidden,
+            )
+            if native8_prefill
+            else workspace(rank)
+            for rank in rank_order
+        )
         source_ready = self._source_events[layer]
         done_events = [
             self._done_events[rank][layer] for rank in rank_order
@@ -3846,19 +4048,27 @@ class ResidentRoutedVQPool:
 
         from .fusedext import tp_all_rank_reduce_from_events_fused
 
+        native8_prefill = self._native8_layer_supported(layer)
         capability = self.store.man.projection_operator_capability(layer)
         dequant_prefill = bool(
-            len(capability.get("packed_formats", ())) == 3
+            not native8_prefill
+            and len(capability.get("packed_formats", ())) == 3
             and self.store.man.projection_vq
             and self._dequant_supported(layer)
         )
-        if not dequant_prefill:
+        if not native8_prefill and not dequant_prefill:
             raise RuntimeError(
-                "replicated packed CUDA Prefill requires exact dequant + "
-                "grouped GEMM; decode GEMV fallback is forbidden"
+                "replicated packed CUDA Prefill requires Native8 or exact "
+                "dequant + grouped GEMM; decode GEMV fallback is forbidden"
             )
-        self.prefill_executor = "cuda.dequant-grouped-gemm"
-        self._prefill_dequant_launch(layer, intermediate, hidden)
+        if native8_prefill:
+            self.prefill_executor = (
+                "cuda.vq-to-e4m3-scaled-grouped-gemm."
+                f"{self._native8_grouped_backend}"
+            )
+        else:
+            self.prefill_executor = "cuda.dequant-grouped-gemm"
+            self._prefill_dequant_launch(layer, intermediate, hidden)
         outputs = [
             torch.empty(
                 rows,
@@ -3869,7 +4079,15 @@ class ResidentRoutedVQPool:
             for device in self.devices
         ]
         rank_workspaces = tuple(
-            workspace(rank) for rank in range(len(self.devices))
+            self._native8_prefill_rank_workspace(
+                rank,
+                capacity=micro_batch,
+                top_k=top_k,
+                hidden=hidden,
+            )
+            if native8_prefill
+            else workspace(rank)
+            for rank in range(len(self.devices))
         )
         done_events = [
             self._done_events[rank][layer]
@@ -3918,20 +4136,36 @@ class ResidentRoutedVQPool:
                         route_weights[start:stop],
                         non_blocking=True,
                     )
-                    partial = self._run_rows_dequant_rank(
-                        layer,
-                        rank,
-                        cached.inputs[:count],
-                        cached.route_ids[:count],
-                        cached.route_weights[:count],
-                        cached.result[:count],
-                        count,
-                        top_k,
-                        activation,
-                        activation_beta,
-                        activation_linear_beta,
-                        limit,
-                    )
+                    if native8_prefill:
+                        partial = self._run_rows_native8_rank(
+                            layer,
+                            rank,
+                            cached.inputs[:count],
+                            cached.route_ids[:count],
+                            cached.route_weights[:count],
+                            cached.result[:count],
+                            count,
+                            top_k,
+                            activation,
+                            activation_beta,
+                            activation_linear_beta,
+                            limit,
+                        )
+                    else:
+                        partial = self._run_rows_dequant_rank(
+                            layer,
+                            rank,
+                            cached.inputs[:count],
+                            cached.route_ids[:count],
+                            cached.route_weights[:count],
+                            cached.result[:count],
+                            count,
+                            top_k,
+                            activation,
+                            activation_beta,
+                            activation_linear_beta,
+                            limit,
+                        )
                     contributions.append(partial)
                     done_events[rank].record(stream)
             reduced = tp_all_rank_reduce_from_events_fused(
@@ -4023,6 +4257,55 @@ class ResidentRoutedVQPool:
         owner = self.plan.owner_by_layer[layer]
         owner_device = self.devices[owner]
         graph_batch = self._graph_batches.get(layer)
+        if (
+            graph_batch is not None
+            and len(self.devices) == 1
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            # CUDA does not permit launching an already-instantiated child
+            # graph while an outer whole-token graph is being captured.  For
+            # TP1, record the same public packed kernels directly into the
+            # outer graph; ordinary eager Decode continues to use the retained
+            # route/expert child graph below.
+            hidden, output, result = self._workspaces[owner]
+            with torch.cuda.device(owner_device):
+                if self._compact_decode_enabled:
+                    reduced = self._run_compact_decode_rank(
+                        layer,
+                        owner,
+                        value,
+                        route_ids,
+                        route_weights,
+                        activation=activation,
+                        activation_beta=activation_beta,
+                        activation_linear_beta=activation_linear_beta,
+                        limit=limit,
+                        result=result,
+                    )
+                else:
+                    reduced = packed_moe_topk(
+                        value.to(torch.bfloat16),
+                        route_ids.reshape(-1),
+                        route_weights.reshape(-1),
+                        self._metadata[layer][owner],
+                        activation=activation,
+                        activation_beta=float(activation_beta),
+                        activation_linear_beta=(
+                            0.0
+                            if activation_linear_beta is None
+                            else float(activation_linear_beta)
+                        ),
+                        hidden_workspace=hidden,
+                        output_workspace=output,
+                        result=result,
+                        grouped_prefix=-1,
+                        **self.store.man.projection_operator_capability(
+                            layer
+                        ),
+                        limit=float(limit),
+                    )
+            self.hits += int(route_ids.numel())
+            return reduced
         if graph_batch is not None:
             from .fusedext import expert_dispatch_pack_fused
 

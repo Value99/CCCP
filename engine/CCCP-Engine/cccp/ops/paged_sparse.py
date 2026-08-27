@@ -16,6 +16,12 @@ MODEL1_SCALE_STRIDE = 8
 MODEL1_STORAGE_BYTES = MODEL1_PAYLOAD_BYTES + MODEL1_SCALE_STRIDE
 
 
+def _ceil_power_of_two(values: torch.Tensor) -> torch.Tensor:
+    """Round positive scales upward without CUDA 13's broken exp2 path."""
+    exponents = values.log2().ceil().to(torch.int32)
+    return torch.ldexp(torch.ones_like(values), exponents)
+
+
 @dataclass
 class Model1FP8PagedCache:
     """FlashMLA Model1 cache with stable page addresses.
@@ -85,7 +91,7 @@ class Model1FP8PagedCache:
                 count, MODEL1_SCALE_COUNT, 64
             )
             scales = (tiles.abs().amax(dim=-1) / 448.0).clamp_min(1.0e-4)
-            scales = scales.log2().ceil().exp2()
+            scales = _ceil_power_of_two(scales)
             quantized = (tiles / scales.unsqueeze(-1)).to(
                 torch.float8_e4m3fn
             ).reshape(count, MODEL1_NOPE_DIM)

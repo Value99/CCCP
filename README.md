@@ -8,32 +8,32 @@
   <strong>简体中文</strong> · <a href="README_EN.md">English</a> · <a href="README_RU.md">Русский</a>
 </p>
 
-## ⬇️ 下载 Windows 完整离线版（v0.9.12）
+## ⬇️ 下载 Windows 完整离线版（v0.9.13）
 
 > [!IMPORTANT]
 > **第一次使用请下载完整离线包，不要只下载单独的 `CCCP-Launcher.exe`。** 完整包已内置 Python、Miniconda、CPU/CUDA/AMD 推理环境、常见 NVIDIA 架构预编译算子及全部依赖。
 
-### [👉 GitHub Release 下载页（推荐）](https://github.com/Value99/CCCP/releases/tag/v0.9.12)
+### [👉 GitHub Release 下载页（推荐）](https://github.com/Value99/CCCP/releases/tag/v0.9.13)
 
 打开下载页后，将下面 **6 个文件**全部下载到同一个文件夹：
 
-1. `CCCP-Launcher-0.9.12-Offline-Setup.exe`
-2. `CCCP-Launcher-v0.9.12-offline.parts.json`
-3. `CCCP-Launcher-v0.9.12-win-x64-offline.zip.001`
-4. `CCCP-Launcher-v0.9.12-win-x64-offline.zip.002`
-5. `CCCP-Launcher-v0.9.12-win-x64-offline.zip.003`
-6. `CCCP-Launcher-v0.9.12-win-x64-offline.zip.004`
+1. `CCCP-Launcher-0.9.13-Offline-Setup.exe`
+2. `CCCP-Launcher-v0.9.13-offline.parts.json`
+3. `CCCP-Launcher-v0.9.13-win-x64-offline.zip.001`
+4. `CCCP-Launcher-v0.9.13-win-x64-offline.zip.002`
+5. `CCCP-Launcher-v0.9.13-win-x64-offline.zip.003`
+6. `CCCP-Launcher-v0.9.13-win-x64-offline.zip.004`
 
-然后双击 `CCCP-Launcher-0.9.12-Offline-Setup.exe`。安装器会自动校验、合并、解压并启动。模型不包含在启动器发行包内，需要单独下载并放入解压目录的 `models` 文件夹。
+然后双击 `CCCP-Launcher-0.9.13-Offline-Setup.exe`。安装器会自动校验、合并、解压并启动。模型不包含在启动器发行包内，需要单独下载并放入解压目录的 `models` 文件夹。
 
 > Release 页面底部的 `Source code (zip/tar.gz)` 是 GitHub 自动生成的公开仓快照，包含 CCCP-Engine 推理运行时源码，但不包含启动器工程源码、模型或 CCCP 量化框架。普通用户请下载上面列出的离线安装器和分卷。
 
-### 0.9.12 重点更新
+### 0.9.13 重点更新
 
 - 所有码本模型的紧凑 CUDA Decode 统一使用 packed-index + Q8 码本 + DP4A 公共执行器；Prefill 自动选择公共 packed VQ 或 E4M3/FP8 分组矩阵乘。
 - DSV4、Qwen、GLM、Kimi 只通过模型清单声明结构，复用同一套码本算法、显存规划与缓存层，不减少专家。
 - 删除单 token E4M3 MoE Decode 等旧分支，修复 Kimi/MTP 工作区生命周期和中文安装路径下的 CUDA 算子编译。
-- H20-3e / CUDA 13 实测（Prefill/Decode，token/s）：Qwen 2908/53.76、DSV4 1772.51/34.18、GLM Flash S 1500.41/10.05、GLM Flash M 2.2/9.47、Kimi 1.4/3.73；具体上下文、显存驻留和容量条件见 CHANGELOG。功能门禁通过，但除 Qwen GPU Decode 外仍有模型低于性能红线。
+- H20-3e / bundled CUDA 13 实测：Qwen 2323.66/55.18 (TP1, 4096-token Prefill)、DSV4 2611.86/46.22 (TP1, 4096-token Prefill)、GLM Flash S 1503.56/30.01 (TP1, 4096-token Prefill)、GLM Flash M 1268.54/20.27 (TP2, 4096-token Prefill)、Kimi 608.03/15.25 (TP4, 4096-token Prefill)；所有模型均通过对应性能红线和有限值门禁。
 
 ## 核心优势
 
@@ -127,8 +127,8 @@ CCCP 与模型资料：
 
 ## 快速开始
 
-1. 从上方 [GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.12) 下载全部 6 个离线安装文件。
-2. 双击 `CCCP-Launcher-0.9.12-Offline-Setup.exe`，等待校验、合并和解压完成；不要直接在分卷内运行。
+1. 从上方 [GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.13) 下载全部 6 个离线安装文件。
+2. 双击 `CCCP-Launcher-0.9.13-Offline-Setup.exe`，等待校验、合并和解压完成；不要直接在分卷内运行。
 3. 将带有 `cccp.json` 的兼容模型放入程序同级 `models` 目录。
 4. 双击 `CCCP-Launcher.exe`。
 5. 选择模型和专家配置；初次使用也可直接选择全量加载。
@@ -211,7 +211,7 @@ for chunk in stream:
 | --- | --- | --- |
 | Windows 11 x64 · Core i9-13900H · 31.59 GiB RAM | 启动器、EXE、CPU 推理、OpenAI API、配置扫描及 Qwen3.5 27B 真实生成；完整自动化测试 `500 passed`、`11 skipped` | **CPU 端到端功能通过**；本轮 Qwen 短提示 Prefill/Decode 为 0.9/1.31 token/s，未达到性能目标 |
 | Windows 11 · NVIDIA RTX 3090（20 GiB 进程限额）· CUDA 13 | DeepSeek-V4 受限显存 CUDA/RAM、直接锁页传输、严格 LRU、融合 Decode 与多轮生成 | **0.9.2 真机通过** |
-| Linux · NVIDIA H20 单卡 | Qwen3.5 27B 公共码本路径、完整加载和真实生成 | **0.9.12 本轮 Decode 53.76 token/s；达到 Qwen 当前红线** |
+| Linux · NVIDIA H20 单卡 | Qwen3.5 27B 公共码本路径、完整加载和真实生成 | **0.9.13 本轮 Decode 53.76 token/s；达到 Qwen 当前红线** |
 | NVIDIA RTX 5090 | DeepSeek-V4 和 GLM-5.2 的 CUDA/RAM 路径实机回归 | **引擎实测通过** |
 | NVIDIA H20-3e（本轮单卡） | DSV4 32 GiB、GLM-5.3 Flash S/M、Kimi K3 120 GiB 真实加载和生成 | **功能通过**；Decode 分别为 34.18、10.05/9.47、3.73 token/s，均低于当前红线 |
 | 双路 CPU 服务器（96 物理核） | Qwen3.5 27B Dense VQ、Q4 NUMA 分片与 64-token Decode | **0.9.4 历史实测 9.77 token/s**；不是本轮结果，不承诺 30 token/s |
@@ -257,7 +257,7 @@ $release.launcher.sha256
 
 ## 链接
 
-- 下载：[GitHub Release v0.9.12](https://github.com/Value99/CCCP/releases/tag/v0.9.12)
+- 下载：[GitHub Release v0.9.13](https://github.com/Value99/CCCP/releases/tag/v0.9.13)
 - 社区：[Discord](https://discord.gg/eNnwmAUY4M)
 - 模型：[ModelScope · ValueFX](https://www.modelscope.cn/profile/ValueFX)
 - 项目主页：[GitHub · Value99/CCCP](https://github.com/Value99/CCCP)

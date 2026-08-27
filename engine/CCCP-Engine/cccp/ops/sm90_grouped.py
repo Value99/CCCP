@@ -138,6 +138,7 @@ def select_grouped_fp8_backend(
     capability: tuple[int, int],
     *,
     deepgemm_available: bool | None = None,
+    multi_device: bool = False,
 ) -> str | None:
     """Select the fastest packaged exact grouped FP8 executor for an SM."""
 
@@ -147,7 +148,11 @@ def select_grouped_fp8_backend(
         if deepgemm_available is None
         else bool(deepgemm_available)
     )
-    if (major, minor) == (9, 0) and has_deepgemm:
+    # DeepGEMM 2.6 keeps one process-global CUDA JIT function handle.  That
+    # handle belongs to the first CUDA context, and isolated per-device loads
+    # are slower than torch grouped-mm at the 896-group Kimi shape.  TP keeps
+    # the faster process-safe torch primitive; TP1 retains DeepGEMM.
+    if (major, minor) == (9, 0) and has_deepgemm and not multi_device:
         return "deepgemm-sm90"
     if major in (9, 10):
         return "torch-scaled-grouped-mm"

@@ -748,8 +748,14 @@ class KimiK3CCCPModel:
                     # retained by TensorParallelKDA.capture, preserving the
                     # fixed addresses already composed into MLP parents.
                     self._tp_kda.capture()
+                    # capture() intentionally rebuilds the base KDA graph
+                    # batch.  Restore the normalization/residual parent
+                    # sequence now that every child graph has reached its
+                    # final lifetime; fixed output buffers/events remain
+                    # unchanged for the MLP and MoE plans above.
+                    self._prepare_tp_attention_layer_graph()
                     print(
-                        "[cccp-kimi] 全部 KDA 固定图在父图后完成最终捕获",
+                        "[cccp-kimi] 全部 KDA 固定图在父图后完成最终捕获并重组",
                         flush=True,
                     )
             return
@@ -791,7 +797,7 @@ class KimiK3CCCPModel:
         )
         if (
             not self.routed_vq.hidden_mode
-            or self.routed_vq.parallelism != "tensor"
+            or self.routed_vq.parallelism not in {"expert", "tensor"}
             or self._tp_route_down is None
             or self._tp_fixed_moe_prelude is not None
             or self._tp_moe_owner_layer_graph
@@ -826,9 +832,13 @@ class KimiK3CCCPModel:
                 else "independent_all_rank_graphs"
             ),
             "routed_up_input_layout": "bound_local_view_zero_copy",
-            "packed_expert_parallelism": "tensor",
+            "packed_expert_parallelism": self.routed_vq.parallelism,
             "packed_expert_ranks": len(self.devices),
-            "packed_expert_weight_layout": "all_rank_tensor_sharded",
+            "packed_expert_weight_layout": (
+                "one_rank_per_expert"
+                if self.routed_vq.parallelism == "expert"
+                else "all_rank_tensor_sharded"
+            ),
             "dense_staging_layout": "layer_local_startup_only",
             "dense_runtime_layout": "all_layer_all_rank_tp_sharded",
             "owner_dataflow_ops": 0,
@@ -6700,10 +6710,13 @@ class KimiK3CCCPModel:
         state.rope_cache[rank].index_copy_(
             0, positions, key_rope.contiguous()
         )
-        absorbed = torch.matmul(
-            query_nope.unsqueeze(2),
+        # Keep heads as the BMM batch dimension.  Broadcasting ``matmul``
+        # over [tokens, heads, 1, width] can materialize a tokens×heads
+        # expansion (12 GiB at Kimi TP4/4096) before Split-KV starts.
+        absorbed = torch.bmm(
+            query_nope.transpose(0, 1).contiguous(),
             state.key_absorb[rank],
-        )
+        ).transpose(0, 1)
         contexts = torch.empty(
             rows,
             local_heads,
@@ -6733,7 +6746,7 @@ class KimiK3CCCPModel:
             from .ops.attention_prefill import causal_latent_prefill
 
             context = causal_latent_prefill(
-                query_nope=absorbed.squeeze(2),
+                query_nope=absorbed,
                 query_rope=query_rope,
                 latent_cache=state.latent_cache[rank],
                 rope_cache=state.rope_cache[rank],
@@ -6765,7 +6778,7 @@ class KimiK3CCCPModel:
                 "paged_latent_prefill",
                 "cuda",
                 runner=runner,
-                query_nope=absorbed.squeeze(2),
+                query_nope=absorbed,
                 query_rope=query_rope,
                 latent_cache=latent_pages,
                 rope_cache=rope_pages,
@@ -6778,7 +6791,7 @@ class KimiK3CCCPModel:
             context = attention_step(
                 "causal_latent_prefill",
                 "cuda",
-                query_nope=absorbed.squeeze(2),
+                query_nope=absorbed,
                 query_rope=query_rope,
                 latent_cache=state.latent_cache[rank],
                 rope_cache=state.rope_cache[rank],
@@ -6795,14 +6808,10 @@ class KimiK3CCCPModel:
             )
         if context is None:
             raise RuntimeError("TP MLA 批量 prefill 注意力不可用")
-        output = (
-            torch.matmul(
-                contexts.unsqueeze(2),
-                state.value_absorb[rank].transpose(1, 2),
-            )
-            .squeeze(2)
-            .reshape(rows, -1)
-        )
+        output = torch.bmm(
+            contexts.transpose(0, 1).contiguous(),
+            state.value_absorb[rank].transpose(1, 2),
+        ).transpose(0, 1).reshape(rows, -1)
         output.mul_(output_gate.sigmoid())
         return self._prefill_linear(
             output,

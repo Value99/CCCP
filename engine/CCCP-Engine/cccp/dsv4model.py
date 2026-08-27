@@ -314,6 +314,38 @@ def _tp1_token_graph_bucket(
     return "topk512"
 
 
+def _tp1_direct_cache_reserve_item(max_ctx: int, ratio: int) -> int:
+    """Return the last compressed item read by TP1's direct graph buckets."""
+    context = max(1, int(max_ctx))
+    compression = int(ratio)
+    if compression <= 0:
+        raise ValueError("ratio must be positive")
+    max_items = (context + compression - 1) // compression
+    direct_items = 512 if compression == 4 else 16
+    return min(max_items, direct_items) - 1
+
+
+def _tp1_graph_cache_reserve_item(
+    max_ctx: int,
+    ratio: int,
+    sparse_bucket: bool,
+) -> int:
+    """Return the last compressed item referenced by retained TP1 graphs."""
+    compression = int(ratio)
+    if bool(sparse_bucket) and compression != 4:
+        context = max(1, int(max_ctx))
+        return (context + compression - 1) // compression - 1
+    return _tp1_direct_cache_reserve_item(max_ctx, compression)
+
+
+def _dsv4_compressed_page_items(ratio: int) -> int:
+    """Keep every direct TokenGraph compressed read inside one KV page."""
+    compression = int(ratio)
+    if compression <= 0:
+        raise ValueError("ratio must be positive")
+    return max(16, 4096 // compression)
+
+
 def _requires_flashmla_splitkv(
     *,
     device_type: str,
@@ -326,6 +358,15 @@ def _requires_flashmla_splitkv(
         and not bool(hip_runtime)
         and int(max_ctx) > 2051
     )
+
+
+def _flashmla_prefill_batch_enabled(
+    tokens: int,
+    *,
+    runner_available: bool,
+) -> bool:
+    """Use sparse SplitKV Prefill only for its validated long-batch range."""
+    return int(tokens) >= 512 and bool(runner_available)
 
 
 def _indexer_candidate_capacity(candidate_count: int) -> int:
@@ -1836,7 +1877,7 @@ class DSV4CCCPModel:
             if ratio:
                 st["compressed"] = PagedKV(
                     batch=B,
-                    page_items=max(1, 4096 // ratio),
+                    page_items=_dsv4_compressed_page_items(ratio),
                     dim=hd,
                     device=device,
                     dtype=compute_dtype(device),
@@ -4533,7 +4574,10 @@ class DSV4CCCPModel:
                 and torch.version.hip is None
                 and int(hd) == 512
                 and B == 1
-                and "sparse_runner" in st
+                and _flashmla_prefill_batch_enabled(
+                    T,
+                    runner_available="sparse_runner" in st,
+                )
                 and os.environ.get("CCCP_FLASHMLA_PREFILL", "1") != "0"
             )
             if flashmla_prefill:
@@ -5690,6 +5734,11 @@ class DSV4CCCPModel:
 
         device = self.devices[0]
         layer_count = int(self.cfg["n_layers"])
+        sparse_splitkv_available = any(
+            "sparse_runner" in context["state"]
+            for context in self._tp_attention_contexts[0]
+            if int(context["ratio"]) == 4
+        )
         # Every page address referenced by a captured graph must already be
         # stable.  At max_ctx=4096 each ratio-4/128 state fits in one page.
         for context in self._tp_attention_contexts[0]:
@@ -5701,8 +5750,9 @@ class DSV4CCCPModel:
             # exact direct bucket.  Reserving to the model's logical max_ctx
             # defeats dynamic KV and can eagerly allocate a million-token
             # cache.  Pages beyond this point are created on demand.
-            direct_token_limit = min(int(self.max_ctx), 2051)
-            max_item = (direct_token_limit + ratio - 1) // ratio - 1
+            max_item = _tp1_graph_cache_reserve_item(
+                int(self.max_ctx), ratio, sparse_splitkv_available
+            )
             state["compressed"].reserve(max_item)
             state["compressed"].device_page_ptrs()
             indexer = state.get("indexer")
@@ -5764,11 +5814,6 @@ class DSV4CCCPModel:
             ("direct128", 128, False),
             ("direct512", 512, False),
         ]
-        sparse_splitkv_available = any(
-            "sparse_runner" in context["state"]
-            for context in self._tp_attention_contexts[0]
-            if int(context["ratio"]) == 4
-        )
         if (
             (self.max_ctx + 3) // 4 > int(self.cfg["index_topk"])
             and sparse_splitkv_available

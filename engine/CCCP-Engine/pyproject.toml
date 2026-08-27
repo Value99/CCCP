@@ -19,7 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 cuda = [
-  "flashinfer-python>=0.6.15,<0.7",
+  "flashinfer-python>=0.6.6,<0.7",
   "fla-core>=0.5.2,<0.6",
   "triton>=3.6,<3.7",
 ]
