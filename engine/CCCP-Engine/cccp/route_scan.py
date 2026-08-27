@@ -84,7 +84,7 @@ def _encode_conversation(
             drop_thinking=True,
         )
         return tokenizer_engine.encode(rendered)
-    if architecture == "glm":
+    if architecture in {"glm", "glm5_next"}:
         from .chat_adapters.glm import _render_prompt
 
         return tokenizer_engine.encode(_render_prompt(messages, options))
@@ -241,7 +241,9 @@ def main(argv: list[str] | None = None) -> None:
     cache_gb = None
     if args.profile == "mapped":
         cache_gb = 0.5
-    elif preset.architecture in {"dsv4", "glm", "kimi_k3"}:
+    elif preset.architecture in {
+        "dsv4", "glm", "glm5_next", "kimi_k3",
+    }:
         import psutil
         available_gib = psutil.virtual_memory().available / 2**30
         context_gib = 0.0
@@ -383,7 +385,7 @@ def main(argv: list[str] | None = None) -> None:
                         route_output(base, complete=False),
                     )
                     last_live_snapshot = now
-                if preset.architecture == "glm":
+                if preset.architecture in {"glm", "glm5_next"}:
                     resident_gib = scan_process.memory_info().rss / 2**30
                     available_gib = psutil.virtual_memory().available / 2**30
                     _event(

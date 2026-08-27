@@ -16,7 +16,6 @@ from __future__ import annotations
 import os
 import copy
 import time
-from collections import Counter
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -39,7 +38,7 @@ from .kernels import (
     rmsnorm,
 )
 from .precision import compute_dtype
-from .store import CCCPStore, ExpertPool
+from .store import CCCPStore
 
 
 _DENSE_BF16_ELIGIBLE = frozenset({
@@ -1276,6 +1275,17 @@ def _shared_expert_mlp_cccp(x, w, limit):
     )
 
 
+def _dsv4_routed_topology(store, tp_size: int):
+    """Return only the DSV4 layer/rank map consumed by the public runtime."""
+    from .ops import build_routed_vq_topology_plan
+
+    return build_routed_vq_topology_plan(
+        store,
+        int(tp_size),
+        primary_dense=True,
+    )
+
+
 class DSV4CCCPModel:
     """DeepSeek-V4 CCCP 产物的推理模型（CPU/CUDA，内存显存自动适配由外层 Engine 定）。"""
 
@@ -1391,68 +1401,32 @@ class DSV4CCCPModel:
             os.environ["CCCP_SINGLE_GPU_LAYER_GRAPH"] = "1"
             os.environ["CCCP_DSV4_TOKEN_GRAPH"] = "1"
         self._single_gpu_layer_graph = False
-        self._packed_device_pool = False
-        self._packed_full_gpu = False
-        if self.store.man.projection_vq:
-            if not gpu:
-                from .store import PackedCpuExpertPool
-
-                self.pool = PackedCpuExpertPool(
-                    self.store,
-                    budget_gb=cache_gb,
-                )
-            elif (
-                self.tp_size == 1
-                and os.environ.get("CCCP_PACKED_FULL_GPU", "0") != "1"
-            ):
-                from .packed_hybrid import PackedHybridPool
-
-                self.pool = PackedHybridPool(
-                    self.store,
-                    vram_cache_gb,
-                    device=self.device,
-                    ram_gb=cache_gb,
-                    startup_gpu_reserve_bytes=extreme_fixed_gpu_bytes,
-                )
-                self._packed_device_pool = True
-            else:
-                from .kimi_experts import (
-                    PackedExpertPool,
-                    build_primary_dense_packed_plan,
-                )
-
-                plan = build_primary_dense_packed_plan(
-                    self.store,
-                    self.tp_size,
-                )
-                self.pool = PackedExpertPool(
-                    self.store,
-                    self.devices,
-                    plan,
-                    parallelism=(
-                        "tensor"
-                        if self._single_gpu_layer_graph_requested
-                        or self.tp_size > 1
-                        else "pipeline"
-                    ),
-                )
-                self._packed_device_pool = True
-                self._packed_full_gpu = True
-        else:
-            if self.tp_size != 1:
-                raise ValueError(
-                    "legacy DeepSeek-V4 archives support only tp=1"
-                )
-            self.pool = ExpertPool(
-                self.store,
-                vram_cache_gb if gpu else cache_gb,
-                device=str(self.device),
-                ram_gb=cache_gb if gpu else 0.0,
+        if not self.store.man.projection_vq and self.tp_size != 1:
+            raise ValueError(
+                "legacy DeepSeek-V4 archives support only tp=1"
             )
+        from .ops import create_routed_vq_runtime
+
+        codebook_runtime = create_routed_vq_runtime(
+            self.store,
+            device=self.device,
+            devices=self.devices,
+            tp_size=self.tp_size,
+            cache_gb=cache_gb,
+            vram_cache_gb=vram_cache_gb,
+            startup_gpu_reserve_bytes=extreme_fixed_gpu_bytes,
+            topology_plan_factory=_dsv4_routed_topology,
+            layer_graph_requested=self._single_gpu_layer_graph_requested,
+        )
+        self.routed_vq = codebook_runtime.executor
+        self._packed_device_pool = (
+            codebook_runtime.plan.packed_device_pool
+        )
+        self._packed_full_gpu = codebook_runtime.plan.packed_full_gpu
         self._hybrid_fixed_token_graph = bool(
             self._single_gpu_layer_graph_requested
             and not self._packed_full_gpu
-            and getattr(self.pool, "fixed_token_graph_candidate", False)
+            and self.routed_vq.fixed_token_graph_candidate
         )
         self._single_gpu_layer_graph = bool(
             self._single_gpu_layer_graph_requested
@@ -1466,7 +1440,7 @@ class DSV4CCCPModel:
             and self._packed_full_gpu
             and self.tp_size == 1
         ):
-            if getattr(self.pool, "parallelism", None) != "tensor":
+            if self.routed_vq.parallelism != "tensor":
                 raise RuntimeError(
                     "AMD/HIP full-resident pool must be initialized in "
                     "TP1 tensor mode"
@@ -1695,7 +1669,7 @@ class DSV4CCCPModel:
         return wt
 
     def _prefetch_enabled(self) -> bool:
-        if not bool(getattr(self.pool, "speculative_prefetch", True)):
+        if not self.routed_vq.speculative_prefetch:
             return False
         raw = os.environ.get("CCCP_PREFETCH", "auto").strip().lower()
         if raw in ("", "auto"):
@@ -1710,7 +1684,7 @@ class DSV4CCCPModel:
         """
 
         return self._prefetch_enabled() and not bool(
-            getattr(self.pool, "layer_prefetch_only", False)
+            self.routed_vq.layer_prefetch_only
         )
 
     def layer(self, i: int) -> dict:
@@ -2175,21 +2149,22 @@ class DSV4CCCPModel:
             prebuild_cpu()
             # CPU 也需要真正的 RAM 模式；仅使用 LRU 会让每批新路由专家
             # 重复承担 zlib 解压和张量构造，即使机器还有数百 GiB 可用内存。
-            resident_all = self.pool.preload_all()
-            if not resident_all:
-                self.pool.preload_pinned()
-            profile_resident = bool(self.pool.compact_full_resident)
+            residency = self.routed_vq.initialize_residency(
+                device_type="cpu",
+            )
+            resident_all = residency.resident_all
+            profile_resident = bool(self.routed_vq.compact_full_resident)
             self._prefetch_auto = not (resident_all or profile_resident)
             if resident_all or profile_resident:
                 n_experts = self.cfg["n_experts"]
                 for layer in range(self.cfg["n_layers"]):
-                    experts = tuple(
-                        self.pool.pinned.get((layer, expert))
-                        for expert in range(n_experts)
+                    experts = self.routed_vq.resident_entries(
+                        layer,
+                        n_experts,
                     )
                     if any(expert is not None for expert in experts):
                         self._cpu_resident_experts[layer] = experts
-                prepared_layers = self.pool.prepare_native_layers()
+                prepared_layers = residency.native_layers
                 print(
                     "[cccp-dsv4] CPU 多码本 MoE 执行图完成："
                     f"{prepared_layers} 层；packed 索引保持紧凑，"
@@ -2199,17 +2174,14 @@ class DSV4CCCPModel:
             return
         import time
         t0 = time.time()
-        extreme_resident_all: bool | None = None
-        if getattr(self.pool, "startup_gpu_reserve_bytes", 0) > 0:
+        extreme_residency = None
+        if self.routed_vq.startup_gpu_reserve_bytes > 0:
             # Extreme mode is deliberately expert-first. The pool holds a
             # real CUDA reservation for Dense/context while it fills RAM down
             # to the 1 GiB floor and places overflow experts in VRAM.
-            extreme_resident_all = self.pool.preload_all()
-            if not extreme_resident_all:
-                raise RuntimeError(
-                    "极限模式要求全部紧凑专家固定驻留 RAM/VRAM"
-                )
-            self.pool.release_startup_gpu_reservation()
+            extreme_residency = self.routed_vq.prepare_required_residency(
+                device_type="cuda",
+            )
         if self._dense_bf16:
             print("[cccp] dense BF16 常驻: "
                   + ",".join(sorted(self._dense_bf16)), flush=True)
@@ -2237,8 +2209,8 @@ class DSV4CCCPModel:
         self._prepare_heterogeneous_shared_mlp()
         self._prepare_single_gpu_static_graphs()
         self._prepare_tp_decode_metadata()
-        if extreme_resident_all is not None:
-            self.pool.verify_startup_gpu_reservation()
+        if extreme_residency is not None:
+            self.routed_vq.verify_required_residency()
         vram = torch.cuda.memory_allocated(self.device) / 2**30
         print(f"[cccp] dense 预载完成（{time.time() - t0:.1f}s，显存 {vram:.1f}GB）",
               flush=True)
@@ -2254,21 +2226,25 @@ class DSV4CCCPModel:
             # Dense/Attention fixed graphs above are already resident.  The
             # packed pool must compare only its remaining allocations against
             # the currently free VRAM instead of charging Dense twice.
-            self.pool.preload(dense_resident=True)
+            self.routed_vq.materialize_full_device(dense_resident=True)
             self._prepare_tp_packed_finalizer()
             self._prefetch_auto = False
             return
-        resident_all = (
-            extreme_resident_all
-            if extreme_resident_all is not None
-            else self.pool.preload_all()
+        residency = (
+            self.routed_vq.finalize_residency(
+                extreme_residency,
+                device_type="cuda",
+            )
+            if extreme_residency is not None
+            else self.routed_vq.initialize_residency(device_type="cuda")
         )
+        resident_all = residency.resident_all
         extreme_staging = bool(
-            getattr(self.pool, "fixed_extreme_residency", False)
-            and getattr(self.pool, "extreme_ram_layers", ())
+            self.routed_vq.fixed_extreme_residency
+            and self.routed_vq.extreme_ram_layers
         )
         route_history_resident = bool(
-            getattr(self.pool, "extreme_route_history_resident", False)
+            self.routed_vq.extreme_route_history_resident
         )
         self._prefetch_auto = _automatic_prefetch_policy(
             resident_all=resident_all,
@@ -2277,16 +2253,8 @@ class DSV4CCCPModel:
             extreme_staging=extreme_staging,
             route_history_resident=route_history_resident,
         )
-        if not resident_all:   # 内存够则全量常驻；不够（已警告）回退热钉住+LRU
-            self.pool.preload_pinned()
-            self.pool.build_gpu_arenas()
-        else:
-            # Reserve the fixed VRAM hot arena before registering host pages.
-            # Large cudaHostRegister mappings consume driver address resources
-            # even though torch.cuda.memory_allocated() does not report them.
-            self.pool.build_gpu_arenas()
-            self.pool.pin_host_resident()
-            if getattr(self.pool, "profile_hot_cache_enabled", False):
+        if resident_all:
+            if self.routed_vq.profile_hot_cache_enabled:
                 # Corpus heat seeds a shared strict LRU. Previous-token
                 # speculation uploaded far more experts than demand and
                 # displaced useful entries before their layer executed.
@@ -2311,7 +2279,7 @@ class DSV4CCCPModel:
                         "上一 token 路由与当前层 Attention/共享专家计算重叠",
                         flush=True,
                     )
-                elif getattr(self.pool, "profile_hot_cache_enabled", False):
+                elif self.routed_vq.profile_hot_cache_enabled:
                     print(
                         "[cccp] 专家缓存使用按需 strict-LRU；"
                         "关闭上一 token 推测预取，避免无效 H2D 污染热槽",
@@ -2857,7 +2825,7 @@ class DSV4CCCPModel:
                 tuple(route_ids),
             )
             self._tp_route_events[layer] = tuple(route_events)
-            self.pool.bind_hidden_inputs(
+            self.routed_vq.bind_hidden_inputs(
                 layer,
                 self._tp_shared_mlp.input_hidden(layer),
                 tuple(route_weights),
@@ -3079,7 +3047,7 @@ class DSV4CCCPModel:
                     n_group=int(self.cfg.get("n_group", 1)),
                     topk_group=int(self.cfg.get("topk_group", 1)),
                 ),
-                self.pool,
+                self.routed_vq,
                 {
                     layer: self._tp_router.output_hidden(layer)
                     for layer in route_layers
@@ -3114,7 +3082,7 @@ class DSV4CCCPModel:
                 hidden_size=int(self.cfg["hidden"]),
                 dtype=torch.bfloat16,
             ),
-            self.pool,
+            self.routed_vq,
         )
         for layer in range(int(self.cfg["n_layers"])):
             finalizer.add_layer(layer)
@@ -3140,26 +3108,23 @@ class DSV4CCCPModel:
 
         if not getattr(self, "_hybrid_fixed_token_graph", False):
             return
-        activate = getattr(self.pool, "activate_decode_arena", None)
-        if activate is None:
+        if not self.routed_vq.activate_decode():
             raise RuntimeError(
                 "hybrid TP1 TokenGraph requires a Decode arena capability"
             )
-        activate()
-        if not getattr(self.pool, "fixed_token_graph_capable", False):
+        if not self.routed_vq.fixed_token_graph_capable:
             raise RuntimeError(
                 "hybrid TP1 TokenGraph requires Linux registered-host UVA, "
                 "device segmented LRU and compact Q8 Decode"
             )
-        prepare = getattr(self.pool, "prepare_fixed_token_graphs", None)
-        if prepare is None or not prepare(
+        if not self.routed_vq.prepare_fixed_token_graphs(
             activation=self.operator_config.expert_activation,
             activation_beta=float(self.cfg.get("situ_beta", 4.0)),
             activation_linear_beta=self.cfg.get("situ_linear_beta"),
             limit=float(self.cfg.get("swiglu_limit", 0.0)),
         ):
             raise RuntimeError("hybrid fixed expert graph construction failed")
-        generation = int(getattr(self.pool, "fixed_graph_generation", -1))
+        generation = self.routed_vq.fixed_graph_generation
         if (
             generation == self._tp1_pool_graph_generation
             and self._tp_moe_finalizer is not None
@@ -3298,14 +3263,7 @@ class DSV4CCCPModel:
         """按需记录真实路由；仅校准任务启用，正常推理没有 D2H/列表开销。"""
         if os.environ.get("CCCP_ROUTE_COUNTS", "0") == "0":
             return
-        counts = getattr(self.pool, "route_counts", None)
-        if counts is None:
-            counts = Counter()
-            self.pool.route_counts = counts
-        counts.update(
-            (int(layer), int(expert))
-            for expert in indices.detach().reshape(-1).cpu().tolist()
-        )
+        self.routed_vq.record_routes(layer, indices)
 
     def _route_cccp(self, xf: torch.Tensor, w: dict, cfg, ids: torch.Tensor, layer: int):
         """带 drop 掩码的 sqrtsoftplus 路由（数值同 dsv4.gate_route；丢弃专家不可选）。
@@ -3413,7 +3371,7 @@ class DSV4CCCPModel:
         ):
             fused_layer = self._cpu_fused_resident_moe.get(layer)
             if fused_layer is None:
-                native_layer = self.pool.native_layer(layer)
+                native_layer = self.routed_vq.native_layer(layer)
                 from .ops import create_resident_moe_layer
 
                 fused_layer = create_resident_moe_layer(
@@ -3522,29 +3480,23 @@ class DSV4CCCPModel:
             if (
                 B * T > 1
                 and self.device.type == "cpu"
-                and not getattr(self.pool, "compact_full_resident", False)
+                and not self.routed_vq.compact_full_resident
                 and self._prefetch_enabled()
             ):
                 # The exact route is already known for this prefill block.
                 # Start disk reads for every distinct expert while the shared
                 # branch computes; row execution and reduction order stay
                 # unchanged, so routing counts/logits remain bit-identical.
-                self.pool.prefetch(
-                    [
-                        (layer, int(expert_id))
-                        for expert_id in torch.unique(indices).tolist()
-                    ]
-                )
+                self.routed_vq.prefetch_routes(layer, indices)
             pending_routed = None
             if (
                 B * T == 1
                 and self._packed_device_pool
-                and hasattr(self.pool, "prepare_run")
             ):
                 # 公共双阶段接口先提交 packed DMA，再让默认流计算共享专家；
                 # finish_run 仅在 routed kernel 真正读取槽位前建立事件依赖。
                 # 这样 RAM→VRAM 与 shared Gate/Up/Down 并行，数学顺序不变。
-                pending_routed = self.pool.prepare_run(
+                pending_routed = self.routed_vq.prepare(
                     layer,
                     x_rows[:1],
                     indices[0],
@@ -3578,14 +3530,14 @@ class DSV4CCCPModel:
                 )
             except BaseException:
                 if pending_routed is not None:
-                    self.pool.cancel_run(pending_routed)
+                    self.routed_vq.cancel(pending_routed)
                 raise
             mark_moe("shared")
             if B * T > 1 and _batched_packed_prefill_available(
-                self.pool,
+                self.routed_vq,
                 self._packed_full_gpu,
             ):
-                routed = self.pool.run_rows(
+                routed = self.routed_vq.execute(
                     layer,
                     x_rows,
                     indices,
@@ -3625,23 +3577,10 @@ class DSV4CCCPModel:
                         flush=True,
                     )
                 if row == 0 and pending_routed is not None:
-                    routed = self.pool.finish_run(pending_routed)
+                    routed = self.routed_vq.finish(pending_routed)
                     pending_routed = None
-                elif self._packed_device_pool:
-                    routed = self.pool.run(
-                        layer,
-                        x_rows[row : row + 1],
-                        indices[row],
-                        weights[row],
-                        activation=activation,
-                        activation_beta=float(c.get("situ_beta", 4.0)),
-                        activation_linear_beta=c.get(
-                            "situ_linear_beta"
-                        ),
-                        limit=limit,
-                    )
                 else:
-                    routed = self.pool.run_native(
+                    routed = self.routed_vq.execute(
                         layer,
                         x_rows[row : row + 1],
                         indices[row],
@@ -3653,46 +3592,6 @@ class DSV4CCCPModel:
                         ),
                         limit=limit,
                     )
-                    if routed is None:
-                        selected = self.pool.get_many(
-                            [
-                                (layer, int(expert_id))
-                                for expert_id in indices[row].tolist()
-                            ]
-                        )
-                        experts = [
-                            selected[(layer, int(expert_id))]
-                            for expert_id in indices[row].tolist()
-                        ]
-                        from .ops import packed_moe_selected_topk
-
-                        routed = packed_moe_selected_topk(
-                            x_rows[row : row + 1].float(),
-                            experts,
-                            weights[row].float(),
-                            activation=activation,
-                            activation_beta=float(c.get("situ_beta", 4.0)),
-                            activation_linear_beta=c.get(
-                                "situ_linear_beta"
-                            ),
-                            limit=limit,
-                        )
-                        if routed is None:
-                            # Windows 低端机可能没有 MSVC，公共 JIT 内核因此
-                            # 不可用。使用 grouped.py 已有的编译器无关精确参考
-                            # 路径，逐专家临时展开后立即释放；速度较慢但数学一致，
-                            # 且不会要求最终用户安装编译器。
-                            from .grouped import moe_mlp_grouped_mixed
-
-                            routed = moe_mlp_grouped_mixed(
-                                x_rows[row : row + 1].float(),
-                                experts,
-                                weights[row].float(),
-                                limit=limit,
-                                activation=activation,
-                                situ_beta=float(c.get("situ_beta", 4.0)),
-                                situ_linear_beta=c.get("situ_linear_beta"),
-                            )
                 # Device expert pools intentionally return one fixed-address
                 # result workspace.  During a multi-token fallback every
                 # subsequent row overwrites that buffer, so retaining views
@@ -3706,12 +3605,12 @@ class DSV4CCCPModel:
             # slots, so RAM/LRU mode must not pull the same IDs through a
             # second ``tolist`` synchronization.
             if not self._packed_full_gpu and self._prefetch_enabled():
-                last_ids = getattr(self.pool, "last_expert_ids", None)
-                if callable(last_ids):
+                last_ids = self.routed_vq.last_expert_ids(layer)
+                if last_ids is not None:
                     # The public hybrid pool already copied the exact route
                     # once while resolving compact slots.  Reuse that host
                     # metadata instead of adding a second CUDA synchronize.
-                    self._prev_ids[layer] = list(last_ids(layer))
+                    self._prev_ids[layer] = list(last_ids)
                 else:
                     self._prev_ids[layer] = [
                         int(expert_id)
@@ -3746,109 +3645,26 @@ class DSV4CCCPModel:
                 indices[0],
             )
             return fused_cpu.view(B, T, D).to(output_dtype)
-        # T=1 解码热路径：把 top-k 专家堆叠成批做分组 GEMM（每层 launch 数 ÷6，
-        # 数值与下方逐专家循环等价，见 cccp/grouped.py 自检）。
-        # 全部选中专家均为 VQWeight 且未设 CCCP_GROUPED=0 时启用，否则回退原循环。
-        if B * T == 1 and os.environ.get("CCCP_GROUPED", "1") != "0":
-            from .grouped import moe_mlp_grouped_mixed
-            # 先发射共享专家 GEMM（不依赖路由结果），CPU 等 indices DtoH 期间 GPU 有活干
-            shared = None
-            if x_rows.is_cuda:
-                shared = expert_mlp(
-                    x_rows,
-                    w["sh_w1"],
-                    w["sh_w3"],
-                    w["sh_w2"],
-                    c.get("swiglu_limit", 0.0),
-                )
-            eids = indices[0].tolist()
-            self._prev_ids[layer] = eids
-            if resident is not None:
-                elist = [resident[e] for e in eids]
-                if any(expert is None for expert in elist):
-                    got = self.pool.get_many([(layer, e) for e in eids])
-                    elist = [got[(layer, e)] for e in eids]
-            else:
-                got = self.pool.get_many([(layer, e) for e in eids])
-                elist = [got[(layer, e)] for e in eids]
-            if all(isinstance(g, VQWeight) and isinstance(d, VQWeight) for g, d in elist):
-                shared_weights = (w["sh_w1"], w["sh_w3"], w["sh_w2"])
-                if (
-                    not x_rows.is_cuda
-                    and all(
-                        isinstance(weight, Int4Weight)
-                        for weight in shared_weights
-                    )
-                ):
-                    from .cpuext import moe_mixed_cpu
-
-                    w1, w3, w2 = shared_weights
-                    fused_cpu = moe_mixed_cpu(
-                        x_rows,
-                        [gu.idx for gu, _ in elist],
-                        [gu.cb for gu, _ in elist],
-                        [dn.idx for _, dn in elist],
-                        [dn.cb for _, dn in elist],
-                        weights[0],
-                        w1.q,
-                        w1.s,
-                        w3.q,
-                        w3.s,
-                        w2.q,
-                        w2.s,
-                        w1.gs,
-                        c.get("swiglu_limit", 0.0),
-                    )
-                    if fused_cpu is not None:
-                        return fused_cpu.view(B, T, D).to(output_dtype)
-                if shared is None:
-                    shared = expert_mlp(
-                        x_rows,
-                        w["sh_w1"],
-                        w["sh_w3"],
-                        w["sh_w2"],
-                        c.get("swiglu_limit", 0.0),
-                    )
-                y = moe_mlp_grouped_mixed(x_rows, elist, weights[0],
-                                          c.get("swiglu_limit", 0.0)).unsqueeze(0)
-                y += shared
-                return y.view(B, T, D).to(output_dtype)
-        if x_rows.is_cuda:
-            raise RuntimeError(
-                "CUDA fused packed top-k operator unavailable; the legacy "
-                "single-token/per-expert projection fallback was deleted"
-            )
-        y = torch.zeros_like(xf)
-        # 分派：argsort + searchsorted 按专家分段（每层一次 DtoH 同步），替代逐专家
-        # nonzero（每个都隐式同步，投机验证 T=6 时 ~1200 次/轮、WDDM 下约 0.6s）。
-        # 专家遍历顺序仍为升序，与 indices.unique() 一致 → 数值不变。
-        K = indices.shape[1]
-        flat = indices.reshape(-1)
-        order = torch.argsort(flat)
-        bounds = torch.searchsorted(flat[order],
-                                    torch.arange(c["n_experts"] + 1, device=flat.device))
-        bl = bounds.tolist()
-        present = [e for e in range(c["n_experts"]) if bl[e + 1] > bl[e]]
-        self._prev_ids[layer] = present
-        rows_all = torch.div(order, K, rounding_mode="floor")
-        cols_all = order % K
-        experts = self.pool.get_many([(layer, e) for e in present])
-        from .grouped import expert_mlp_batched
-        limit = c.get("swiglu_limit", 0.0)
-        for e in present:
-            sl = slice(bl[e], bl[e + 1])
-            rows, cols = rows_all[sl], cols_all[sl]
-            gu, dn = experts[(layer, e)]
-            if isinstance(gu, VQWeight) and isinstance(dn, VQWeight):
-                # 投机验证 T>1：idx 广播走融合 kernel（一次调用替代逐 token LUT 循环）
-                y[rows] += expert_mlp_batched(xf[rows], gu, dn, limit) \
-                    * weights[rows, cols, None]
-            else:
-                y[rows] += self._expert_mlp_cccp(xf[rows], gu, dn,
-                                               weights[rows, cols, None])
-        y += expert_mlp(xf, w["sh_w1"], w["sh_w3"], w["sh_w2"],
-                        c.get("swiglu_limit", 0.0))
-        return y.view(B, T, D).to(output_dtype)
+        routed = self.routed_vq.execute(
+            layer,
+            x_rows,
+            indices if B * T > 1 else indices[0],
+            weights if B * T > 1 else weights[0],
+            activation=self.operator_config.expert_activation,
+            activation_beta=float(c.get("situ_beta", 4.0)),
+            activation_linear_beta=c.get("situ_linear_beta"),
+            limit=float(c.get("swiglu_limit", 0.0)),
+        )
+        shared = expert_mlp(
+            x_rows,
+            w["sh_w1"],
+            w["sh_w3"],
+            w["sh_w2"],
+            c.get("swiglu_limit", 0.0),
+        )
+        return (routed.to(shared.dtype) + shared).view(B, T, D).to(
+            output_dtype
+        )
 
     def _hc_decode_workspace(
         self,
@@ -3924,7 +3740,7 @@ class DSV4CCCPModel:
 
         if h.is_cuda and ids.shape[-1] > 1:
             prepare_prefill_layer = getattr(
-                self.pool,
+                self.routed_vq,
                 "prepare_prefill_layer",
                 None,
             )
@@ -3946,7 +3762,7 @@ class DSV4CCCPModel:
             # window.  Normal hybrid decode already queued every layer once at
             # token start; submitting the same 43 routes again doubles host
             # executor traffic without adding useful overlap.
-            self.pool.prefetch([(layer, e) for e in prev])
+            self.routed_vq.prefetch_routes(layer, prev)
         residual = h
         canonical_short_decode = bool(
             getattr(self, "_canonical_short_decode", False)
@@ -5079,7 +4895,7 @@ class DSV4CCCPModel:
         self.ensure_position(pos0 + T - 1)
         if self._prev_ids and self._token_prefetch_enabled():
             for l, es in self._prev_ids.items():
-                self.pool.prefetch([(l, e) for e in es])
+                self.routed_vq.prefetch_routes(l, es)
         self._spec = self._spec_snapshot(pos0, T)
         h = self._embed(ids).unsqueeze(2).repeat(1, 1, cfg.hc_mult, 1)
         mh = []
@@ -5830,7 +5646,7 @@ class DSV4CCCPModel:
         with torch.cuda.device(device):
             torch.cuda.empty_cache()
         print(
-            "[cccp] AMD/HIP TokenGraph bucket 切换："
+            "[cccp] TokenGraph bucket 切换："
             f"{previous} -> {next_bucket}；旧图已释放",
             flush=True,
         )
@@ -6056,7 +5872,7 @@ class DSV4CCCPModel:
                         router_raw = router_state.graphs[0].raw_cuda_graph()
                     else:
                         expert_raw = (
-                            self.pool.fixed_layer_child_graphs(layer)[0][-1]
+                            self.routed_vq.fixed_layer_child_graphs(layer)[0][-1]
                             .raw_cuda_graph()
                         )
                         router_raw = hash_route_graph.raw_cuda_graph()
@@ -6498,7 +6314,7 @@ class DSV4CCCPModel:
                         tuple(ffn_aux_buffers),
                         self._tp_shared_mlp,
                         self._tp_router,
-                        self.pool,
+                        self.routed_vq,
                         self._tp_layer_output_hidden[layer],
                         sinkhorn_iters=int(cfg.hc_sinkhorn_iters),
                         eps=float(cfg.rms_eps),
@@ -6574,13 +6390,7 @@ class DSV4CCCPModel:
         graph = self._tp1_token_graphs.get(bucket)
         if graph is None:
             return None
-        refresh_mapped_cache = getattr(
-            self.pool,
-            "refresh_mapped_cache",
-            None,
-        )
-        if refresh_mapped_cache is not None:
-            refresh_mapped_cache()
+        self.routed_vq.refresh_mapped_cache()
         self._tp1_decode_control.update(int(ids.reshape(-1)[0]), position)
         with torch.cuda.device(self.devices[0]):
             graph.launch_tp1()
@@ -6599,14 +6409,12 @@ class DSV4CCCPModel:
                     state["indexer"].keys.length = max(
                         state["indexer"].keys.length, length
                     )
-        self.pool.hits += int(self.cfg["top_k"]) * int(
-            self.cfg["n_layers"]
-        )
         layer_count = int(self.cfg["n_layers"])
-        if hasattr(self.pool, "decode_fused_submissions"):
-            self.pool.decode_fused_submissions += layer_count
-        if hasattr(self.pool, "decode_graph_submissions"):
-            self.pool.decode_graph_submissions += layer_count
+        self.routed_vq.record_cache_hits(
+            int(self.cfg["top_k"]) * layer_count,
+            fused_submissions=layer_count,
+            graph_submissions=layer_count,
+        )
         return self._tp1_token_logits[bucket]
 
     def _decode_tp(self, ids: torch.Tensor, pos: int) -> torch.Tensor:
@@ -6712,7 +6520,7 @@ class DSV4CCCPModel:
                         "HC layer plan input events are unavailable"
                     )
                 hidden = hc_layer_plan.launch(input_events)
-                self.pool.hits += int(self.cfg["top_k"])
+                self.routed_vq.record_cache_hits(int(self.cfg["top_k"]))
                 continue
             attention_profile = None
             if stage_profiler is not None:
@@ -6965,7 +6773,7 @@ class DSV4CCCPModel:
                     moe_profile,
                     combined_hidden,
                 )
-            self.pool.hits += int(self.cfg["top_k"])
+            self.routed_vq.record_cache_hits(int(self.cfg["top_k"]))
             output = self._tp_layer_output_hidden[layer]
             post_profile = None
             if stage_profiler is not None:
@@ -7018,7 +6826,7 @@ class DSV4CCCPModel:
         self.ensure_position(pos)
         if self._prev_ids and self._token_prefetch_enabled():
             for l, es in self._prev_ids.items():
-                self.pool.prefetch([(l, e) for e in es])
+                self.routed_vq.prefetch_routes(l, es)
         h = self._embed(ids).unsqueeze(1).unsqueeze(2).repeat(1, 1, cfg.hc_mult, 1)
         for i in range(cfg.n_layers):
             if os.environ.get("CCCP_DEBUG_LAYER_TRACE", "0") != "0":

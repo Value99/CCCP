@@ -117,6 +117,18 @@ def _make_model(
     with open(os.path.join(model_dir, "cccp.json"), "r", encoding="utf-8") as f:
         manifest = json.load(f)
     cfg = manifest["config"]
+    adapter = _model_adapter_architecture(manifest)
+    if adapter == "glm5_next":
+        from .glm5_next_model import GLM5NextCCCPModel
+
+        return GLM5NextCCCPModel(
+            model_dir,
+            cache_gb=cache_gb,
+            max_ctx=max_ctx,
+            device=device,
+            vram_cache_gb=vram_cache_gb,
+            tp_size=tp_size,
+        ), adapter
     dense_vq = bool(manifest.get("tensor_vq")) and not bool(
         manifest.get("expert_files")
         or (manifest.get("routed_experts") or {}).get("layer_files")
@@ -175,6 +187,33 @@ def _make_model(
                     tp_size=tp_size), "glm"
 
 
+def _model_adapter_architecture(manifest: dict) -> str:
+    """Resolve the model adapter only from manifest capabilities."""
+
+    config = manifest.get("config") or {}
+    if str(manifest.get("architecture") or "").lower() == "glm5_next":
+        return "glm5_next"
+    dense_vq = bool(manifest.get("tensor_vq")) and not bool(
+        manifest.get("expert_files")
+        or (manifest.get("routed_experts") or {}).get("layer_files")
+    )
+    if dense_vq and str(
+        config.get("text_model_type")
+        or config.get("outer_model_type")
+        or manifest.get("architecture")
+        or ""
+    ).startswith("qwen3_5"):
+        return "qwen3_5_dense"
+    if (
+        manifest.get("model_family") == "kimi_k3"
+        or ("kda_layers" in config and "routed_hidden" in config)
+    ):
+        return "kimi_k3"
+    if "hc_mult" in config or "compress_ratios" in config:
+        return "dsv4"
+    return "glm"
+
+
 def _dense_need_gb(model_dir: str, arch_hint: str, kv_gb: float) -> float:
     """按产物清单与 config 实际计算 dense 常驻需求（替代按架构硬编码）：
     DSV4 全 BF16 路径按 safetensors 头部精确计算展开常驻量；其他路径按
@@ -185,12 +224,39 @@ def _dense_need_gb(model_dir: str, arch_hint: str, kv_gb: float) -> float:
         8.2 if arch_hint == "dsv4"
         else 60.0 if arch_hint == "kimi_k3"
         else 18.0 if arch_hint == "qwen3_5_dense"
+        else 16.0 if arch_hint == "glm5_next"
         else 13.5
     ) + kv_gb
     try:
         with open(os.path.join(model_dir, "cccp.json"), "r", encoding="utf-8") as f:
             man = json.load(f)
         cfg = man["config"]
+        if arch_hint == "glm5_next":
+            from .store import CCCPStore
+
+            store = CCCPStore(model_dir)
+            text_names = [
+                name
+                for name in store.dense_names()
+                if (
+                    name == "lm_head.weight"
+                    or name.startswith("model.language_model.")
+                )
+                and not name.startswith(
+                    "model.language_model.layers.45."
+                )
+            ]
+            fixed_bytes = 0
+            for name in text_names:
+                fixed_bytes += store.dense_nbytes(name)
+                scale_name = name + "_scale_inv"
+                if store.has(scale_name):
+                    fixed_bytes += store.dense_nbytes(scale_name)
+            store.close()
+            # Model buffers, KDA recurrent state and allocator-private blocks
+            # are not safetensors payloads. Keep one measured fixed margin;
+            # the routed expert arena is still planned independently.
+            return fixed_bytes / 2**30 + 1.5 + kv_gb
         if arch_hint == "qwen3_5_dense":
             files = [str(man.get("dense_file") or "dense.safetensors")]
             files.extend(
@@ -550,32 +616,7 @@ class Engine:
             with open(cccp_j, "r", encoding="utf-8") as _f:
                 _manifest = json.load(_f)
                 _cfg = _manifest["config"]
-                if (
-                    _manifest.get("model_family") == "kimi_k3"
-                    or (
-                        "kda_layers" in _cfg
-                        and "routed_hidden" in _cfg
-                    )
-                ):
-                    arch_hint = "kimi_k3"
-                elif (
-                    _manifest.get("tensor_vq")
-                    and not (
-                        _manifest.get("expert_files")
-                        or (_manifest.get("routed_experts") or {}).get(
-                            "layer_files"
-                        )
-                    )
-                    and str(
-                        _cfg.get("text_model_type")
-                        or _cfg.get("outer_model_type")
-                        or _manifest.get("architecture")
-                        or ""
-                    ).startswith("qwen3_5")
-                ):
-                    arch_hint = "qwen3_5_dense"
-                elif "hc_mult" in _cfg or "compress_ratios" in _cfg:
-                    arch_hint = "dsv4"
+                arch_hint = _model_adapter_architecture(_manifest)
         if (
             not self.extreme_mode
             and arch_hint != "qwen3_5_dense"
@@ -699,7 +740,7 @@ class Engine:
                         or (
                             arch_hint == "kimi_k3"
                             and os.environ.get(
-                                "CCCP_KIMI_TP_PACKED_HYBRID",
+                                "CCCP_TP_PACKED_HYBRID",
                                 "0",
                             )
                             != "0"
@@ -875,7 +916,7 @@ class Engine:
                 # when necessary.  Keep the requested one-GiB total reserve;
                 # dynamic workspaces remain bounded by their live planners.
                 live_chunked_workspace = arch_hint in {
-                    "dsv4", "qwen3_5_dense"
+                    "dsv4", "qwen3_5_dense", "glm5_next"
                 }
                 runtime_headroom_gb = (
                     reserve_gb
@@ -1005,15 +1046,27 @@ class Engine:
             self.model.preload()
             if self.arch == "kimi_k3" and hasattr(self.model, "preload_vision"):
                 self.model.preload_vision()
+        routed_vq = getattr(self.model, "routed_vq", None)
+        dense_codebook_stats = getattr(
+            self.model,
+            "codebook_stats",
+            None,
+        )
         full_resident = bool(
-            getattr(getattr(self.model, "pool", None), "full_resident", False)
+            routed_vq.full_resident
+            if routed_vq is not None
+            else getattr(dense_codebook_stats, "full_resident", False)
         )
         compact_cpu_resident = bool(
             dev == "cpu"
-            and getattr(
-                getattr(self.model, "pool", None),
-                "compact_full_resident",
-                False,
+            and (
+                routed_vq.compact_full_resident
+                if routed_vq is not None
+                else getattr(
+                    dense_codebook_stats,
+                    "compact_full_resident",
+                    False,
+                )
             )
         )
         if dev == "cuda" and dense_residency != "ram":
@@ -1047,11 +1100,8 @@ class Engine:
                 )
         if (
             ram_mirror is not None
-            and getattr(
-                getattr(self.model, "pool", None),
-                "retains_store_ram_blobs",
-                False,
-            )
+            and routed_vq is not None
+            and routed_vq.retains_store_ram_blobs
         ):
             self._ram_mirror = ram_mirror
             ram_mirror = None
@@ -1091,25 +1141,18 @@ class Engine:
             and not self.extreme_mode
             and os.environ.get("CCCP_VRAM_WATCH", "1") != "0"
         ):
-            _pool = getattr(self.model, "pool", None)
-            if (
-                _pool is not None
-                and getattr(_pool, "supports_vram_watch", True)
-            ):
-                from .vramwatch import VramWatch
-                self._vwatch = VramWatch(
-                    _pool,
-                    max_budget=_pool.budget,
+            if routed_vq is not None:
+                self._vwatch = routed_vq.start_vram_watch(
                     low_gb=self._vram_runtime_reserve_gb,
                     high_gb=self._vram_runtime_reserve_gb + 1.0,
                     quiet=quiet,
                 )
-                self._vwatch.start()
-            elif _pool is not None and not quiet:
+            if routed_vq is not None and self._vwatch is None and not quiet:
+                runtime_stats = routed_vq.stats()
                 print(
                     "[cccp-vram-plan] monitor=disabled "
                     "reason=fixed-address-arena "
-                    f"arena={getattr(_pool, 'gpu_arena_bytes', 0) / 2**30:.2f}GiB；"
+                    f"arena={runtime_stats.gpu_arena_bytes / 2**30:.2f}GiB；"
                     "容量由进程物理上限与单一总预留固定，运行期不再破坏性缩容",
                     flush=True,
                 )
@@ -1137,7 +1180,11 @@ class Engine:
             }
         if not quiet:
             if dev == "cuda":
-                pool = getattr(self.model, "pool", None)
+                runtime_stats = (
+                    routed_vq.stats()
+                    if routed_vq is not None
+                    else dense_codebook_stats
+                )
                 operator = str(
                     getattr(self.model, "packed_operator_name", "") or
                     "架构公共 CUDA 路径"
@@ -1150,9 +1197,9 @@ class Engine:
                     "[cccp-cuda-audit] "
                     f"Dense={self.dense_residency['actual']}；"
                     f"专家计算={operator}；"
-                    f"RAM专家={getattr(pool, 'host_expert_bytes', 0) / 2**30:.2f}GiB；"
-                    f"锁页RAM={getattr(pool, '_host_pinned_bytes', 0) / 2**30:.2f}GiB；"
-                    f"显存热缓存={getattr(pool, 'gpu_arena_bytes', 0) / 2**30:.2f}GiB；"
+                    f"RAM专家={getattr(runtime_stats, 'host_expert_bytes', 0) / 2**30:.2f}GiB；"
+                    f"锁页RAM={getattr(runtime_stats, 'host_pinned_bytes', getattr(runtime_stats, '_host_pinned_bytes', 0)) / 2**30:.2f}GiB；"
+                    f"显存热缓存={getattr(runtime_stats, 'gpu_arena_bytes', 0) / 2**30:.2f}GiB；"
                     f"跨层预取={'启用' if prefetch_enabled else '关闭'}",
                     flush=True,
                 )
@@ -1178,7 +1225,12 @@ class Engine:
                 except (RuntimeError, TypeError, ValueError):
                     pass
                 host_pinned_bytes = int(
-                    getattr(pool, "_host_pinned_bytes", 0) or 0
+                    getattr(
+                        runtime_stats,
+                        "host_pinned_bytes",
+                        getattr(runtime_stats, "_host_pinned_bytes", 0),
+                    )
+                    or 0
                 )
                 if os.name == "nt" and host_pinned_bytes > 0:
                     print(
@@ -1188,21 +1240,20 @@ class Engine:
                         flush=True,
                     )
             if full_resident and self.arch == "qwen3_5_dense":
-                pool = self.model.pool
                 print(
                     f"[cccp] 模型加载完成（{time.time() - t0:.1f}s）："
                     f"Qwen3.5 Dense VQ 全显存常驻 "
-                    f"{pool.gpu_storage_bytes / 2**30:.2f}GB；"
+                    f"{dense_codebook_stats.gpu_storage_bytes / 2**30:.2f}GB；"
                     "动态专家=无；运行期权重 H2D=0",
                     flush=True,
                 )
             elif full_resident:
-                pool = self.model.pool
+                runtime_stats = routed_vq.stats()
                 print(
                     f"[cccp] 模型加载完成（{time.time() - t0:.1f}s）："
                     f"TP={self.model.effective_tp_size} routed experts "
-                    f"{pool.gpu_storage_bytes / 2**30:.2f}GB 全显存常驻，"
-                    f"主机专家 {pool.host_expert_bytes / 2**30:.2f}GB",
+                    f"{runtime_stats.gpu_storage_bytes / 2**30:.2f}GB 全显存常驻，"
+                    f"主机专家 {runtime_stats.host_expert_bytes / 2**30:.2f}GB",
                     flush=True,
                 )
             elif compact_cpu_resident and self.arch == "qwen3_5_dense":
@@ -1212,14 +1263,14 @@ class Engine:
                     flush=True,
                 )
             elif compact_cpu_resident:
-                pool = self.model.pool
+                runtime_stats = routed_vq.stats()
                 print(
                     f"[cccp] 模型加载完成（{time.time() - t0:.1f}s）："
-                    f"CPU 专家执行镜像 {pool.host_expert_bytes / 2**30:.2f}GB "
+                    f"CPU 专家执行镜像 {runtime_stats.host_expert_bytes / 2**30:.2f}GB "
                     f"全量常驻；cpu_compile="
-                    f"{getattr(pool, 'cpu_compile_mode', 'off')}；"
+                    f"{runtime_stats.cpu_compile_mode}；"
                     f"expanded_index_bytes="
-                    f"{getattr(pool, 'expanded_index_bytes', 0)}",
+                    f"{runtime_stats.expanded_index_bytes}",
                     flush=True,
                 )
             elif dev == "cuda" and dense_residency == "ram":
@@ -1229,18 +1280,11 @@ class Engine:
                     flush=True,
                 )
             else:
-                pool = getattr(self.model, "pool", None)
                 extreme_detail = ""
-                if self.extreme_mode and pool is not None:
-                    ram_layers = len(
-                        getattr(pool, "extreme_ram_layers", ())
-                    )
-                    gpu_layers = len(
-                        getattr(pool, "extreme_gpu_layers", ())
-                    )
-                    ratio = float(
-                        getattr(pool, "extreme_storage_ratio", 0.0)
-                    )
+                if self.extreme_mode and routed_vq is not None:
+                    ram_layers = len(routed_vq.extreme_ram_layers)
+                    gpu_layers = len(routed_vq.extreme_gpu_layers)
+                    ratio = routed_vq.extreme_storage_ratio
                     extreme_detail = (
                         f"；极限常驻 RAM={ram_layers}层/GPU={gpu_layers}层"
                         f"/紧凑开销={ratio:.3f}x"
@@ -1254,25 +1298,29 @@ class Engine:
 
     def _cap_expert_cache(self, reserve_gb: float, reason: str) -> int | None:
         """Immediately enforce a cache ceiling within the allocator hard limit."""
-        pool = getattr(getattr(self, "model", None), "pool", None)
+        routed_vq = getattr(getattr(self, "model", None), "routed_vq", None)
         if (
-            pool is None
-            or getattr(pool, "full_resident", False)
-            or getattr(pool, "fixed_extreme_residency", False)
-            or getattr(pool, "manages_per_rank_budget", False)
+            routed_vq is None
+            or routed_vq.full_resident
+            or routed_vq.fixed_extreme_residency
+            or routed_vq.manages_per_rank_budget
+            or routed_vq.cache_budget is None
             or not self._vram_limit_bytes
         ):
             return None
         allocated = torch.cuda.memory_allocated()
-        expert_storage = getattr(pool, "gpu_storage_bytes", pool.bytes)
+        runtime_stats = routed_vq.stats()
+        expert_storage = (
+            runtime_stats.gpu_storage_bytes or runtime_stats.bytes
+        )
         new_budget = _safe_expert_budget(
             limit_bytes=self._vram_limit_bytes,
             allocated_bytes=allocated,
             expert_bytes=expert_storage,
-            requested_bytes=pool.budget,
+            requested_bytes=routed_vq.cache_budget,
             reserve_bytes=int(reserve_gb * 2**30),
         )
-        old_budget = pool.budget
+        old_budget = routed_vq.cache_budget
         fixed_gb = max(0, allocated - expert_storage) / 2**30
         if not self.quiet:
             print(
@@ -1288,14 +1336,18 @@ class Engine:
                 flush=True,
             )
         if new_budget < old_budget:
-            arena_bytes = getattr(pool, "gpu_arena_bytes", 0)
+            arena_bytes = runtime_stats.gpu_arena_bytes
             allocated_before = allocated
-            resize = getattr(pool, "resize_gpu_arenas", None)
-            resized = arena_bytes > new_budget and callable(resize)
-            if resized:
-                old_arena, new_arena = resize(new_budget)
+            resized_pair = (
+                routed_vq.resize_gpu_arenas(new_budget)
+                if arena_bytes > new_budget
+                else None
+            )
+            resized = resized_pair is not None
+            if resized_pair is not None:
+                old_arena, new_arena = resized_pair
             else:
-                pool.trim_to(new_budget)
+                routed_vq.trim_to(new_budget)
                 old_arena = new_arena = arena_bytes
             torch.cuda.empty_cache()
             allocated_after = torch.cuda.memory_allocated()
@@ -1410,7 +1462,7 @@ class Engine:
         prefill batches unchanged: their cache/H2D reuse has different costs.
         """
         suffix = ids[skip:]
-        pool = getattr(self.model, "pool", None)
+        routed_vq = getattr(self.model, "routed_vq", None)
         try:
             max_sequential = int(os.environ.get(
                 "CCCP_GLM_SEQUENTIAL_PREFILL_MAX",
@@ -1433,7 +1485,7 @@ class Engine:
                 "1",
             )
             != "0"
-            and bool(getattr(pool, "full_resident", False))
+            and bool(routed_vq is not None and routed_vq.full_resident)
             and not (callable(batch_available) and batch_available())
         )
         if media_state is not None and getattr(self, "arch", "glm") == "kimi_k3":
@@ -1807,17 +1859,20 @@ class Engine:
     ) -> torch.Tensor:
         """Build canonical DSV4 state independently of request boundaries."""
         self.reset()
-        pool = getattr(self.model, "pool", None)
-        short_exact_decode = _use_short_reset_decode(pool, baseline_len)
+        routed_vq = getattr(self.model, "routed_vq", None)
+        short_exact_decode = _use_short_reset_decode(
+            routed_vq,
+            baseline_len,
+        )
         arena_active = False
         if short_exact_decode:
             # A freshly loaded bounded pool starts in its long-Prefill layout.
             # Initialize the Decode layout once before the exact short path;
             # activate_decode_arena is idempotent once the runtime directory
             # is valid, so subsequent short prompts retain their hot slots.
-            end_prefill_block(pool)
+            end_prefill_block(routed_vq)
         elif manage_arena:
-            begin_prefill_block(pool)
+            begin_prefill_block(routed_vq)
             arena_active = True
         # A reset prompt is canonical batch prefill, not incremental replay.
         # The old one-token seed followed by ``_dsv4_prefill_range`` forced
@@ -1854,7 +1909,7 @@ class Engine:
             # the expanded BF16 expert scratch has been released.  A failed
             # Prefill also restores it so the next request starts cleanly.
             if arena_active:
-                end_prefill_block(pool)
+                end_prefill_block(routed_vq)
         if self.model.pos != baseline_len:
             raise RuntimeError(
                 f"DSV4 batched prefill position {self.model.pos} "
@@ -2120,24 +2175,24 @@ class Engine:
                 )
             return logits, snapshot_bytes
 
-        pool = getattr(self.model, "pool", None)
+        routed_vq = getattr(self.model, "routed_vq", None)
         # Only a fresh long prompt uses the batch-Prefill arena. Live and
         # rollback suffixes always use the exact Decode executor, while a
         # short reset can explicitly keep the existing Decode layout through
         # the pool capability above. No environment tuning switch is needed.
         batch_arena_required = bool(
             strategy == "full"
-            and not _use_short_reset_decode(pool, baseline_len)
+            and not _use_short_reset_decode(routed_vq, baseline_len)
         )
         arena_active = False
         try:
             if batch_arena_required:
-                arena_active = begin_prefill_block(pool)
+                arena_active = begin_prefill_block(routed_vq)
             with _PrefillProgressMonitor(self, len(ids)):
                 logits, snapshot_bytes = prepare_selected()
         finally:
             if arena_active:
-                end_prefill_block(pool)
+                end_prefill_block(routed_vq)
 
         stats = KVPrefillStats(
             mode=mode,
@@ -2188,21 +2243,26 @@ class Engine:
         no_repeat_ngram: int,
     ) -> int:
         """Return the safe GPU-token feedback window for greedy TP decode."""
+        routed_vq = getattr(self.model, "routed_vq", None)
+        public_fixed_graph = bool(
+            getattr(self.model, "device_greedy_supported", False)
+        )
         if (
-            getattr(self, "arch", "glm") != "glm"
-            or temp > 1e-6
+            temp > 1e-6
             or rep_penalty != 1.0
             or presence_penalty != 0.0
             or no_repeat_ngram != 0
             or getattr(self.model, "device", torch.device("cpu")).type
             != "cuda"
-            or getattr(self.model, "expert_parallel", None) is None
-            or not getattr(
-                getattr(self.model, "pool", None),
-                "full_resident",
-                False,
-            )
         ):
+            return 0
+        legacy_resident_graph = bool(
+            getattr(self, "arch", "glm") == "glm"
+            and routed_vq is not None
+            and routed_vq.resident_parallel_supported
+            and routed_vq.full_resident
+        )
+        if not public_fixed_graph and not legacy_resident_graph:
             return 0
         try:
             window = max(
@@ -2212,7 +2272,8 @@ class Engine:
         except ValueError:
             return 0
         if (
-            window > 1
+            legacy_resident_graph
+            and window > 1
             and os.environ.get(
                 "CCCP_FLASHINFER_MLA",
                 "1",

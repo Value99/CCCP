@@ -22,7 +22,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from .kernels import Int4Weight, VQWeight, rmsnorm
+from .kernels import Int4Weight, rmsnorm
 
 
 def _lin(x: torch.Tensor, w) -> torch.Tensor:
@@ -109,16 +109,9 @@ class MTPHead:
         activation_linear_beta = c.get("situ_linear_beta")
         limit = float(c.get("swiglu_limit", 0.0))
 
-        if (
-            x.shape[0] > 1
-            and getattr(self.m.pool, "prefill_rows_supported", False)
-            and callable(getattr(self.m.pool, "run_rows", None))
-        ):
-            self.m.pool.prefetch([
-                (self.LAYER, int(expert))
-                for expert in torch.unique(idx).detach().cpu().tolist()
-            ])
-            routed = self.m.pool.run_rows(
+        if x.shape[0] > 1:
+            self.m.routed_vq.prefetch_routes(self.LAYER, idx)
+            routed = self.m.routed_vq.execute(
                 self.LAYER,
                 x,
                 idx,
@@ -130,29 +123,14 @@ class MTPHead:
             )
         elif x.shape[0] == 1:
             expert_ids = [int(expert) for expert in idx[0].tolist()]
-            selected = self.m.pool.get_many([
-                (self.LAYER, expert) for expert in expert_ids
-            ])
-            experts = [
-                selected[(self.LAYER, expert)] for expert in expert_ids
-            ]
-            if not all(
-                isinstance(gu, VQWeight) and isinstance(dn, VQWeight)
-                for gu, dn in experts
-            ):
-                raise RuntimeError(
-                    "MTP fused packed top-k decode requires VQ experts; "
-                    "the legacy single-token expert projection was deleted"
-                )
-            from .grouped import moe_mlp_grouped_mixed
-
-            routed = moe_mlp_grouped_mixed(
+            routed = self.m.routed_vq.execute(
+                self.LAYER,
                 x,
-                experts,
+                idx[0],
                 w[0],
                 activation=activation,
-                situ_beta=activation_beta,
-                situ_linear_beta=activation_linear_beta,
+                activation_beta=activation_beta,
+                activation_linear_beta=activation_linear_beta,
                 limit=limit,
             ).reshape_as(x)
         else:
@@ -184,14 +162,12 @@ class MTPHead:
 
         位置 j 的 MTP 输入 = (h_main[j], embed(ids[j+1]))，预测 ids[j+2]。
         """
-        from .prefill import end_prefill_block
-
         T = len(ids)
         x = self._combine(h_main[: T - 1], ids[1:])
         h78 = self._layer78(x, 1)  # MTP 输入在 RoPE 位置 1..T-1（与 token 对齐）
         # 本块 run_rows 在共享主池上保留的专家展开工作区不能带进解码阶段。
         # 主池的 arena 相位由 engine 管理，这里只释放工作区。
-        end_prefill_block(self.m.pool, restore_decode=False)
+        self.m.routed_vq.end_prefill(restore_decode=False)
         return h78[-1:]
 
     def step(self, h78_prev: torch.Tensor, tok_id: int, pos: int) -> tuple[torch.Tensor, torch.Tensor]:

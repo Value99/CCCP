@@ -327,7 +327,8 @@ TPHidden 不存在 hidden owner，Attention、Dense/共享专家和 routed packe
 
 | 变量 | RAM / Parallel 默认 | 说明 |
 |---|---|---|
-| `CCCP_KIMI_PACKED_HYBRID` | RAM 为 1 | 单卡 packed 专家 RAM+VRAM 路径 |
+| `CCCP_TP_PACKED_HYBRID` | 0 | 通用多卡 packed 专家 RAM+VRAM 路径 |
+| `CCCP_RESIDENT_CODEBOOKS` | 1 | 通用码本常驻设备缓存 |
 | `CCCP_TP_GRAPH` | 1 | 启用张量并行固定地址 Graph |
 | `CCCP_TP_DIRECT_INPUT` | 1 | 全 rank 直接读取输入状态 |
 | `CCCP_TP_HIDDEN` | RAM 0；Parallel 1 | 启用分片 hidden 表示 |

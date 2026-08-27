@@ -81,13 +81,18 @@ def _operator_cache_identity(
             else "sm_auto"
         )
         runtime = str(torch.version.cuda or "unknown")
+    source_digest = hashlib.sha256()
+    source_digest.update(source_path.read_bytes())
+    for header in sorted(source_path.parent.glob("*.cuh")):
+        source_digest.update(header.name.encode("utf-8"))
+        source_digest.update(header.read_bytes())
     identity = {
         "abi": _EXTENSION_ABI,
         "backend": backend,
         "arch": arch,
         "python": f"{sys.version_info.major}.{sys.version_info.minor}",
         "runtime": runtime,
-        "source_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+        "source_sha256": source_digest.hexdigest(),
         "torch": str(torch.__version__).split("+")[0],
     }
     digest = hashlib.sha256(
@@ -110,7 +115,32 @@ def _stage_operator_source(source: str | Path, build_directory: Path) -> Path:
     staged = build_directory / source_path.name
     if not staged.is_file() or staged.read_bytes() != source_path.read_bytes():
         shutil.copy2(source_path, staged)
+    for header in source_path.parent.glob("*.cuh"):
+        staged_header = build_directory / header.name
+        if (
+            not staged_header.is_file()
+            or staged_header.read_bytes() != header.read_bytes()
+        ):
+            shutil.copy2(header, staged_header)
     return staged
+
+
+def _reset_jit_ninja_metadata(build_directory: str | Path) -> None:
+    """Discard generated Ninja text before an offline JIT retry.
+
+    PyTorch reads an existing ``build.ninja`` with the Windows process code
+    page before deciding whether to rewrite it.  A previous launch from a
+    non-ASCII path can therefore make the next launch fail before NVCC starts.
+    This file is generated metadata, never source or a compiled operator.
+    """
+
+    ninja_file = Path(build_directory) / "build.ninja"
+    try:
+        ninja_file.unlink(missing_ok=True)
+    except OSError as exc:
+        raise RuntimeError(
+            f"无法重置算子编译缓存元数据：{ninja_file}"
+        ) from exc
 
 
 def _load_extension_binary(module_name: str, binary: Path):
@@ -393,7 +423,14 @@ def _launcher_root() -> Path:
 
 
 def _bundled_windows_tool(name: str) -> str | None:
-    """Prefer the release's MSVC tool and consult the system only as fallback."""
+    """Return only the release's resolved portable MSVC tool path.
+
+    Resolving the complete candidate is important when ``toolchain`` is a
+    junction below a non-ASCII workspace: NVCC accepts the resolved ASCII
+    target but can exit without diagnostics when ``-ccbin`` retains the
+    junction's display path.  System Visual Studio is deliberately excluded
+    so an offline build cannot silently mix compiler ABIs.
+    """
     vc_tools = (
         _launcher_root() / "toolchain" / "portable" / "Contents" /
         "VC" / "Tools" / "MSVC"
@@ -409,10 +446,7 @@ def _bundled_windows_tool(name: str) -> str | None:
     for version in versions:
         candidate = version / "bin" / "Hostx64" / "x64" / name
         if candidate.is_file():
-            return str(candidate)
-    located = shutil.which(name)
-    if located and os.path.isfile(located):
-        return located
+            return str(candidate.resolve())
     return None
 
 
@@ -900,6 +934,7 @@ def _build(verbose: bool = False):
                 extra_include_paths = (extra_include_paths or []) + [compact_headers]
         backend_label = "AMD-HIP" if torch.version.hip is not None else "NVIDIA-CUDA"
         staged_source = _stage_operator_source(src, build_directory)
+        _reset_jit_ninja_metadata(build_directory)
         with operator_build_progress(backend_label) as build_progress:
             _EXT = load(name=module_name, sources=[str(staged_source)],
                         extra_cflags=extra_cflags,
@@ -1513,7 +1548,7 @@ if _EXT is not None:
         lower_bound: float = -5.0,
     ) -> torch.Tensor:
         """KDA decode update with persistent FP32 V-first state."""
-        return _EXT.kimi_kda_recurrent(
+        return _EXT.cccp_ordered_recurrent_step(
             query.contiguous(),
             key.contiguous(),
             value.contiguous(),
@@ -1552,7 +1587,7 @@ if _EXT is not None:
             or output.shape != value.shape
         ):
             return None
-        return _EXT.kimi_kda_recurrent_batch(
+        return _EXT.cccp_ordered_recurrent_scan(
             query.contiguous(), key.contiguous(), value.contiguous(),
             gate.contiguous(), beta.float().contiguous(),
             a_log.float().contiguous(), dt_bias.float().contiguous(),
@@ -1643,57 +1678,6 @@ if _EXT is not None:
             result,
             int(p12_count),
             int(projection_layout_tag),
-        )
-
-    def packed_moe_topk_compact_fp8_codebook_fused(
-        value: torch.Tensor,
-        route_ids: torch.Tensor,
-        weights: torch.Tensor,
-        metadata: torch.Tensor,
-        scales: torch.Tensor,
-        activation: str,
-        beta: float,
-        linear_beta: float,
-        limit: float,
-        hidden_workspace: torch.Tensor,
-        out_workspace: torch.Tensor,
-        result: torch.Tensor,
-    ) -> torch.Tensor | None:
-        """Run Top-K MoE without materializing full E4M3 expert weights."""
-        activation_kind = {
-            "situ": 0,
-            "silu": 1,
-            "swiglu": 1,
-        }.get(str(activation).strip().lower())
-        if (
-            activation_kind is None
-            or not value.is_cuda
-            or value.dtype != torch.bfloat16
-            or value.shape[0] != 1
-            or route_ids.dtype != torch.long
-            or route_ids.ndim != 1
-            or not 0 < route_ids.numel() <= 16
-            or weights.dtype != torch.float32
-            or weights.shape != route_ids.shape
-            or metadata.dtype != torch.long
-            or metadata.shape != (15, route_ids.numel())
-            or scales.dtype != torch.float32
-            or scales.shape != (route_ids.numel(), 3)
-        ):
-            return None
-        return _EXT.packed_moe_topk_compact_fp8_codebook(
-            value.contiguous(),
-            route_ids.contiguous(),
-            weights.contiguous(),
-            metadata.contiguous(),
-            scales.contiguous(),
-            int(activation_kind),
-            float(beta),
-            float(linear_beta),
-            float(limit),
-            hidden_workspace,
-            out_workspace,
-            result,
         )
 
     def packed_moe_topk_compact_q8_codebook_fused(
@@ -4765,9 +4749,6 @@ else:
     def packed_moe_topk_fused(*args, **kwargs):
         return None
 
-    def packed_moe_topk_compact_fp8_codebook_fused(*args, **kwargs):
-        return None
-
     def packed_moe_topk_compact_q8_codebook_fused(*args, **kwargs):
         return None
 
@@ -5089,6 +5070,5 @@ else:
 
 # 旧公开名只作为外部脚本的兼容别名；注册层只引用通用名称。
 kimi_short_conv3_fused = short_conv3_fused
-kimi_kda_recurrent_fused = kda_recurrent_fused
 kimi_gated_rmsnorm_fused = gated_rmsnorm_fused
 kimi_moe_packed_fused = packed_moe_topk_fused

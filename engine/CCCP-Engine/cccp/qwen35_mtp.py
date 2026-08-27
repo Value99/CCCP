@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from .dense_vq import (
+from .ops.codebook import (
     DenseBF16Linear,
     DenseBF16LinearGroup,
     DenseBF16SwiGLU,

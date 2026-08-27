@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from .cconfig import KimiK3Config
-from .grouped import activate_gate_up, moe_mlp_grouped_mixed
+from .grouped import activate_gate_up
 from .kernels import BlockFP8Weight, ProjectionGroup
 from .kimi_ops import (
     attention_residual,
@@ -31,15 +31,20 @@ from .kimi_ops import (
 )
 from .precision import compute_dtype
 from .prefill import (
-    begin_prefill_block,
-    end_prefill_block,
     prefill_block_size_with_legacy,
     run_prefill_blocks,
 )
-from .store import CCCPStore, ExpertPool, PackedCpuExpertPool
+from .store import CCCPStore
 
 
 _ROOT = "language_model"
+
+
+def _kimi_routed_topology(store, tp_size: int):
+    """Return only Kimi's layer/rank map for the public VQ runtime."""
+    from .ops import build_routed_vq_topology_plan
+
+    return build_routed_vq_topology_plan(store, int(tp_size))
 
 
 def _linear(value: torch.Tensor, weight) -> torch.Tensor:
@@ -131,108 +136,33 @@ class KimiK3CCCPModel:
                     f"Kimi tp={self.tp_size} requires cuda:{primary}.."
                     f"cuda:{self.devices[-1].index}"
                 )
-            from .kimi_experts import (
-                PackedExpertPool,
-                build_kimi_layer_plan,
-            )
-
-            self._pipeline_plan = build_kimi_layer_plan(
-                self.store,
-                self.tp_size,
-            )
-            tp_ram_offload = (
-                os.environ.get(
-                    "CCCP_KIMI_TP_PACKED_HYBRID",
-                    "0",
-                )
-                != "0"
-            )
-            if tp_ram_offload:
-                from .kimi_tp_hybrid import (
-                    PackedTensorHybridPool,
-                )
-
-                self.pool = PackedTensorHybridPool(
-                    self.store,
-                    self.devices,
-                    self._pipeline_plan,
-                    vram_cache_gb,
-                    ram_gb=cache_gb,
-                )
-            else:
-                self.pool = PackedExpertPool(
-                    self.store,
-                    self.devices,
-                    self._pipeline_plan,
-                    parallelism=os.environ.get(
-                        "CCCP_MOE_PARALLELISM",
-                        "tensor",
-                    ),
-                    tensor_group_size=int(
-                        os.environ.get("CCCP_MOE_TP_GROUP", "2")
-                    ),
-                )
         else:
             self.devices = (self.device,)
-            self._pipeline_plan = None
-            packed_cpu = (
-                self.device.type == "cpu"
-                and os.environ.get("CCCP_CPU_PACKED", "1") != "0"
-            )
-            packed_hybrid = (
-                self.device.type == "cuda"
-                and os.environ.get("CCCP_KIMI_PACKED_HYBRID", "1") != "0"
-            )
-            if self._ram_dense_cuda:
-                from .packed_hybrid import PackedHybridPool
+        expert_device = self.accelerator_device or self.device
+        routed_devices = (
+            (expert_device,) if self._ram_dense_cuda else self.devices
+        )
+        layer_graph_requested = bool(
+            expert_device.type == "cuda"
+            and os.environ.get("CCCP_SINGLE_GPU_LAYER_GRAPH", "0") != "0"
+        )
+        from .ops import create_routed_vq_runtime
 
-                self.pool = PackedHybridPool(
-                    self.store,
-                    vram_cache_gb,
-                    device=self.accelerator_device,
-                    ram_gb=cache_gb,
-                    startup_gpu_reserve_bytes=0,
-                )
-            elif packed_cpu:
-                self.pool = PackedCpuExpertPool(
-                    self.store,
-                    cache_gb,
-                )
-            elif packed_hybrid:
-                from .packed_hybrid import PackedHybridPool
-
-                self.pool = PackedHybridPool(
-                    self.store,
-                    vram_cache_gb,
-                    device=self.device,
-                    ram_gb=cache_gb,
-                    startup_gpu_reserve_bytes=extreme_fixed_gpu_bytes,
-                )
-            else:
-                self.pool = ExpertPool(
-                    self.store,
-                    vram_cache_gb if self.device.type != "cpu" else cache_gb,
-                    device=device,
-                    ram_gb=cache_gb if self.device.type != "cpu" else 0.0,
-                )
-            if (
-                self.device.type == "cuda"
-                and os.environ.get(
-                    "CCCP_SINGLE_GPU_LAYER_GRAPH",
-                    "0",
-                )
-                != "0"
-            ):
-                from .kimi_experts import build_kimi_layer_plan
-
-                # Reuse the public fixed-address TP graph builders at width
-                # one.  The packed RAM pool remains unchanged; this plan only
-                # describes dense/attention graph ownership and never turns
-                # the single-GPU path into an owner/worker execution system.
-                self._pipeline_plan = build_kimi_layer_plan(
-                    self.store,
-                    1,
-                )
+        codebook_runtime = create_routed_vq_runtime(
+            self.store,
+            device=expert_device,
+            devices=routed_devices,
+            tp_size=self.tp_size,
+            cache_gb=cache_gb,
+            vram_cache_gb=vram_cache_gb,
+            startup_gpu_reserve_bytes=(
+                0 if self._ram_dense_cuda else extreme_fixed_gpu_bytes
+            ),
+            topology_plan_factory=_kimi_routed_topology,
+            layer_graph_requested=layer_graph_requested,
+        )
+        self.routed_vq = codebook_runtime.executor
+        self._pipeline_plan = codebook_runtime.topology_plan
         self._weights: dict[str, object] = {}
         self._consumed_dense_names: set[str] = set()
         self._kda_input_proj: dict[int, object] = {}
@@ -535,9 +465,7 @@ class KimiK3CCCPModel:
 
             prebuild_cpu()
             if not self._ram_dense_cuda:
-                resident_all = self.pool.preload_all()
-                if not resident_all:
-                    self.pool.preload_pinned()
+                self.routed_vq.initialize_residency(device_type="cpu")
             names = [
                 name
                 for name in self.store.dense_names()
@@ -557,11 +485,10 @@ class KimiK3CCCPModel:
                 # before creating 82k small expert views.  Reversing this
                 # order fragments the host heap and can reject an otherwise
                 # modest 20--90 MiB Dense allocation despite ample free RAM.
-                resident_all = self.pool.preload_all()
-                if not resident_all:
-                    self.pool.preload_pinned()
-                self.pool.pin_host_resident()
-                arena_gb = self.pool.build_gpu_arenas()
+                residency = self.routed_vq.initialize_residency(
+                    device_type="cuda",
+                )
+                arena_gb = residency.gpu_arena_gb
                 print(
                     "[cccp-kimi] RAM Dense + CUDA packed MoE 联合执行完成："
                     f"GPU arena={arena_gb:.2f}GiB；"
@@ -598,21 +525,15 @@ class KimiK3CCCPModel:
                 )
             return
         started = time.time()
-        extreme_resident_all: bool | None = None
+        extreme_residency = None
         if (
             self._pipeline_plan is None
-            and getattr(self.pool, "startup_gpu_reserve_bytes", 0) > 0
+            and self.routed_vq.startup_gpu_reserve_bytes > 0
         ):
-            extreme_resident_all = self.pool.preload_all()
-            if not extreme_resident_all:
-                raise RuntimeError(
-                    "极限模式要求全部紧凑专家固定驻留 RAM/VRAM"
-                )
-            self.pool.release_startup_gpu_reservation()
+            extreme_residency = self.routed_vq.prepare_required_residency(
+                device_type="cuda",
+            )
         if self._pipeline_plan is not None:
-            allocate = getattr(self.pool, "allocate", None)
-            if callable(allocate):
-                allocate()
             # A full-resident Kimi archive writes hundreds of GiB into its
             # fixed packed slabs.  Finish that one-time population before any
             # Dense/Attention CUDA graph is captured.  Capturing KDA first and
@@ -620,11 +541,11 @@ class KimiK3CCCPModel:
             # driver graph resources on large TP deployments even though the
             # tensor addresses themselves are stable.  Expert execution graphs
             # still wait until Router/Hidden fixed inputs are bound below.
-            if (
-                hasattr(self.pool, "preload")
-                and not getattr(self.pool, "host_mapped", False)
-            ):
-                self.pool.preload(capture_graphs=False)
+            self.routed_vq.materialize_full_device(
+                allocate=True,
+                load_payload=not self.routed_vq.host_mapped,
+                capture_graphs=False,
+            )
             if len(self.devices) == 1:
                 placement = (
                     "单rank固定地址 Graph；Dense 流式落入 GPU，"
@@ -633,7 +554,7 @@ class KimiK3CCCPModel:
             else:
                 placement = (
                     "按层流水线"
-                    if self.pool.parallelism == "pipeline"
+                    if self.routed_vq.parallelism == "pipeline"
                     else (
                         "完整Dense权重仅按层暂存；运行权重已按维度分片到"
                         "全rank，packed专家同样跨全rank分片"
@@ -729,8 +650,8 @@ class KimiK3CCCPModel:
             + "）",
             flush=True,
         )
-        if extreme_resident_all is not None:
-            self.pool.verify_startup_gpu_reservation()
+        if extreme_residency is not None:
+            self.routed_vq.verify_required_residency()
         if self._pipeline_plan is None:
             # Projection fusion temporarily holds both source and concatenated
             # BF16 tensors.  Their allocations are dead here, but PyTorch can
@@ -750,12 +671,9 @@ class KimiK3CCCPModel:
                     f"{released / 2**30:.1f}GiB",
                     flush=True,
                 )
-        if self._pipeline_plan is not None and hasattr(self.pool, "preload"):
-            self.pool.preload()
-            if (
-                getattr(self.pool, "hidden_mode", False)
-                and hasattr(self.pool, "compose_route_topk")
-            ):
+        if self._pipeline_plan is not None:
+            self.routed_vq.materialize_full_device()
+            if self.routed_vq.hidden_mode:
                 from .ops import (
                     RoutePackedPlanSpec,
                     TensorParallelRoutePackedPlan,
@@ -775,7 +693,7 @@ class KimiK3CCCPModel:
                         n_group=self.config.n_group,
                         topk_group=self.config.topk_group,
                     ),
-                    self.pool,
+                    self.routed_vq,
                     {
                         layer: self._tp_route_down.output_hidden(
                             layer
@@ -803,7 +721,7 @@ class KimiK3CCCPModel:
                     ):
                         self._tp_routed_up.compose_normalize_prelude(
                             layer,
-                            self.pool.output_hidden(layer),
+                            self.routed_vq.output_hidden(layer),
                             self._tp_routed_norm_weights[layer],
                             self.config.rms_eps,
                         )
@@ -835,21 +753,13 @@ class KimiK3CCCPModel:
                         flush=True,
                     )
             return
-        resident_all = (
-            extreme_resident_all
-            if extreme_resident_all is not None
-            else self.pool.preload_all()
-        )
-        if resident_all:
-            # Reserve the fixed VRAM arena before cudaHostRegister.  Very large
-            # host mappings consume CUDA driver address-space resources and can
-            # otherwise make the later arena allocation fail even though the
-            # packed archive itself never enters VRAM.
-            self.pool.build_gpu_arenas()
-            self.pool.pin_host_resident()
+        if extreme_residency is not None:
+            self.routed_vq.finalize_residency(
+                extreme_residency,
+                device_type="cuda",
+            )
         else:
-            self.pool.preload_pinned()
-            self.pool.build_gpu_arenas()
+            self.routed_vq.initialize_residency(device_type="cuda")
 
     def _assert_no_owner_tp_dataflow(self) -> None:
         """Reject transitional owner compute when formal no-owner TP is on."""
@@ -880,8 +790,8 @@ class KimiK3CCCPModel:
             )
         )
         if (
-            not getattr(self.pool, "hidden_mode", False)
-            or getattr(self.pool, "parallelism", None) != "tensor"
+            not self.routed_vq.hidden_mode
+            or self.routed_vq.parallelism != "tensor"
             or self._tp_route_down is None
             or self._tp_fixed_moe_prelude is not None
             or self._tp_moe_owner_layer_graph
@@ -934,7 +844,7 @@ class KimiK3CCCPModel:
         if os.environ.get("CCCP_TP_MOE_PLAN", "0") == "0":
             return
         if (
-            not getattr(self.pool, "hidden_mode", False)
+            not self.routed_vq.hidden_mode
             or not self._tp_moe_all_rank_layer_graph
             or not self._tp_route_packed_graph
             or (
@@ -972,7 +882,7 @@ class KimiK3CCCPModel:
                     self._tp_layer_prefix_hidden[layer],
                     self._tp_shared_mlp,
                     self._tp_route_down,
-                    self.pool,
+                    self.routed_vq,
                     self._tp_routed_up,
                 )
             )
@@ -1136,7 +1046,7 @@ class KimiK3CCCPModel:
         if (
             self.device.type != "cpu"
             or os.environ.get("CCCP_CPU_FUSED_LATENT_MOE", "1") == "0"
-            or not getattr(self.pool, "compact_full_resident", False)
+            or not self.routed_vq.compact_full_resident
             or not self.config.latent_moe_use_norm
             or self.config.n_group != 1
         ):
@@ -1149,9 +1059,9 @@ class KimiK3CCCPModel:
             grouped = self._moe_input_proj.get(layer)
             if not isinstance(grouped, ProjectionGroup):
                 continue
-            entries = tuple(
-                self.pool.pinned.get((layer, expert))
-                for expert in range(self.config.n_experts)
+            entries = self.routed_vq.resident_entries(
+                layer,
+                self.config.n_experts,
             )
             if any(entry is None or len(entry) != 3 for entry in entries):
                 continue
@@ -1575,7 +1485,7 @@ class KimiK3CCCPModel:
             )
             if (
                 self.config.latent_moe_use_norm
-                and getattr(self.pool, "hidden_mode", False)
+                and self.routed_vq.hidden_mode
                 and os.environ.get(
                     "CCCP_TP_HIDDEN_STATE",
                     "0",
@@ -1671,7 +1581,7 @@ class KimiK3CCCPModel:
             or self._tp_shared_mlp is None
             or self._tp_routed_up is None
             or (
-                getattr(self.pool, "hidden_mode", False)
+                self.routed_vq.hidden_mode
                 and self._tp_route_down is None
             )
         ):
@@ -1724,7 +1634,7 @@ class KimiK3CCCPModel:
                     self._tp_routed_latent_buffers[layer]
                 )
         if (
-            not getattr(self.pool, "hidden_mode", False)
+            not self.routed_vq.hidden_mode
             and os.environ.get("CCCP_MOE_OWNER_GRAPH", "0") != "0"
         ):
             from .ops import FixedMoEPrelude, FixedMoEPreludeSpec
@@ -1808,7 +1718,7 @@ class KimiK3CCCPModel:
                 for device in self.devices
             )
 
-        if getattr(self.pool, "hidden_mode", False):
+        if self.routed_vq.hidden_mode:
             for layer in range(
                 self.config.first_dense_layers,
                 self.config.n_layers,
@@ -1844,7 +1754,7 @@ class KimiK3CCCPModel:
                 _router_hidden, latent_hidden = (
                     self._tp_route_down.output_hidden(layer)
                 )
-                self.pool.bind_hidden_inputs(
+                self.routed_vq.bind_hidden_inputs(
                     layer,
                     latent_hidden,
                     tuple(weight_buffers),
@@ -2074,7 +1984,7 @@ class KimiK3CCCPModel:
                 hidden_source = self._tp_routed_up.output_hidden(layer)
         self._tp_mlp_layer_graph = True
         if (
-            getattr(self.pool, "hidden_mode", False)
+            self.routed_vq.hidden_mode
             and self._tp_route_down is not None
         ):
             for layer in range(
@@ -3481,7 +3391,7 @@ class KimiK3CCCPModel:
             )
             fused = latent_executor.forward_latent_moe(value, residual)
             if fused.numel():
-                self.pool.hits += config.top_k
+                self.routed_vq.record_cache_hits(config.top_k)
                 self._cpu_profile_finish("moe_latent_fused", fused_started)
                 return fused if fused.dtype == value.dtype else fused.to(value.dtype)
         prefix = f"{_ROOT}.model.layers.{layer}.block_sparse_moe"
@@ -3816,13 +3726,11 @@ class KimiK3CCCPModel:
             and (
                 (
                     self._ram_dense_cuda
-                    and hasattr(self.pool, "prepare_host_run")
-                    and hasattr(self.pool, "finish_host_run")
+                    and self.routed_vq.host_overlap_supported
                 )
                 or (
                     device.type == "cuda"
-                    and hasattr(self.pool, "prepare_run")
-                    and hasattr(self.pool, "finish_run")
+                    and self.routed_vq.overlap_supported
                 )
             )
         )
@@ -3839,18 +3747,18 @@ class KimiK3CCCPModel:
         )
         if (
             self._pipeline_plan is not None
-            or getattr(self.pool, "device_routed", False)
+            or self.routed_vq.device_routed
         ):
             if overlap_shared:
                 prepare = (
-                    self.pool.prepare_host_run
+                    self.routed_vq.prepare_host
                     if self._ram_dense_cuda
-                    else self.pool.prepare_run
+                    else self.routed_vq.prepare
                 )
                 finish = (
-                    self.pool.finish_host_run
+                    self.routed_vq.finish_host
                     if self._ram_dense_cuda
-                    else self.pool.finish_run
+                    else self.routed_vq.finish
                 )
                 pending = prepare(
                     layer,
@@ -3865,10 +3773,10 @@ class KimiK3CCCPModel:
                     shared = compute_shared_output()
                     routed = finish(pending)
                 except BaseException:
-                    self.pool.cancel_run(pending)
+                    self.routed_vq.cancel(pending)
                     raise
             else:
-                routed = self.pool.run(
+                routed = self.routed_vq.execute(
                     layer,
                     latent,
                     indices[0],
@@ -3883,45 +3791,25 @@ class KimiK3CCCPModel:
             ).to(value.dtype)
             remember_route = os.environ.get(
                 "CCCP_PREFETCH",
-                "1" if getattr(self.pool, "prefetch_default", True) else "0",
+                "1" if self.routed_vq.prefetch_default else "0",
             ) != "0"
             if (
-                getattr(self.pool, "device_routed", False)
+                self.routed_vq.device_routed
                 and remember_route
             ):
-                self._prev_ids[layer] = self.pool.last_expert_ids(layer)
+                self._prev_ids[layer] = self.routed_vq.last_expert_ids(layer)
         else:
-            native = getattr(self.pool, "run_native", None)
-            routed = (
-                native(
-                    layer,
-                    latent,
-                    indices[0],
-                    weights[0],
-                    activation=self.operator_config.expert_activation,
-                    activation_beta=config.situ_beta,
-                    activation_linear_beta=config.situ_linear_beta,
-                )
-                if native is not None
-                else None
-            )
             expert_ids = indices[0].tolist()
             self._prev_ids[layer] = expert_ids
-            if routed is None:
-                selected = self.pool.get_many(
-                    [(layer, expert_id) for expert_id in expert_ids]
-                )
-                routed = moe_mlp_grouped_mixed(
-                    latent,
-                    [
-                        selected[(layer, expert_id)]
-                        for expert_id in expert_ids
-                    ],
-                    weights[0],
-                    activation=self.operator_config.expert_activation,
-                    situ_beta=config.situ_beta,
-                    situ_linear_beta=config.situ_linear_beta,
-                )
+            routed = self.routed_vq.execute(
+                layer,
+                latent,
+                indices[0],
+                weights[0],
+                activation=self.operator_config.expert_activation,
+                activation_beta=config.situ_beta,
+                activation_linear_beta=config.situ_linear_beta,
+            )
             routed = routed.view(1, config.routed_hidden).to(value.dtype)
         self._cuda_stage_end(expert_event)
         self._cpu_profile_finish("moe_packed_experts", expert_started)
@@ -4034,51 +3922,6 @@ class KimiK3CCCPModel:
         if event is not None:
             event.record()
 
-    @staticmethod
-    def _pool_profile_counters(pool) -> dict[str, float | int]:
-        """Read monotonic cache counters without depending on one pool type."""
-        return {
-            "hits": int(getattr(pool, "hits", 0)),
-            "misses": int(
-                getattr(pool, "misses", getattr(pool, "miss", 0))
-            ),
-            "prefetch_hits": int(getattr(pool, "prefetch_hits", 0)),
-            "uploaded_bytes": int(getattr(pool, "uploaded_bytes", 0)),
-            "transfer_seconds": float(
-                getattr(pool, "transfer_seconds", 0.0)
-            ),
-            "route_plan_hits": int(
-                getattr(pool, "route_plan_hits", 0)
-            ),
-            "route_plan_misses": int(
-                getattr(pool, "route_plan_misses", 0)
-            ),
-            "device_route_lookups": int(
-                getattr(pool, "device_route_lookups", 0)
-            ),
-            "device_route_full_hits": int(
-                getattr(pool, "device_route_full_hits", 0)
-            ),
-            "device_route_fallbacks": int(
-                getattr(pool, "device_route_fallbacks", 0)
-            ),
-            "h2d_batch_submissions": int(
-                getattr(getattr(pool, "_stage", None), "batch_submissions", 0)
-            ),
-            "h2d_batch_copies": int(
-                getattr(getattr(pool, "_stage", None), "batch_copies", 0)
-            ),
-            "h2d_batch_fallbacks": int(
-                getattr(getattr(pool, "_stage", None), "batch_fallbacks", 0)
-            ),
-            "native_packed_hits": int(
-                getattr(pool, "native_hits", 0)
-            ),
-            "native_packed_fallbacks": int(
-                getattr(pool, "native_fallbacks", 0)
-            ),
-        }
-
     def start_profile(self) -> None:
         """Enable the official one-token Kimi CLI stage probe.
 
@@ -4089,7 +3932,7 @@ class KimiK3CCCPModel:
         self.last_layer_profile = []
         self.last_cuda_profile = {}
         self._cpu_substage_profile = {}
-        self._profile_pool_snapshot = self._pool_profile_counters(self.pool)
+        self._profile_pool_snapshot = self.routed_vq.profile_counters()
         if self.device.type == "cpu":
             from .cpuext import (
                 reset_block_fp8_gemv_profile,
@@ -4107,14 +3950,8 @@ class KimiK3CCCPModel:
     def finish_profile(self) -> dict[str, object]:
         """Finish and aggregate a Kimi probe in JSON-serializable form."""
         self._profile_enabled = False
-        collect_transfer = getattr(
-            self.pool,
-            "collect_transfer_timing",
-            None,
-        )
-        if callable(collect_transfer):
-            collect_transfer(synchronize=True)
-        elif self.device.type == "cuda":
+        self.routed_vq.collect_transfer_timing(synchronize=True)
+        if self.device.type == "cuda":
             for device in self.devices:
                 torch.cuda.synchronize(device)
 
@@ -4176,7 +4013,7 @@ class KimiK3CCCPModel:
             reverse=True,
         )[:8]
 
-        current = self._pool_profile_counters(self.pool)
+        current = self.routed_vq.profile_counters()
         before = self._profile_pool_snapshot
         cache_delta: dict[str, float | int] = {}
         for name, value in current.items():
@@ -4201,25 +4038,26 @@ class KimiK3CCCPModel:
             "expert_cache_delta": cache_delta,
         }
         if self.device.type == "cpu":
+            runtime_stats = self.routed_vq.stats()
             result["cpu_substages_ms"] = {
                 name: seconds * 1000.0
                 for name, seconds in self._cpu_substage_profile.items()
             }
             result["cpu_execution_image"] = {
                 "compile_mode": str(
-                    getattr(self.pool, "cpu_compile_mode", "off")
+                    runtime_stats.cpu_compile_mode
                 ),
                 "resident_bytes": int(
-                    getattr(self.pool, "host_expert_bytes", 0)
+                    runtime_stats.host_expert_bytes
                 ),
                 "source_index_bytes": int(
-                    getattr(self.pool, "compiled_source_bytes", 0)
+                    runtime_stats.compiled_source_bytes
                 ),
                 "compiled_index_bytes": int(
-                    getattr(self.pool, "compiled_index_bytes", 0)
+                    runtime_stats.compiled_index_bytes
                 ),
                 "expanded_index_bytes": int(
-                    getattr(self.pool, "expanded_index_bytes", 0)
+                    runtime_stats.expanded_index_bytes
                 ),
                 "latent_moe_layers": len(
                     getattr(self, "_cpu_latent_moe_layers", {})
@@ -4332,7 +4170,7 @@ class KimiK3CCCPModel:
                 if self._tp_async_profile_active
                 else None
             )
-            self.pool.hits += self.config.top_k
+            self.routed_vq.record_cache_hits(self.config.top_k)
             if os.environ.get("CCCP_ROUTE_HISTORY", "0") != "0":
                 self._prev_ids[layer] = (
                     self._tp_route_all_rank_buffers[layer][1][0][0]
@@ -4436,7 +4274,7 @@ class KimiK3CCCPModel:
         if trace and not self._tp_route_packed_graph:
             moe_trace["route_weights"] = routes[0][0].clone()
             moe_trace["route_indices"] = routes[0][1].clone()
-        routed = self.pool.run_hidden(
+        routed = self.routed_vq.execute_hidden(
             layer,
             latent,
             tuple(routes),
@@ -4517,7 +4355,7 @@ class KimiK3CCCPModel:
 
     def _moe_hidden(self, value, residual, layer: int):
         """Run MoE from fixed replicated state with one hidden collective."""
-        if getattr(self.pool, "hidden_mode", False):
+        if self.routed_vq.hidden_mode:
             return self._moe_hidden_no_owner(value, residual, layer)
         from .ops import linear_route_topk
 
@@ -4667,7 +4505,7 @@ class KimiK3CCCPModel:
             moe_trace["latent"] = latent.clone()
         weights, indices = route
         with torch.cuda.device(device):
-            packed_result = self.pool.run(
+            packed_result = self.routed_vq.execute(
                 layer,
                 latent,
                 indices[0],
@@ -4693,11 +4531,11 @@ class KimiK3CCCPModel:
                 )
         remember_route = os.environ.get(
             "CCCP_PREFETCH",
-            "1" if getattr(self.pool, "prefetch_default", True) else "0",
+            "1" if self.routed_vq.prefetch_default else "0",
         ) != "0"
-        if getattr(self.pool, "device_routed", False) and remember_route:
-            self._prev_ids[layer] = self.pool.last_expert_ids(layer)
-        elif not getattr(self.pool, "device_routed", False):
+        if self.routed_vq.device_routed and remember_route:
+            self._prev_ids[layer] = self.routed_vq.last_expert_ids(layer)
+        elif not self.routed_vq.device_routed:
             self._prev_ids[layer] = indices[0].tolist()
         if layer == trace_layer:
             moe_trace["routed_norm"] = routed.clone()
@@ -4794,7 +4632,7 @@ class KimiK3CCCPModel:
 
         prefetch_default = (
             "1"
-            if getattr(self.pool, "prefetch_default", True)
+            if self.routed_vq.prefetch_default
             else "0"
         )
         if (
@@ -4802,9 +4640,7 @@ class KimiK3CCCPModel:
             and os.environ.get("CCCP_PREFETCH", prefetch_default) != "0"
         ):
             for layer, expert_ids in self._prev_ids.items():
-                self.pool.prefetch(
-                    [(layer, expert_id) for expert_id in expert_ids]
-                )
+                self.routed_vq.prefetch_routes(layer, expert_ids)
 
         for layer in range(self.config.n_layers):
             timing_started = time.perf_counter()
@@ -4885,7 +4721,7 @@ class KimiK3CCCPModel:
                 and stage_profiler is None
             ):
                 hidden = decode_plan.launch(hidden, position)
-                self.pool.hits += self.config.top_k
+                self.routed_vq.record_cache_hits(self.config.top_k)
                 if os.environ.get("CCCP_ROUTE_HISTORY", "0") != "0":
                     self._prev_ids[layer] = (
                         self._tp_route_all_rank_buffers[layer][1][0][0]
@@ -5197,7 +5033,7 @@ class KimiK3CCCPModel:
 
         prefetch_default = (
             "1"
-            if getattr(self.pool, "prefetch_default", True)
+            if self.routed_vq.prefetch_default
             else "0"
         )
         if (
@@ -5205,9 +5041,7 @@ class KimiK3CCCPModel:
             and os.environ.get("CCCP_PREFETCH", prefetch_default) != "0"
         ):
             for layer, expert_ids in self._prev_ids.items():
-                self.pool.prefetch(
-                    [(layer, expert_id) for expert_id in expert_ids]
-                )
+                self.routed_vq.prefetch_routes(layer, expert_ids)
 
         for layer in range(config.n_layers):
             target = self.layer_device(layer)
@@ -5384,7 +5218,7 @@ class KimiK3CCCPModel:
                 if layer >= config.first_dense_layers:
                     expert_transfer_seconds = float(
                         getattr(
-                            self.pool,
+                            self.routed_vq,
                             "last_transfer_seconds",
                             0.0,
                         )
@@ -5948,89 +5782,19 @@ class KimiK3CCCPModel:
             )
         weights, indices = route
         if os.environ.get("CCCP_ROUTE_COUNTS", "0") != "0":
-            from collections import Counter
-
-            counts = getattr(self.pool, "route_counts", None)
-            if counts is None:
-                counts = self.pool.route_counts = Counter()
-            counts.update(
-                (int(layer), int(expert))
-                for expert in indices.detach().to("cpu").reshape(-1).tolist()
-            )
+            self.routed_vq.record_routes(layer, indices)
         self._prev_ids[layer] = [int(item) for item in indices[-1].tolist()]
-        routed = None
-        native = getattr(self.pool, "run_native", None)
-        # Resident CPU execution images expose a decode-only one-row entry.
-        # A strict profile can make that entry available during prefill too,
-        # but multi-row input must stay on the grouped run_rows executor.
-        # Otherwise a valid fully resident CPU profile fails before its first
-        # response with "mixed resident layer requires one CPU input row".
-        if native is not None and value.shape[0] == 1:
-            routed = (
-                native(
-                    layer,
-                    latent,
-                    indices,
-                    weights,
-                    activation=self.operator_config.expert_activation,
-                    activation_beta=config.situ_beta,
-                    activation_linear_beta=config.situ_linear_beta,
-                )
-            )
-        # Autoregressive decode has exactly one row.  The hybrid pool's public
-        # ``run`` entry is a single fused packed-MoE submission for all Top-K
-        # experts; it is not the removed Python per-expert/per-token loop.
-        # Sending a one-row decode through ``run_rows`` would expand every
-        # selected compact expert to BF16 on every generated token, reducing a
-        # fully resident GPU to sub-token/s throughput.  Multi-token prefill
-        # remains strictly on the chunked dequant + grouped-GEMM path below.
-        run_decode = getattr(self.pool, "run", None)
-        if (
-            routed is None
-            and value.shape[0] == 1
-            and callable(run_decode)
-        ):
-            routed = run_decode(
-                layer,
-                latent,
-                indices,
-                weights,
-                activation=self.operator_config.expert_activation,
-                activation_beta=config.situ_beta,
-                activation_linear_beta=config.situ_linear_beta,
-            )
-        run_rows = getattr(self.pool, "run_rows", None)
-        if routed is None and run_rows is not None:
-            routed = run_rows(
-                layer,
-                latent,
-                indices,
-                weights,
-                activation=self.operator_config.expert_activation,
-                activation_beta=config.situ_beta,
-                activation_linear_beta=config.situ_linear_beta,
-            )
-        if routed is None:
-            routed_rows = []
-            for token in range(value.shape[0]):
-                expert_ids = indices[token].tolist()
-                selected = self.pool.get_many(
-                    [(layer, expert_id) for expert_id in expert_ids]
-                )
-                routed = moe_mlp_grouped_mixed(
-                    latent[token:token + 1],
-                    [selected[(layer, expert_id)] for expert_id in expert_ids],
-                    weights[token],
-                    activation=self.operator_config.expert_activation,
-                    situ_beta=config.situ_beta,
-                    situ_linear_beta=config.situ_linear_beta,
-                )
-                routed_rows.append(routed.view(1, config.routed_hidden))
-            routed = torch.cat(routed_rows, dim=0)
+        routed = self.routed_vq.execute(
+            layer,
+            latent,
+            indices,
+            weights,
+            activation=self.operator_config.expert_activation,
+            activation_beta=config.situ_beta,
+            activation_linear_beta=config.situ_linear_beta,
+        )
         routed = routed.to(value.dtype)
-        release_layer = getattr(self.pool, "release_scan_layer", None)
-        if callable(release_layer):
-            release_layer(layer)
+        self.routed_vq.release_scan_layer(layer)
         if config.latent_moe_use_norm:
             routed = self._rmsnorm(
                 routed,
@@ -6070,7 +5834,7 @@ class KimiK3CCCPModel:
             raise RuntimeError(
                 f"context exceeds max_ctx ({self.pos + len(values)} > {self.max_ctx})"
             )
-        begin_prefill_block(self.pool)
+        self.routed_vq.begin_prefill()
         config = self.config
         tokens = len(values)
         hidden = self.embed(values)
@@ -6134,7 +5898,7 @@ class KimiK3CCCPModel:
         # 块级收尾：释放 Prefill 工作区并恢复覆盖全部 packed 签名的
         # Decode arena。否则受限显存场景的首个生成 token 仍会访问仅为
         # 当前 Prefill 层规划的槽池，缺失签名时直接 KeyError。
-        end_prefill_block(self.pool)
+        self.routed_vq.end_prefill()
         self.pos += tokens
         self.last_layer_profile = []
         self.last_cuda_profile = {}
@@ -6204,7 +5968,6 @@ class KimiK3CCCPModel:
         ready = self._prefill_tp_ready
         if ready is None:
             width = len(self.devices)
-            probe = getattr(self.pool, "prefill_rows_available", None)
             config = self.config
             ready = bool(
                 self._tp_hidden_state_ready
@@ -6226,11 +5989,10 @@ class KimiK3CCCPModel:
                         == width
                     )
                 )
-                and getattr(self.pool, "full_resident", False)
-                and getattr(self.pool, "hidden_mode", False)
-                and callable(probe)
+                and self.routed_vq.full_resident
+                and self.routed_vq.hidden_mode
                 and all(
-                    probe(layer)
+                    self.routed_vq.prefill_rows_available(layer)
                     for layer in range(
                         config.first_dense_layers,
                         config.n_layers,
@@ -7106,7 +6868,7 @@ class KimiK3CCCPModel:
         up_executor = self._tp_routed_up
         up_state = up_executor.layers[layer]
         local_routed = up_executor.local_width
-        owner = self.pool.plan.owner_by_layer[layer]
+        owner = self.routed_vq.owner_for_layer(layer)
         owner_device = self.devices[owner]
         shared_partials = []
         logit_slices = []
@@ -7190,7 +6952,7 @@ class KimiK3CCCPModel:
             # GPU layout.  The proven owner path remains the default so a
             # normal service launch cannot silently regress correctness.
             if replicated_moe:
-                routed_replicas = self.pool.run_rows_replicated(
+                routed_replicas = self.routed_vq.execute_replicated(
                     layer,
                     latent_replicas,
                     indices,
@@ -7214,7 +6976,7 @@ class KimiK3CCCPModel:
                         for rank, routed in enumerate(routed_replicas)
                     )
             else:
-                routed = self.pool.run_rows(
+                routed = self.routed_vq.execute(
                     layer,
                     latent,
                     indices,
@@ -7222,7 +6984,6 @@ class KimiK3CCCPModel:
                     activation=self.operator_config.expert_activation,
                     activation_beta=config.situ_beta,
                     activation_linear_beta=config.situ_linear_beta,
-                    prefill_default=8192,
                 ).to(torch.bfloat16)
                 if config.latent_moe_use_norm:
                     routed = rmsnorm(
@@ -7507,8 +7268,8 @@ class KimiK3CCCPModel:
         }
         self._prefill_timing_events.clear()
         pool_before = (
-            int(getattr(self.pool, "prefill_batch_rows", 0)),
-            int(getattr(self.pool, "prefill_batch_submissions", 0)),
+            self.routed_vq.prefill_batch_rows,
+            self.routed_vq.prefill_batch_submissions,
         )
         self._prefill_progress = self.pos
 
@@ -7518,7 +7279,7 @@ class KimiK3CCCPModel:
                 return block_hidden[-1:].clone()
             return block_hidden
 
-        begin_prefill_block(self.pool)
+        self.routed_vq.begin_prefill()
         try:
             outputs = run_prefill_blocks(
                 values,
@@ -7528,17 +7289,17 @@ class KimiK3CCCPModel:
         finally:
             # The public phase API owns the packed arena lifecycle for every
             # projection-VQ model.  Restore Decode even when a TP block fails.
-            end_prefill_block(self.pool)
+            self.routed_vq.end_prefill()
         self.last_prefill_stats["moe_rows"] = (
-            int(getattr(self.pool, "prefill_batch_rows", 0))
+            self.routed_vq.prefill_batch_rows
             - pool_before[0]
         )
         self.last_prefill_stats["moe_submissions"] = (
-            int(getattr(self.pool, "prefill_batch_submissions", 0))
+            self.routed_vq.prefill_batch_submissions
             - pool_before[1]
         )
-        self.last_prefill_stats["moe_batch_max"] = int(
-            getattr(self.pool, "prefill_batch_max", 0)
+        self.last_prefill_stats["moe_batch_max"] = (
+            self.routed_vq.prefill_batch_max
         )
         self._prefill_finish_timing()
         if return_last_only:

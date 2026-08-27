@@ -56,6 +56,8 @@ def load_manifest(model_dir: str | os.PathLike[str]) -> tuple[Path, dict[str, An
 
 def detect_architecture(manifest: dict[str, Any]) -> str:
     config = manifest["config"]
+    if str(manifest.get("architecture") or "").lower() == "glm5_next":
+        return "glm5_next"
     if (
         str(manifest.get("model_family", "")).lower() == "kimi_k3"
         or ("kda_layers" in config and "routed_hidden" in config)
@@ -468,6 +470,14 @@ def resolve_preset(
             for key, value in selected.get("environment", {}).items()
         }
     )
+    quant_method = str(manifest.get("quant", {}).get("method", "")).lower()
+    routed_vq = bool(manifest.get("expert_files")) and "vq" in quant_method
+    if profile == "resident" and routed_vq:
+        # ``resident`` is a capacity contract shared by every routed-codebook
+        # model: packed expert bytes live in the public all-GPU backend and
+        # runtime H2D/LRU is absent.  Keeping this switch in architecture JSON
+        # made two identical projection-VQ manifests select different pools.
+        environment.setdefault("CCCP_PACKED_FULL_GPU", "1")
     ep_layout = (
         choose_ep_layout(manifest, resolved_tp)
         if profile == "parallel"

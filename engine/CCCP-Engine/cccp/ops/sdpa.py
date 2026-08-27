@@ -14,6 +14,32 @@ import torch.nn.functional as F
 
 
 _TRANSFORMERS_ATTENTION_NAME = "cccp-native-gqa-sdpa"
+_DYNAMIC_SDPA_DEVICES: set[tuple[str, int | None]] = set()
+
+
+def configure_dynamic_sdpa_backends(device: torch.device | str) -> str:
+    """Avoid per-sequence-length cuDNN planning for autoregressive Decode.
+
+    Flash and memory-efficient SDPA accept changing KV lengths without a new
+    host-side frontend plan.  This process-wide policy is capability based,
+    idempotent and shared by every Transformers-backed architecture.
+    """
+    resolved = torch.device(device)
+    if resolved.type != "cuda" or torch.version.hip is not None:
+        return "native"
+    key = (resolved.type, resolved.index)
+    if key not in _DYNAMIC_SDPA_DEVICES:
+        torch.backends.cuda.enable_cudnn_sdp(False)
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_math_sdp(True)
+        _DYNAMIC_SDPA_DEVICES.add(key)
+        print(
+            "[cccp-attention] dynamic-kv backend=flash-or-efficient; "
+            "cudnn-sdpa=disabled",
+            flush=True,
+        )
+    return "flash-or-efficient"
 
 
 def _native_gqa_compatible(
@@ -151,6 +177,7 @@ def register_transformers_native_gqa_attention() -> str:
 
 
 __all__ = [
+    "configure_dynamic_sdpa_backends",
     "native_gqa_sdpa",
     "register_transformers_native_gqa_attention",
     "transformers_native_gqa_attention_forward",

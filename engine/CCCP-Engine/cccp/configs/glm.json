@@ -3,6 +3,11 @@
   "architecture": "glm",
   "display_name": "GLM MoE（CCCP）",
   "supports_parallel": true,
+  "performance_gate": {
+    "prefill_tokens": 4096,
+    "prefill_tokens_per_second": 900.0,
+    "decode_tokens_per_second": 20.0
+  },
   "tested_tp_min": 2,
   "tested_tp_max": 8,
   "speculative": {

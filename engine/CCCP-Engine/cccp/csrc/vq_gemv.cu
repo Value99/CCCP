@@ -1006,7 +1006,7 @@ torch::Tensor qwen35_delta_recurrent_batch_checkpoint(
     return output;
 }
 
-__global__ void kimi_kda_prepare_kernel(
+__global__ void cccp_kda_prepare_kernel(
     const __nv_bfloat16* __restrict__ query,
     const __nv_bfloat16* __restrict__ key,
     const __nv_bfloat16* __restrict__ gate,
@@ -1056,9 +1056,11 @@ __global__ void kimi_kda_prepare_kernel(
     }
 }
 
-constexpr int KIMI_KDA_VALUES_PER_BLOCK = 4;
+// Eight rows keep enough CTAs resident on H20 while amortizing token barriers.
+// Sixteen rows was measured 64% slower at 4096 tokens due to occupancy loss.
+constexpr int CCCP_KDA_VALUES_PER_BLOCK = 8;
 
-__global__ void kimi_kda_update_kernel(
+__global__ void cccp_kda_update_kernel(
     const __nv_bfloat16* __restrict__ value,
     const float* __restrict__ beta,
     const float* __restrict__ query_norm,
@@ -1071,15 +1073,15 @@ __global__ void kimi_kda_update_kernel(
     const int value_dim)
 {
     const int head = blockIdx.y;
-    const int value_start = blockIdx.x * KIMI_KDA_VALUES_PER_BLOCK;
+    const int value_start = blockIdx.x * CCCP_KDA_VALUES_PER_BLOCK;
     const int item = threadIdx.x;
     if (head >= heads) return;
     extern __shared__ float shared[];
     float* prediction = shared;
     float* old_output =
-        prediction + KIMI_KDA_VALUES_PER_BLOCK * blockDim.x;
+        prediction + CCCP_KDA_VALUES_PER_BLOCK * blockDim.x;
     float* key_query =
-        old_output + KIMI_KDA_VALUES_PER_BLOCK * blockDim.x;
+        old_output + CCCP_KDA_VALUES_PER_BLOCK * blockDim.x;
     float* deltas = key_query + blockDim.x;
 
     const long qk_offset = (long)head * key_dim + item;
@@ -1088,7 +1090,7 @@ __global__ void kimi_kda_update_kernel(
     const float d = item < key_dim ? decay[qk_offset] : 0.f;
     key_query[item] = q * k;
     #pragma unroll
-    for (int row = 0; row < KIMI_KDA_VALUES_PER_BLOCK; ++row) {
+    for (int row = 0; row < CCCP_KDA_VALUES_PER_BLOCK; ++row) {
         const int value_index = value_start + row;
         float current = 0.f;
         if (value_index < value_dim && item < key_dim) {
@@ -1106,7 +1108,7 @@ __global__ void kimi_kda_update_kernel(
         if (item < stride) {
             key_query[item] += key_query[item + stride];
             #pragma unroll
-            for (int row = 0; row < KIMI_KDA_VALUES_PER_BLOCK; ++row) {
+            for (int row = 0; row < CCCP_KDA_VALUES_PER_BLOCK; ++row) {
                 const int base = row * blockDim.x + item;
                 prediction[base] += prediction[base + stride];
                 old_output[base] += old_output[base + stride];
@@ -1115,7 +1117,7 @@ __global__ void kimi_kda_update_kernel(
         __syncthreads();
     }
 
-    if (item < KIMI_KDA_VALUES_PER_BLOCK) {
+    if (item < CCCP_KDA_VALUES_PER_BLOCK) {
         const int value_index = value_start + item;
         float delta = 0.f;
         if (value_index < value_dim) {
@@ -1129,7 +1131,7 @@ __global__ void kimi_kda_update_kernel(
     __syncthreads();
 
     #pragma unroll
-    for (int row = 0; row < KIMI_KDA_VALUES_PER_BLOCK; ++row) {
+    for (int row = 0; row < CCCP_KDA_VALUES_PER_BLOCK; ++row) {
         const int value_index = value_start + row;
         if (value_index < value_dim && item < key_dim) {
             const long state_offset =
@@ -1147,7 +1149,7 @@ __global__ void kimi_kda_update_kernel(
     }
 }
 
-torch::Tensor kimi_kda_recurrent(
+torch::Tensor cccp_ordered_recurrent_step(
     torch::Tensor query,
     torch::Tensor key,
     torch::Tensor value,
@@ -1165,32 +1167,32 @@ torch::Tensor kimi_kda_recurrent(
         gate.is_cuda() && beta.is_cuda() && a_log.is_cuda() &&
         dt_bias.is_cuda() && state.is_cuda() && workspace.is_cuda() &&
         output.is_cuda(),
-        "Kimi KDA tensors must be CUDA");
+        "CCCP ordered recurrent tensors must be CUDA");
     TORCH_CHECK(
         query.scalar_type() == at::kBFloat16 &&
         key.scalar_type() == at::kBFloat16 &&
         value.scalar_type() == at::kBFloat16 &&
         gate.scalar_type() == at::kBFloat16 &&
         output.scalar_type() == at::kBFloat16,
-        "Kimi KDA activations must be BF16");
+        "CCCP ordered recurrent activations must be BF16");
     TORCH_CHECK(
         beta.scalar_type() == at::kFloat &&
         a_log.scalar_type() == at::kFloat &&
         dt_bias.scalar_type() == at::kFloat &&
         state.scalar_type() == at::kFloat &&
         workspace.scalar_type() == at::kFloat,
-        "Kimi KDA parameters/state/workspace must be FP32");
+        "CCCP ordered recurrent parameters/state/workspace must be FP32");
     TORCH_CHECK(
         query.is_contiguous() && key.is_contiguous() &&
         value.is_contiguous() && gate.is_contiguous() &&
         beta.is_contiguous() && a_log.is_contiguous() &&
         dt_bias.is_contiguous() && state.is_contiguous() &&
         workspace.is_contiguous() && output.is_contiguous(),
-        "Kimi KDA tensors must be contiguous");
+        "CCCP ordered recurrent tensors must be contiguous");
     TORCH_CHECK(
         query.dim() == 2 && key.sizes() == query.sizes() &&
         gate.sizes() == query.sizes() && value.dim() == 2,
-        "Kimi KDA q/k/g must be [H,K] and v must be [H,V]");
+        "CCCP ordered recurrent q/k/g must be [H,K] and v must be [H,V]");
     const int heads = (int)query.size(0);
     const int key_dim = (int)query.size(1);
     const int value_dim = (int)value.size(1);
@@ -1201,16 +1203,16 @@ torch::Tensor kimi_kda_recurrent(
         state.size(1) == value_dim &&
         state.size(2) == key_dim &&
         output.sizes() == value.sizes(),
-        "Kimi KDA value/state/output shape mismatch");
+        "CCCP ordered recurrent value/state/output shape mismatch");
     TORCH_CHECK(
         key_dim > 0 && key_dim <= 256 &&
         (key_dim & (key_dim - 1)) == 0,
-        "Kimi KDA key dimension must be a power of two <= 256");
+        "CCCP ordered recurrent key dimension must be a power of two <= 256");
     TORCH_CHECK(
         workspace.numel() >= 3LL * heads * key_dim &&
         beta.numel() >= heads && a_log.numel() >= heads &&
         dt_bias.numel() >= (long)heads * key_dim,
-        "Kimi KDA workspace or parameter shape mismatch");
+        "CCCP ordered recurrent workspace or parameter shape mismatch");
 
     auto query_norm = workspace.narrow(
         0, 0, (long)heads * key_dim).view({heads, key_dim});
@@ -1221,7 +1223,7 @@ torch::Tensor kimi_kda_recurrent(
         0, 2LL * heads * key_dim,
         (long)heads * key_dim).view({heads, key_dim});
     auto stream = at::cuda::getCurrentCUDAStream();
-    kimi_kda_prepare_kernel<<<
+    cccp_kda_prepare_kernel<<<
         heads,
         key_dim,
         2LL * key_dim * sizeof(float),
@@ -1241,14 +1243,14 @@ torch::Tensor kimi_kda_recurrent(
             key_dim,
             (float)lower_bound);
     const int value_blocks =
-        (value_dim + KIMI_KDA_VALUES_PER_BLOCK - 1)
-        / KIMI_KDA_VALUES_PER_BLOCK;
+        (value_dim + CCCP_KDA_VALUES_PER_BLOCK - 1)
+        / CCCP_KDA_VALUES_PER_BLOCK;
     const size_t update_smem = (
-        2 * KIMI_KDA_VALUES_PER_BLOCK * key_dim
+        2 * CCCP_KDA_VALUES_PER_BLOCK * key_dim
         + key_dim
-        + KIMI_KDA_VALUES_PER_BLOCK
+        + CCCP_KDA_VALUES_PER_BLOCK
     ) * sizeof(float);
-    kimi_kda_update_kernel<<<
+    cccp_kda_update_kernel<<<
         dim3(value_blocks, heads),
         key_dim,
         update_smem,
@@ -1269,133 +1271,193 @@ torch::Tensor kimi_kda_recurrent(
     return output;
 }
 
-// Ordered block-prefill counterpart.  One CTA owns a (head, value-tile) and
-// walks the token dimension in order, so the recurrent state has exactly the
-// same semantics as repeated decode calls while Python submits one kernel.
-__global__ void kimi_kda_recurrent_batch_kernel(
+// Prepare token/head metadata once for the public ordered recurrence.  The
+// value-tile scan used to repeat both norm reductions, q.k and all exponentials
+// in every value CTA.  Keeping only compact [T,H,4] metadata plus [T,H,K]
+// decay preserves the ordered state update without materializing normalized
+// Q/K tensors.
+__global__ void cccp_ordered_recurrent_prepare_batch_kernel(
     const __nv_bfloat16* __restrict__ query,
     const __nv_bfloat16* __restrict__ key,
-    const __nv_bfloat16* __restrict__ value,
     const __nv_bfloat16* __restrict__ gate,
     const float* __restrict__ beta,
     const float* __restrict__ a_log,
     const float* __restrict__ dt_bias,
+    float* __restrict__ token_head_meta,
+    float* __restrict__ prepared_decay,
+    const int tokens,
+    const int heads,
+    const int key_dim,
+    const float lower_bound)
+{
+    const int token = blockIdx.x;
+    const int head = blockIdx.y;
+    const int item = threadIdx.x;
+    if (token >= tokens || head >= heads || item >= key_dim) return;
+    extern __shared__ float shared[];
+    float* q_square = shared;
+    float* k_square = q_square + key_dim;
+    float* key_query = k_square + key_dim;
+    float* a_value = key_query + key_dim;
+    const long token_head = (long)token * heads + head;
+    const long qk_offset = token_head * key_dim + item;
+    const float q = __bfloat162float(query[qk_offset]);
+    const float k = __bfloat162float(key[qk_offset]);
+    q_square[item] = q * q;
+    k_square[item] = k * k;
+    if (item == 0)
+        a_value[0] = expf(a_log[head]);
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (item < stride) {
+            q_square[item] += q_square[item + stride];
+            k_square[item] += k_square[item + stride];
+        }
+        __syncthreads();
+    }
+    if (item == 0) {
+        q_square[0] = rsqrtf(q_square[0] + 1e-6f);
+        k_square[0] = rsqrtf(k_square[0] + 1e-6f);
+    }
+    __syncthreads();
+    const float q_scale = q_square[0];
+    const float k_scale = k_square[0];
+    key_query[item] = (q * q_scale) * (k * k_scale);
+    const long bias_offset = (long)head * key_dim + item;
+    const float raw = a_value[0] * (
+        __bfloat162float(gate[qk_offset]) + dt_bias[bias_offset]);
+    prepared_decay[qk_offset] = expf(
+        lower_bound * (1.f / (1.f + expf(-raw))));
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (item < stride)
+            key_query[item] += key_query[item + stride];
+        __syncthreads();
+    }
+    if (item == 0) {
+        float* meta = token_head_meta + token_head * 4;
+        meta[0] = q_scale;
+        meta[1] = k_scale;
+        meta[2] = key_query[0];
+        meta[3] = 1.f / (1.f + expf(-beta[token_head]));
+    }
+}
+
+// Ordered block-prefill counterpart. One CTA owns a (head, value-tile) and
+// walks tokens in order. All token/head-only work comes from the public
+// preparation kernel above and is therefore shared by every value tile.
+__global__ void cccp_ordered_recurrent_scan_kernel(
+    const __nv_bfloat16* __restrict__ query,
+    const __nv_bfloat16* __restrict__ key,
+    const __nv_bfloat16* __restrict__ value,
+    const float* __restrict__ token_head_meta,
+    const float* __restrict__ prepared_decay,
     float* __restrict__ state,
     __nv_bfloat16* __restrict__ output,
     const int tokens,
     const int heads,
     const int key_dim,
-    const int value_dim,
-    const float lower_bound)
+    const int value_dim)
 {
     const int head = blockIdx.y;
-    const int value_start = blockIdx.x * KIMI_KDA_VALUES_PER_BLOCK;
+    const int value_start = blockIdx.x * CCCP_KDA_VALUES_PER_BLOCK;
     const int item = threadIdx.x;
     if (head >= heads) return;
+    const int lane = item & 31;
+    const int warp = item >> 5;
+    const int warps = (key_dim + 31) >> 5;
     extern __shared__ float shared[];
-    float* q_norm = shared;
-    float* k_norm = q_norm + key_dim;
-    float* decay = k_norm + key_dim;
-    float* prediction = decay + key_dim;
-    float* old_output = prediction + KIMI_KDA_VALUES_PER_BLOCK * key_dim;
-    float* key_query = old_output + KIMI_KDA_VALUES_PER_BLOCK * key_dim;
-    float* deltas = key_query + key_dim;
-    float* norm_scales = deltas + KIMI_KDA_VALUES_PER_BLOCK;
+    float* prediction_partial = shared;
+    float* old_output_partial = prediction_partial
+        + CCCP_KDA_VALUES_PER_BLOCK * warps;
+    float* deltas = old_output_partial
+        + CCCP_KDA_VALUES_PER_BLOCK * warps;
     for (int token = 0; token < tokens; ++token) {
-        const long qk_base = ((long)token * heads + head) * key_dim;
-        float q = item < key_dim
-            ? __bfloat162float(query[qk_base + item]) : 0.f;
-        float k = item < key_dim
-            ? __bfloat162float(key[qk_base + item]) : 0.f;
-        q_norm[item] = q * q;
-        k_norm[item] = k * k;
-        __syncthreads();
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (item < stride) {
-                q_norm[item] += q_norm[item + stride];
-                k_norm[item] += k_norm[item + stride];
-            }
-            __syncthreads();
-        }
-        if (item == 0) {
-            norm_scales[0] = rsqrtf(q_norm[0] + 1e-6f);
-            norm_scales[1] = rsqrtf(k_norm[0] + 1e-6f);
-        }
-        __syncthreads();
-        if (item < key_dim) {
-            const float q_scale = norm_scales[0];
-            const float k_scale = norm_scales[1];
-            q_norm[item] = q * q_scale;
-            k_norm[item] = k * k_scale;
-            const long gate_offset = qk_base + item;
-            const long bias_offset = (long)head * key_dim + item;
-            const float raw = expf(a_log[head]) * (
-                __bfloat162float(gate[gate_offset]) + dt_bias[bias_offset]);
-            decay[item] = expf(lower_bound * (1.f / (1.f + expf(-raw))));
-            key_query[item] = q_norm[item] * k_norm[item];
-        }
-        __syncthreads();
+        const long token_head = (long)token * heads + head;
+        const long qk_base = token_head * key_dim;
+        const float* meta = token_head_meta + token_head * 4;
+        const float q = item < key_dim
+            ? __bfloat162float(query[qk_base + item]) * meta[0] : 0.f;
+        const float k = item < key_dim
+            ? __bfloat162float(key[qk_base + item]) * meta[1] : 0.f;
+        const float decay = item < key_dim
+            ? prepared_decay[qk_base + item] : 0.f;
         const long state_head = (long)head * value_dim * key_dim;
+        float prediction[CCCP_KDA_VALUES_PER_BLOCK];
+        float old_output[CCCP_KDA_VALUES_PER_BLOCK];
         #pragma unroll
-        for (int row = 0; row < KIMI_KDA_VALUES_PER_BLOCK; ++row) {
+        for (int row = 0; row < CCCP_KDA_VALUES_PER_BLOCK; ++row) {
             const int value_index = value_start + row;
             float current = 0.f;
             if (value_index < value_dim && item < key_dim) {
                 const long state_offset = state_head
                     + (long)value_index * key_dim + item;
-                current = state[state_offset] * decay[item];
+                current = state[state_offset] * decay;
                 state[state_offset] = current;
             }
-            prediction[row * key_dim + item] = current * k_norm[item];
-            old_output[row * key_dim + item] = current * q_norm[item];
+            prediction[row] = current * k;
+            old_output[row] = current * q;
+        }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            #pragma unroll
+            for (int row = 0; row < CCCP_KDA_VALUES_PER_BLOCK; ++row) {
+                prediction[row] += __shfl_down_sync(
+                    0xffffffffu, prediction[row], offset);
+                old_output[row] += __shfl_down_sync(
+                    0xffffffffu, old_output[row], offset);
+            }
+        }
+        if (lane == 0) {
+            #pragma unroll
+            for (int row = 0; row < CCCP_KDA_VALUES_PER_BLOCK; ++row) {
+                prediction_partial[row * warps + warp] = prediction[row];
+                old_output_partial[row * warps + warp] = old_output[row];
+            }
         }
         __syncthreads();
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (item < stride) {
-                key_query[item] += key_query[item + stride];
-                #pragma unroll
-                for (int row = 0; row < KIMI_KDA_VALUES_PER_BLOCK; ++row) {
-                    const int base = row * key_dim + item;
-                    prediction[base] += prediction[base + stride];
-                    old_output[base] += old_output[base + stride];
+        if (warp == 0 && lane < CCCP_KDA_VALUES_PER_BLOCK) {
+            const int row = lane;
+            const int value_index = value_start + row;
+            float prediction_sum = 0.f;
+            float old_output_sum = 0.f;
+            #pragma unroll
+            for (int source_warp = 0; source_warp < 8; ++source_warp) {
+                if (source_warp < warps) {
+                    prediction_sum += prediction_partial[
+                        row * warps + source_warp];
+                    old_output_sum += old_output_partial[
+                        row * warps + source_warp];
                 }
             }
-            __syncthreads();
-        }
-        if (item < KIMI_KDA_VALUES_PER_BLOCK) {
-            const int value_index = value_start + item;
             float delta = 0.f;
             if (value_index < value_dim) {
                 const long value_offset = ((long)token * heads + head)
                     * value_dim + value_index;
-                const float b = 1.f / (1.f + expf(-beta[(long)token * heads + head]));
                 delta = (__bfloat162float(value[value_offset])
-                    - prediction[item * key_dim]) * b;
+                    - prediction_sum) * meta[3];
+                const float result = (
+                    old_output_sum + delta * meta[2]
+                ) * rsqrtf((float)key_dim);
+                output[value_offset] = __float2bfloat16_rn(result);
             }
-            deltas[item] = delta;
+            deltas[row] = delta;
         }
         __syncthreads();
         #pragma unroll
-        for (int row = 0; row < KIMI_KDA_VALUES_PER_BLOCK; ++row) {
+        for (int row = 0; row < CCCP_KDA_VALUES_PER_BLOCK; ++row) {
             const int value_index = value_start + row;
             if (value_index < value_dim && item < key_dim) {
                 const long state_offset = state_head
                     + (long)value_index * key_dim + item;
-                state[state_offset] += deltas[row] * k_norm[item];
-            }
-            if (item == 0 && value_index < value_dim) {
-                const float result = (old_output[row * key_dim]
-                    + deltas[row] * key_query[0]) * rsqrtf((float)key_dim);
-                const long output_offset = ((long)token * heads + head)
-                    * value_dim + value_index;
-                output[output_offset] = __float2bfloat16_rn(result);
+                state[state_offset] += deltas[row] * k;
             }
         }
         __syncthreads();
     }
 }
 
-torch::Tensor kimi_kda_recurrent_batch(
+torch::Tensor cccp_ordered_recurrent_scan(
     torch::Tensor query, torch::Tensor key, torch::Tensor value,
     torch::Tensor gate, torch::Tensor beta, torch::Tensor a_log,
     torch::Tensor dt_bias, torch::Tensor state, torch::Tensor output,
@@ -1404,7 +1466,7 @@ torch::Tensor kimi_kda_recurrent_batch(
     TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda()
         && gate.is_cuda() && beta.is_cuda() && a_log.is_cuda()
         && dt_bias.is_cuda() && state.is_cuda() && output.is_cuda(),
-        "Kimi KDA batch tensors must be CUDA");
+        "CCCP ordered recurrent batch tensors must be CUDA");
     TORCH_CHECK(query.scalar_type() == at::kBFloat16
         && key.scalar_type() == at::kBFloat16
         && value.scalar_type() == at::kBFloat16
@@ -1414,17 +1476,19 @@ torch::Tensor kimi_kda_recurrent_batch(
         && a_log.scalar_type() == at::kFloat
         && dt_bias.scalar_type() == at::kFloat
         && state.scalar_type() == at::kFloat,
-        "Kimi KDA batch dtype mismatch");
+        "CCCP ordered recurrent batch dtype mismatch");
     TORCH_CHECK(query.is_contiguous() && key.is_contiguous()
         && value.is_contiguous() && gate.is_contiguous()
         && beta.is_contiguous() && a_log.is_contiguous()
         && dt_bias.is_contiguous() && state.is_contiguous()
-        && output.is_contiguous(), "Kimi KDA batch tensors must be contiguous");
+        && output.is_contiguous(),
+        "CCCP ordered recurrent batch tensors must be contiguous");
     TORCH_CHECK(query.dim() == 3 && key.sizes() == query.sizes()
         && gate.sizes() == query.sizes() && value.dim() == 3
         && value.size(0) == query.size(0) && value.size(1) == query.size(1)
         && beta.sizes() == query.sizes().slice(0, 2)
-        && output.sizes() == value.sizes(), "Kimi KDA batch shapes mismatch");
+        && output.sizes() == value.sizes(),
+        "CCCP ordered recurrent batch shapes mismatch");
     const int tokens = (int)query.size(0);
     const int heads = (int)query.size(1);
     const int key_dim = (int)query.size(2);
@@ -1435,23 +1499,38 @@ torch::Tensor kimi_kda_recurrent_batch(
         && beta.numel() >= (long)tokens * heads
         && a_log.numel() >= heads
         && dt_bias.numel() >= (long)heads * key_dim,
-        "Kimi KDA batch state or parameter shape mismatch");
-    const int value_blocks = (value_dim + KIMI_KDA_VALUES_PER_BLOCK - 1)
-        / KIMI_KDA_VALUES_PER_BLOCK;
-    const size_t smem = (
-        (4LL + 2LL * KIMI_KDA_VALUES_PER_BLOCK) * key_dim
-        + KIMI_KDA_VALUES_PER_BLOCK + 2) * sizeof(float);
+        "CCCP ordered recurrent batch state or parameter shape mismatch");
+    auto float_options = query.options().dtype(at::kFloat);
+    auto token_head_meta = torch::empty({tokens, heads, 4}, float_options);
+    auto prepared_decay = torch::empty(
+        {tokens, heads, key_dim}, float_options);
     auto stream = at::cuda::getCurrentCUDAStream();
-    kimi_kda_recurrent_batch_kernel<<<dim3(value_blocks, heads), key_dim,
-        smem, stream>>>(
+    const size_t prepare_smem = (3LL * key_dim + 1) * sizeof(float);
+    cccp_ordered_recurrent_prepare_batch_kernel<<<
+        dim3(tokens, heads), key_dim, prepare_smem, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(query.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(key.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(gate.data_ptr<at::BFloat16>()),
+            beta.data_ptr<float>(), a_log.data_ptr<float>(),
+            dt_bias.data_ptr<float>(), token_head_meta.data_ptr<float>(),
+            prepared_decay.data_ptr<float>(), tokens, heads, key_dim,
+            (float)lower_bound);
+    const int value_blocks =
+        (value_dim + CCCP_KDA_VALUES_PER_BLOCK - 1)
+        / CCCP_KDA_VALUES_PER_BLOCK;
+    const int warps = (key_dim + 31) / 32;
+    const size_t scan_smem = (
+        2LL * CCCP_KDA_VALUES_PER_BLOCK * warps
+        + CCCP_KDA_VALUES_PER_BLOCK) * sizeof(float);
+    cccp_ordered_recurrent_scan_kernel<<<
+        dim3(value_blocks, heads), key_dim, scan_smem, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(query.data_ptr<at::BFloat16>()),
             reinterpret_cast<const __nv_bfloat16*>(key.data_ptr<at::BFloat16>()),
             reinterpret_cast<const __nv_bfloat16*>(value.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const __nv_bfloat16*>(gate.data_ptr<at::BFloat16>()),
-            beta.data_ptr<float>(), a_log.data_ptr<float>(),
-            dt_bias.data_ptr<float>(), state.data_ptr<float>(),
+            token_head_meta.data_ptr<float>(),
+            prepared_decay.data_ptr<float>(), state.data_ptr<float>(),
             reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>()),
-            tokens, heads, key_dim, value_dim, (float)lower_bound);
+            tokens, heads, key_dim, value_dim);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
@@ -4486,93 +4565,6 @@ __device__ __forceinline__ void vq_block_dot_pair_routed_bf16(
     }
 }
 
-__device__ __forceinline__ float vq_block_dot_routed_fp8_codebook(
-    const uint8_t* codebook,
-    const __nv_bfloat16* input,
-    const int vector,
-    const float scale)
-{
-    float value = 0.0f;
-    #pragma unroll
-    for (int component = 0; component < 16; component += 4) {
-        if (component >= vector) break;
-        __nv_fp8x4_e4m3 packed_code;
-        packed_code.__x = __ldg(reinterpret_cast<const uint32_t*>(
-            codebook + component));
-        const float4 code = static_cast<float4>(packed_code);
-        const float2 input01 = __bfloat1622float2(
-            *reinterpret_cast<const __nv_bfloat162*>(input + component));
-        const float2 input23 = __bfloat1622float2(
-            *reinterpret_cast<const __nv_bfloat162*>(input + component + 2));
-        value = fmaf(code.x * scale, input01.x, value);
-        value = fmaf(code.y * scale, input01.y, value);
-        value = fmaf(code.z * scale, input23.x, value);
-        value = fmaf(code.w * scale, input23.y, value);
-    }
-    return value;
-}
-
-__device__ __forceinline__ float vq_gemv_routed_row_fp8_codebook(
-    const int64_t index_address,
-    const uint8_t* __restrict__ codebook,
-    const __nv_bfloat16* __restrict__ input,
-    const int blocks,
-    const int vector,
-    const int dtype_tag,
-    const long index_row,
-    const float scale)
-{
-    float value = 0.0f;
-    for (int block = threadIdx.x; block < blocks; block += 32) {
-        const int code = routed_index_value(
-            index_address, dtype_tag, index_row + block);
-        value += vq_block_dot_routed_fp8_codebook(
-            codebook + static_cast<long>(code) * vector,
-            input + block * vector,
-            vector,
-            scale);
-    }
-    return value;
-}
-
-__device__ __forceinline__ void vq_gemv_routed_pair_fp8_codebook(
-    const int64_t gate_index_address,
-    const int64_t up_index_address,
-    const uint8_t* __restrict__ gate_codebook,
-    const uint8_t* __restrict__ up_codebook,
-    const __nv_bfloat16* __restrict__ input,
-    const int blocks,
-    const int vector,
-    const int gate_dtype_tag,
-    const int up_dtype_tag,
-    const long index_row,
-    const float gate_scale,
-    const float up_scale,
-    float& gate_value,
-    float& up_value)
-{
-    gate_value = 0.0f;
-    up_value = 0.0f;
-    for (int block = threadIdx.x; block < blocks; block += 32) {
-        const long offset = index_row + block;
-        const int gate_code = routed_index_value(
-            gate_index_address, gate_dtype_tag, offset);
-        const int up_code = routed_index_value(
-            up_index_address, up_dtype_tag, offset);
-        const __nv_bfloat16* input_block = input + block * vector;
-        gate_value += vq_block_dot_routed_fp8_codebook(
-            gate_codebook + static_cast<long>(gate_code) * vector,
-            input_block,
-            vector,
-            gate_scale);
-        up_value += vq_block_dot_routed_fp8_codebook(
-            up_codebook + static_cast<long>(up_code) * vector,
-            input_block,
-            vector,
-            up_scale);
-    }
-}
-
 __device__ __forceinline__ void vq_gemv_routed_pair(
     const int64_t gate_index_address,
     const int64_t up_index_address,
@@ -5123,231 +5115,6 @@ __device__ __forceinline__ float projection_gate_up_activation(
     if (linear_beta > 0.f)
         up = linear_beta * tanhf(up / linear_beta);
     return nonlinear * up;
-}
-
-// Low-memory native route: compact indices and compact E4M3 codebooks stay
-// resident. Gate/Up and Down convert only referenced codewords in registers;
-// there is no expanded expert-weight workspace between lookup and dot.
-template <int WARPS, int ROWS_PER_WARP>
-__global__ void vq_projection_gate_up_compact_fp8_kernel(
-    const __nv_bfloat16* __restrict__ input,
-    const int64_t* __restrict__ route_ids,
-    const int64_t* __restrict__ metadata,
-    const float* __restrict__ scales,
-    __nv_bfloat16* __restrict__ activated,
-    const int top_k,
-    const int expert_count,
-    const int output_rows,
-    const int input_cols,
-    const int activation_kind,
-    const float beta,
-    const float linear_beta,
-    const float limit)
-{
-    const int position = blockIdx.y;
-    if (position >= top_k) return;
-    const int expert = static_cast<int>(route_ids[position]);
-    const int linear_thread = threadIdx.y * 32 + threadIdx.x;
-    constexpr int block_threads = 32 * WARPS;
-    extern __shared__ __nv_bfloat16 compact_fp8_gate_up_input[];
-    __shared__ RoutedBlockMetadata gate_meta;
-    __shared__ RoutedBlockMetadata up_meta;
-    __shared__ float gate_scale;
-    __shared__ float up_scale;
-    if (threadIdx.x == 0 && threadIdx.y == 0) {
-        gate_meta.valid = 0;
-        up_meta.valid = 0;
-        if (expert >= 0 && expert < expert_count) {
-            gate_meta.index_address = metadata[expert];
-            gate_meta.codebook_address =
-                metadata[(long)expert_count + expert];
-            gate_meta.blocks = static_cast<int>(
-                metadata[(long)2 * expert_count + expert]);
-            gate_meta.vector = static_cast<int>(
-                metadata[(long)3 * expert_count + expert]);
-            gate_meta.dtype_tag = static_cast<int>(
-                metadata[(long)4 * expert_count + expert]);
-            up_meta.index_address =
-                metadata[(long)5 * expert_count + expert];
-            up_meta.codebook_address =
-                metadata[(long)6 * expert_count + expert];
-            up_meta.blocks = static_cast<int>(
-                metadata[(long)7 * expert_count + expert]);
-            up_meta.vector = static_cast<int>(
-                metadata[(long)8 * expert_count + expert]);
-            up_meta.dtype_tag = static_cast<int>(
-                metadata[(long)9 * expert_count + expert]);
-            gate_meta.valid = gate_meta.index_address != 0 &&
-                gate_meta.codebook_address != 0 && gate_meta.blocks > 0;
-            up_meta.valid = up_meta.index_address != 0 &&
-                up_meta.codebook_address != 0 && up_meta.blocks > 0;
-            gate_scale = scales[(long)expert * 3];
-            up_scale = scales[(long)expert * 3 + 1];
-        }
-    }
-    const auto* input4 = reinterpret_cast<const uint4*>(input);
-    auto* shared4 = reinterpret_cast<uint4*>(compact_fp8_gate_up_input);
-    for (int item = linear_thread; item < input_cols / 8;
-         item += block_threads)
-        shared4[item] = input4[item];
-    __syncthreads();
-    if (!gate_meta.valid || !up_meta.valid) return;
-
-    const auto* gate_codebook = reinterpret_cast<const uint8_t*>(
-        static_cast<uintptr_t>(gate_meta.codebook_address));
-    const auto* up_codebook = reinterpret_cast<const uint8_t*>(
-        static_cast<uintptr_t>(up_meta.codebook_address));
-    float gate_values[ROWS_PER_WARP] = {};
-    float up_values[ROWS_PER_WARP] = {};
-    #pragma unroll
-    for (int item = 0; item < ROWS_PER_WARP; ++item) {
-        const int row = blockIdx.x * (WARPS * ROWS_PER_WARP) +
-            threadIdx.y + item * WARPS;
-        if (row >= output_rows) continue;
-        if (gate_meta.blocks == up_meta.blocks &&
-            gate_meta.vector == up_meta.vector) {
-            vq_gemv_routed_pair_fp8_codebook(
-                gate_meta.index_address,
-                up_meta.index_address,
-                gate_codebook,
-                up_codebook,
-                compact_fp8_gate_up_input,
-                gate_meta.blocks,
-                gate_meta.vector,
-                gate_meta.dtype_tag,
-                up_meta.dtype_tag,
-                (long)row * gate_meta.blocks,
-                gate_scale,
-                up_scale,
-                gate_values[item],
-                up_values[item]);
-        } else {
-            gate_values[item] = vq_gemv_routed_row_fp8_codebook(
-                gate_meta.index_address,
-                gate_codebook,
-                compact_fp8_gate_up_input,
-                gate_meta.blocks,
-                gate_meta.vector,
-                gate_meta.dtype_tag,
-                (long)row * gate_meta.blocks,
-                gate_scale);
-            up_values[item] = vq_gemv_routed_row_fp8_codebook(
-                up_meta.index_address,
-                up_codebook,
-                compact_fp8_gate_up_input,
-                up_meta.blocks,
-                up_meta.vector,
-                up_meta.dtype_tag,
-                (long)row * up_meta.blocks,
-                up_scale);
-        }
-    }
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        #pragma unroll
-        for (int item = 0; item < ROWS_PER_WARP; ++item) {
-            gate_values[item] += __shfl_down_sync(
-                0xffffffffu, gate_values[item], offset);
-            up_values[item] += __shfl_down_sync(
-                0xffffffffu, up_values[item], offset);
-        }
-    }
-    if (threadIdx.x == 0) {
-        #pragma unroll
-        for (int item = 0; item < ROWS_PER_WARP; ++item) {
-            const int row = blockIdx.x * (WARPS * ROWS_PER_WARP) +
-                threadIdx.y + item * WARPS;
-            if (row < output_rows)
-                activated[(long)position * output_rows + row] =
-                    __float2bfloat16_rn(projection_gate_up_activation(
-                        gate_values[item], up_values[item], activation_kind,
-                        beta, linear_beta, limit));
-        }
-    }
-}
-
-template <int WARPS, int ROWS_PER_WARP>
-__global__ void vq_projection_down_compact_fp8_kernel(
-    const __nv_bfloat16* __restrict__ input,
-    const int64_t* __restrict__ route_ids,
-    const int64_t* __restrict__ metadata,
-    const float* __restrict__ scales,
-    __nv_bfloat16* __restrict__ output,
-    const int top_k,
-    const int expert_count,
-    const int output_rows,
-    const int input_cols)
-{
-    const int position = blockIdx.y;
-    if (position >= top_k) return;
-    const int expert = static_cast<int>(route_ids[position]);
-    const int linear_thread = threadIdx.y * 32 + threadIdx.x;
-    constexpr int block_threads = 32 * WARPS;
-    extern __shared__ __nv_bfloat16 compact_fp8_down_input[];
-    __shared__ RoutedBlockMetadata down_meta;
-    __shared__ float down_scale;
-    if (threadIdx.x == 0 && threadIdx.y == 0) {
-        down_meta.valid = 0;
-        if (expert >= 0 && expert < expert_count) {
-            down_meta.index_address =
-                metadata[(long)10 * expert_count + expert];
-            down_meta.codebook_address =
-                metadata[(long)11 * expert_count + expert];
-            down_meta.blocks = static_cast<int>(
-                metadata[(long)12 * expert_count + expert]);
-            down_meta.vector = static_cast<int>(
-                metadata[(long)13 * expert_count + expert]);
-            down_meta.dtype_tag = static_cast<int>(
-                metadata[(long)14 * expert_count + expert]);
-            down_meta.valid = down_meta.index_address != 0 &&
-                down_meta.codebook_address != 0 && down_meta.blocks > 0;
-            down_scale = scales[(long)expert * 3 + 2];
-        }
-    }
-    const __nv_bfloat16* input_row = input + (long)position * input_cols;
-    const auto* input4 = reinterpret_cast<const uint4*>(input_row);
-    auto* shared4 = reinterpret_cast<uint4*>(compact_fp8_down_input);
-    for (int item = linear_thread; item < input_cols / 8;
-         item += block_threads)
-        shared4[item] = input4[item];
-    __syncthreads();
-    if (!down_meta.valid) return;
-
-    const auto* codebook = reinterpret_cast<const uint8_t*>(
-        static_cast<uintptr_t>(down_meta.codebook_address));
-    float values[ROWS_PER_WARP] = {};
-    #pragma unroll
-    for (int item = 0; item < ROWS_PER_WARP; ++item) {
-        const int row = blockIdx.x * (WARPS * ROWS_PER_WARP) +
-            threadIdx.y + item * WARPS;
-        if (row < output_rows)
-            values[item] = vq_gemv_routed_row_fp8_codebook(
-                down_meta.index_address,
-                codebook,
-                compact_fp8_down_input,
-                down_meta.blocks,
-                down_meta.vector,
-                down_meta.dtype_tag,
-                (long)row * down_meta.blocks,
-                down_scale);
-    }
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        #pragma unroll
-        for (int item = 0; item < ROWS_PER_WARP; ++item)
-            values[item] += __shfl_down_sync(
-                0xffffffffu, values[item], offset);
-    }
-    if (threadIdx.x == 0) {
-        #pragma unroll
-        for (int item = 0; item < ROWS_PER_WARP; ++item) {
-            const int row = blockIdx.x * (WARPS * ROWS_PER_WARP) +
-                threadIdx.y + item * WARPS;
-            if (row < output_rows)
-                output[(long)position * output_rows + row] =
-                    __float2bfloat16_rn(values[item]);
-        }
-    }
 }
 
 template <int VECTOR, int DTYPE_TAG>
@@ -8630,143 +8397,6 @@ __global__ void packed_stage_topk_blob_metadata_kernel(
             (host_projection - host_base);
     }
     staged_metadata[item] = value;
-}
-
-torch::Tensor packed_moe_topk_compact_fp8_codebook(
-    torch::Tensor input,
-    torch::Tensor route_ids,
-    torch::Tensor weights,
-    torch::Tensor metadata,
-    torch::Tensor scales,
-    int64_t activation_kind_value,
-    double beta,
-    double linear_beta,
-    double limit,
-    torch::Tensor hidden_workspace,
-    torch::Tensor out_workspace,
-    torch::Tensor result)
-{
-#if defined(__HIP_PLATFORM_AMD__)
-    TORCH_CHECK(false, "compact E4M3 codebook MoE is unavailable on HIP");
-#else
-    TORCH_CHECK(
-        input.is_cuda() && input.scalar_type() == at::kBFloat16 &&
-        input.is_contiguous() && input.dim() == 2 && input.size(0) == 1,
-        "compact E4M3 MoE input must be CUDA BF16 [1,D]");
-    TORCH_CHECK(
-        route_ids.is_cuda() && route_ids.scalar_type() == at::kLong &&
-        route_ids.is_contiguous() && route_ids.dim() == 1 &&
-        route_ids.numel() > 0 && route_ids.numel() <= MAX_SLOT_EXPERTS,
-        "compact E4M3 MoE route IDs must be CUDA int64 [TopK]");
-    TORCH_CHECK(
-        weights.is_cuda() && weights.scalar_type() == at::kFloat &&
-        weights.is_contiguous() && weights.sizes() == route_ids.sizes(),
-        "compact E4M3 MoE weights must match TopK");
-    TORCH_CHECK(
-        metadata.is_cuda() && metadata.scalar_type() == at::kLong &&
-        metadata.is_contiguous() && metadata.dim() == 2 &&
-        metadata.size(0) == CCCP_PROJECTION_LEGACY_META_ROWS &&
-        metadata.size(1) == route_ids.numel(),
-        "compact E4M3 MoE metadata must be int64 [15,TopK]");
-    TORCH_CHECK(
-        scales.is_cuda() && scales.scalar_type() == at::kFloat &&
-        scales.is_contiguous() && scales.dim() == 2 &&
-        scales.size(0) == route_ids.numel() && scales.size(1) == 3,
-        "compact E4M3 MoE scales must be float32 [TopK,3]");
-    const int top_k = static_cast<int>(route_ids.numel());
-    const int hidden = static_cast<int>(input.size(1));
-    TORCH_CHECK(
-        hidden_workspace.is_cuda() &&
-        hidden_workspace.scalar_type() == at::kBFloat16 &&
-        hidden_workspace.is_contiguous() &&
-        hidden_workspace.dim() == 2 &&
-        hidden_workspace.size(0) == top_k &&
-        hidden_workspace.size(1) % 2 == 0,
-        "compact E4M3 MoE hidden workspace must be BF16 [TopK,2I]");
-    const int intermediate =
-        static_cast<int>(hidden_workspace.size(1) / 2);
-    TORCH_CHECK(
-        out_workspace.is_cuda() &&
-        out_workspace.scalar_type() == at::kBFloat16 &&
-        out_workspace.is_contiguous() &&
-        out_workspace.sizes() == torch::IntArrayRef({top_k, hidden}) &&
-        result.is_cuda() && result.scalar_type() == at::kFloat &&
-        result.is_contiguous() && result.numel() == hidden,
-        "compact E4M3 MoE output workspaces are invalid");
-    const int device = input.get_device();
-    TORCH_CHECK(
-        route_ids.get_device() == device && weights.get_device() == device &&
-        metadata.get_device() == device && scales.get_device() == device &&
-        hidden_workspace.get_device() == device &&
-        out_workspace.get_device() == device && result.get_device() == device,
-        "compact E4M3 MoE tensors must share one CUDA device");
-    TORCH_CHECK(
-        activation_kind_value >= 0 && activation_kind_value <= 1 &&
-        (activation_kind_value != 0 || beta > 0.0),
-        "compact E4M3 MoE activation metadata is invalid");
-
-    constexpr int warps = 16;
-    constexpr int rows_per_warp = 4;
-    const dim3 block(32, warps);
-    auto stream = at::cuda::getCurrentCUDAStream(device);
-    vq_projection_gate_up_compact_fp8_kernel<
-        warps, rows_per_warp><<<
-            dim3(
-                (intermediate + warps * rows_per_warp - 1) /
-                    (warps * rows_per_warp),
-                top_k),
-            block,
-            static_cast<size_t>(hidden) * sizeof(__nv_bfloat16),
-            stream>>>(
-                reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
-                route_ids.data_ptr<int64_t>(),
-                metadata.data_ptr<int64_t>(),
-                scales.data_ptr<float>(),
-                reinterpret_cast<__nv_bfloat16*>(
-                    hidden_workspace.data_ptr()),
-                top_k,
-                top_k,
-                intermediate,
-                hidden,
-                static_cast<int>(activation_kind_value),
-                static_cast<float>(beta),
-                static_cast<float>(linear_beta),
-                static_cast<float>(limit));
-    vq_projection_down_compact_fp8_kernel<
-        warps, rows_per_warp><<<
-            dim3(
-                (hidden + warps * rows_per_warp - 1) /
-                    (warps * rows_per_warp),
-                top_k),
-            block,
-            static_cast<size_t>(intermediate) * sizeof(__nv_bfloat16),
-            stream>>>(
-                reinterpret_cast<const __nv_bfloat16*>(
-                    hidden_workspace.data_ptr()),
-                route_ids.data_ptr<int64_t>(),
-                metadata.data_ptr<int64_t>(),
-                scales.data_ptr<float>(),
-                reinterpret_cast<__nv_bfloat16*>(out_workspace.data_ptr()),
-                top_k,
-                top_k,
-                hidden,
-                intermediate);
-    routed_weighted_sum_f32_kernel<<<
-        (hidden + 255) / 256, 256, 0, stream>>>(
-            reinterpret_cast<const __nv_bfloat16*>(
-                out_workspace.data_ptr()),
-            route_ids.data_ptr<int64_t>(),
-            weights.data_ptr<float>(),
-            metadata.data_ptr<int64_t>() + (long)5 * top_k,
-            result.data_ptr<float>(),
-            top_k,
-            top_k,
-            hidden,
-            -1,
-            false);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return result;
-#endif
 }
 
 torch::Tensor packed_moe_topk_compact_q8_codebook(
@@ -23442,20 +23072,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "qwen35_delta_recurrent_batch_checkpoint",
           &qwen35_delta_recurrent_batch_checkpoint,
           "Qwen3.5 batched gated-delta update with token checkpoints");
-    m.def("kimi_kda_recurrent", &kimi_kda_recurrent,
-          "Kimi KDA one-token recurrent update with V-first FP32 state");
-    m.def("kimi_kda_recurrent_batch", &kimi_kda_recurrent_batch,
-          "Kimi ordered block-prefill recurrent update with V-first FP32 state");
+    m.def("cccp_ordered_recurrent_step", &cccp_ordered_recurrent_step,
+          "CCCP one-token ordered recurrent update with V-first FP32 state");
+    m.def("cccp_ordered_recurrent_scan", &cccp_ordered_recurrent_scan,
+          "CCCP ordered block-prefill recurrent scan with V-first FP32 state");
     m.def("kimi_gated_rmsnorm", &kimi_gated_rmsnorm,
           "Kimi one-token gated RMSNorm");
     m.def(
           "packed_moe_topk",
           &packed_moe_topk,
           "Packed 8/9/10/12/14/16-bit Top-K routed expert MLP");
-    m.def(
-          "packed_moe_topk_compact_fp8_codebook",
-          &packed_moe_topk_compact_fp8_codebook,
-          "Top-K MoE directly from compact VQ and E4M3 codebooks");
     m.def(
           "packed_moe_topk_compact_q8_codebook",
           &packed_moe_topk_compact_q8_codebook,

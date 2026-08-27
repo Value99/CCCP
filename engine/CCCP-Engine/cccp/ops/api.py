@@ -1192,16 +1192,23 @@ def attention_step(kind: str, device_type: str, **kwargs):
         query = kwargs.get("query")
         if not isinstance(query, torch.Tensor):
             query = kwargs.get("query_nope")
-        request = OperatorRequest(
-            operation=f"attention_step:{normalized_kind}",
-            device_type=normalized_device,
-            activation="none",
-            batch_size=(
+        query_batch = (
+            int(query.shape[-2])
+            if normalized_kind == "compressed_kv_decode"
+            and isinstance(query, torch.Tensor)
+            and query.ndim >= 3
+            else (
                 int(query.shape[0])
                 if isinstance(query, torch.Tensor)
                 and query.ndim >= 3
                 else 1
-            ),
+            )
+        )
+        request = OperatorRequest(
+            operation=f"attention_step:{normalized_kind}",
+            device_type=normalized_device,
+            activation="none",
+            batch_size=query_batch,
         )
         implementation = REGISTRY.resolve(request).implementation
         _ATTENTION_IMPLEMENTATIONS[key] = implementation

@@ -12,7 +12,7 @@ from pathlib import Path
 
 import torch
 
-from .dense_vq import (
+from .ops.codebook import (
     DenseBF16Linear,
     DenseBF16LinearGroup,
     DenseVQArchive,
@@ -21,6 +21,8 @@ from .dense_vq import (
     DenseVQLinearGroup,
     DenseVQPoolStats,
     DenseVQSwiGLU,
+    native_fp8_gemm_available,
+    plan_dense_vq_gpu_image,
 )
 
 
@@ -35,113 +37,6 @@ class Qwen35DecodeSnapshot:
 
     position: int
     linear_states: tuple[dict[str, object] | None, ...]
-
-
-def _qwen35_gpu_image_plan(
-    *,
-    free_bytes: int,
-    linear_bf16_bytes: int,
-    packed_embedding_bytes: int,
-    fixed_file_bytes: int,
-    max_ctx: int,
-    config,
-    linear_fp8_bytes: int = 0,
-    linear_int4_bytes: int = 0,
-    embedding_bf16_bytes: int = 0,
-    fp8_supported: bool = False,
-) -> tuple[str, dict[str, int]]:
-    """Choose the fastest execution image that fits real free VRAM.
-
-    The planner has no model-name branches.  It derives the exact Linear and
-    Embedding footprints from manifest shapes and derives the KV allowance
-    from the architecture config.  Compact INT4 remains the universal path;
-    exact resident BF16 is selected only when the complete image plus runtime
-    state and a fragmentation margin fit before loading starts.
-    """
-    layer_types = list(getattr(config, "layer_types", ()) or ())
-    full_attention_layers = sum(
-        1 for item in layer_types if "full_attention" in str(item)
-    )
-    if not full_attention_layers:
-        full_attention_layers = int(
-            getattr(config, "num_hidden_layers", 0) or 0
-        )
-    kv_heads = int(getattr(config, "num_key_value_heads", 0) or 0)
-    head_dim = int(getattr(config, "head_dim", 0) or 0)
-    kv_bytes = (
-        int(max_ctx)
-        * full_attention_layers
-        * kv_heads
-        * head_dim
-        * 2  # key + value
-        * 2  # BF16
-    )
-    # Covers recurrent states, activations, allocator fragmentation and the
-    # transient source matrix that exists while a projection is expanded.
-    runtime_bytes = max(4 * _GIB, kv_bytes + 3 * _GIB)
-    bf16_planned_bytes = (
-        int(linear_bf16_bytes)
-        + int(embedding_bf16_bytes or packed_embedding_bytes)
-        + int(fixed_file_bytes)
-        + int(runtime_bytes)
-    )
-    fp8_planned_bytes = (
-        int(linear_fp8_bytes)
-        + int(embedding_bf16_bytes or packed_embedding_bytes)
-        + int(fixed_file_bytes)
-        + int(runtime_bytes)
-    )
-    int4_planned_bytes = (
-        int(linear_int4_bytes)
-        + int(packed_embedding_bytes)
-        + int(fixed_file_bytes)
-        + int(runtime_bytes)
-    )
-    if (
-        fp8_supported
-        and int(linear_fp8_bytes) > 0
-        and int(free_bytes) >= fp8_planned_bytes
-    ):
-        image = "fp8"
-        planned_bytes = fp8_planned_bytes
-    elif int(free_bytes) >= bf16_planned_bytes:
-        image = "bf16"
-        planned_bytes = bf16_planned_bytes
-    else:
-        image = "int4"
-        planned_bytes = int4_planned_bytes
-    details = {
-        "free": int(free_bytes),
-        "linear_bf16": int(linear_bf16_bytes),
-        "packed_embedding": int(packed_embedding_bytes),
-        "embedding_bf16": int(embedding_bf16_bytes or packed_embedding_bytes),
-        "linear_fp8": int(linear_fp8_bytes),
-        "linear_int4": int(linear_int4_bytes),
-        "fixed": int(fixed_file_bytes),
-        "kv": int(kv_bytes),
-        "runtime": int(runtime_bytes),
-        "planned": int(planned_bytes),
-        "bf16_planned": int(bf16_planned_bytes),
-        "fp8_planned": int(fp8_planned_bytes),
-        "int4_planned": int(int4_planned_bytes),
-    }
-    return image, details
-
-
-def _qwen35_native_fp8_available(device: torch.device) -> bool:
-    """Return whether the current NVIDIA runtime exposes native FP8 GEMM."""
-    if (
-        device.type != "cuda"
-        or torch.version.hip is not None
-        or not hasattr(torch, "_scaled_mm")
-        or not hasattr(torch, "float8_e4m3fn")
-    ):
-        return False
-    try:
-        major, minor = torch.cuda.get_device_capability(device)
-    except (RuntimeError, TypeError, ValueError):
-        return False
-    return (int(major), int(minor)) >= (8, 9)
 
 
 def _resolve_module(root: torch.nn.Module, path: str):
@@ -523,7 +418,7 @@ class Qwen35DenseVQModel:
         self.pos = 0
         self.network = None
         self.cache = None
-        self.pool = DenseVQPoolStats(
+        self.codebook_stats = DenseVQPoolStats(
             self.device, self.archive.packed_bytes
         )
         self.effective_tp_size = 1
@@ -576,6 +471,7 @@ class Qwen35DenseVQModel:
             return
         started = time.perf_counter()
         if self.device.type == "cuda":
+            from .ops import configure_dynamic_sdpa_backends
             from .fusedext import available, last_error
 
             if not available():
@@ -583,23 +479,7 @@ class Qwen35DenseVQModel:
                     "Dense VQ GPU operators are unavailable: "
                     f"{last_error() or 'unknown build error'}"
                 )
-            # PyTorch 2.9 may choose cuDNN SDPA for Qwen's T=1 full-attention
-            # layers.  On H20 the kernel itself takes only microseconds, but
-            # cuDNN frontend plan dispatch costs about 20 ms per layer on the
-            # host.  Flash/memory-efficient SDPA supports the same public
-            # semantics without that per-token setup cliff.  The inference
-            # process owns one model, so this adapter-local initialization
-            # cannot alter another architecture in the same process.
-            if torch.version.hip is None:
-                torch.backends.cuda.enable_cudnn_sdp(False)
-                torch.backends.cuda.enable_flash_sdp(True)
-                torch.backends.cuda.enable_mem_efficient_sdp(True)
-                torch.backends.cuda.enable_math_sdp(True)
-                print(
-                    "[cccp-qwen35] attention_backend="
-                    "flash-or-efficient; cudnn-sdpa=disabled",
-                    flush=True,
-                )
+            configure_dynamic_sdpa_backends(self.device)
         from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen_impl
 
         Qwen3_5ForCausalLM = qwen_impl.Qwen3_5ForCausalLM
@@ -645,7 +525,7 @@ class Qwen35DenseVQModel:
                         f"{type(original).__name__}"
                     )
             free_bytes, _total_bytes = torch.cuda.mem_get_info(self.device)
-            gpu_image, gpu_plan = _qwen35_gpu_image_plan(
+            gpu_image, gpu_plan = plan_dense_vq_gpu_image(
                 free_bytes=int(free_bytes),
                 linear_bf16_bytes=linear_bf16_bytes,
                 packed_embedding_bytes=packed_embedding_bytes,
@@ -655,7 +535,7 @@ class Qwen35DenseVQModel:
                 linear_fp8_bytes=linear_fp8_bytes,
                 linear_int4_bytes=linear_int4_bytes,
                 embedding_bf16_bytes=embedding_bf16_bytes,
-                fp8_supported=_qwen35_native_fp8_available(self.device),
+                fp8_supported=native_fp8_gemm_available(self.device),
             )
             if (
                 gpu_image == "int4"
@@ -679,7 +559,7 @@ class Qwen35DenseVQModel:
                         f"forced Dense VQ {image_probe.upper()} image exceeds "
                         "planned free VRAM; choose CPU or a device with more VRAM"
                     )
-                if image_probe == "fp8" and not _qwen35_native_fp8_available(
+                if image_probe == "fp8" and not native_fp8_gemm_available(
                     self.device
                 ):
                     raise RuntimeError(
@@ -942,9 +822,9 @@ class Qwen35DenseVQModel:
                 "每组一次 GEMM/GEMV",
                 flush=True,
             )
-            self.pool.gpu_storage_bytes = int(image_bytes)
-            self.pool.gpu_arena_bytes = int(image_bytes)
-            self.pool.bytes = int(image_bytes)
+            self.codebook_stats.gpu_storage_bytes = int(image_bytes)
+            self.codebook_stats.gpu_arena_bytes = int(image_bytes)
+            self.codebook_stats.bytes = int(image_bytes)
         self._gpu_image = gpu_image
         self._new_cache(config)
         self._loaded = True

@@ -35,6 +35,9 @@ def begin_prefill_block(pool) -> bool:
     the call with :func:`end_prefill_block` in a ``finally`` regardless of
     the pool implementation behind it.
     """
+    begin = getattr(pool, "begin_prefill", None)
+    if callable(begin):
+        return bool(begin())
     activate = getattr(pool, "activate_prefill_arena", None)
     if callable(activate):
         activate()
@@ -50,6 +53,10 @@ def end_prefill_block(pool, *, restore_decode: bool = True) -> None:
     block through this helper so the scratch cannot leak into Decode.  Pools
     without the phase API are a no-op.
     """
+    end = getattr(pool, "end_prefill", None)
+    if callable(end):
+        end(restore_decode=bool(restore_decode))
+        return
     release = getattr(pool, "release_host_rows_workspace", None)
     if callable(release):
         release()
@@ -129,6 +136,26 @@ def prefill_moe_batch_size(
     return max(1, min(int(maximum), value))
 
 
+def should_retain_prefill_workspace(
+    *,
+    device_type: str,
+    planned_chunk_capacity: int,
+) -> bool:
+    """Keep the public routed-VQ scratch for one planned Prefill block.
+
+    A positive planned capacity means the common VRAM planner already
+    subtracted the expert-expansion scratch and the following layer's
+    Attention/KV allowance from the packed arena.  Reusing that allocation is
+    therefore safe on every CUDA/HIP host OS.  An unplanned or CPU execution
+    releases per-layer scratch instead of guessing from a model name or OS.
+    """
+
+    return (
+        str(device_type).lower() == "cuda"
+        and int(planned_chunk_capacity) > 0
+    )
+
+
 __all__ = [
     "batched_packed_prefill_available",
     "begin_prefill_block",
@@ -138,4 +165,5 @@ __all__ = [
     "prefill_ranges",
     "run_prefill_blocks",
     "prefill_moe_batch_size",
+    "should_retain_prefill_workspace",
 ]

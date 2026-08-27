@@ -992,6 +992,13 @@ _MODEL_CAPABILITIES: dict[str, dict[str, Any]] = {
         "image": False,
         "video": False,
     },
+    "glm5_next": {
+        "tool_use": False,
+        "efforts": (),
+        "default_effort": None,
+        "image": False,
+        "video": False,
+    },
     "qwen3_5_dense": {
         "tool_use": True,
         "efforts": ("low", "medium", "high", "max"),

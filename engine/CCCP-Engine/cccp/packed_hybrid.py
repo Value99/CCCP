@@ -33,18 +33,48 @@ from .ops.packed_view import (
     runtime_metadata_row_count,
 )
 from .ops.sm90_grouped import (
-    execute_deepgemm_grouped_fp8,
+    build_deepgemm_grouped_layout,
+    deepgemm_grouped_alignment,
+    deepgemm_grouped_padded_rows,
+    DeepGEMMGroupedWorkspace,
+    execute_grouped_fp8,
+    grouped_jit_bucket,
     projection_block_scales,
     row_block_scales,
     select_grouped_fp8_backend,
 )
-from .prefill import prefill_moe_batch_size
+from .ops.codebook import compile_shared_codebook_image
+from .prefill import (
+    prefill_moe_batch_size,
+    should_retain_prefill_workspace,
+)
 
 
-def _native8_grouped_backend(capability: tuple[int, int]) -> str | None:
-    """Select a real FP8 Tensor-Core grouped executor for this NVIDIA SM."""
+def _packed_executor_log_kind(
+    *, rows: int, batch_start: int, announced: bool
+) -> str | None:
+    """Return the bounded log event for one public packed execution call."""
 
-    return select_grouped_fp8_backend(capability)
+    if int(batch_start) != 0:
+        return None
+    if int(rows) > 1:
+        return "prefill"
+    if int(rows) == 1 and not announced:
+        return "decode"
+    return None
+
+
+def _process_memory_room(
+    *,
+    process_limit: int,
+    allocated: int,
+    allocator_reserved: int,
+    safety_reserve: int,
+) -> int:
+    """Return allocatable process room without double-using cached blocks."""
+
+    committed = max(int(allocated), int(allocator_reserved))
+    return max(0, int(process_limit) - committed - int(safety_reserve))
 
 
 def _projection_kernel_chunk_limit(
@@ -69,45 +99,38 @@ def _projection_kernel_chunk_limit(
     return max(1, (2**31 - 1) // max(1, gate_up_bytes))
 
 
-def _native8_grouped_mm(
-    value: torch.Tensor,
-    weights: torch.Tensor,
+def _prefill_workspace_matches(
+    cached: dict[str, object] | None,
     *,
-    scale_a: torch.Tensor,
-    scale_b: torch.Tensor,
-    offsets: torch.Tensor | None,
-    backend: str,
-    group_ids: torch.Tensor | None = None,
-    output: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Run the vendor grouped FP8 primitive on architectures that support it."""
+    rows: int,
+    micro_batch: int,
+    top_k: int,
+    intermediate: int,
+    hidden: int,
+    compact: bool,
+) -> bool:
+    """Return whether one public MoE workspace supports the next call.
 
-    if backend == "deepgemm-sm90":
-        if group_ids is None or output is None:
-            raise RuntimeError(
-                "DeepGEMM grouped FP8 requires group ids and output workspace"
-            )
-        return execute_deepgemm_grouped_fp8(
-            value,
-            weights,
-            scale_a=scale_a,
-            scale_b=scale_b,
-            group_ids=group_ids,
-            output=output,
-        )
-    if backend == "torch-scaled-grouped-mm":
-        if offsets is None:
-            raise RuntimeError("PyTorch grouped FP8 requires cumulative offsets")
-        return torch._scaled_grouped_mm(
-            value,
-            weights.transpose(1, 2),
-            scale_a=scale_a.view(-1),
-            scale_b=scale_b,
-            offs=offsets,
-            out_dtype=torch.bfloat16,
-            use_fast_accum=True,
-        )
-    raise RuntimeError(f"unsupported native8 grouped backend: {backend}")
+    Long native8 Prefill and short compact Prefill share result/metadata
+    storage, but only the compact executor owns packed activation buffers.
+    Treating a preceding long workspace as universally reusable made the
+    first short request after a long context fail with ``KeyError``.
+    """
+
+    if cached is None:
+        return False
+    common = (
+        int(cached["rows"]) >= int(rows)
+        and int(cached["micro_batch"]) >= int(micro_batch)
+        and int(cached["top_k"]) == int(top_k)
+        and int(cached["intermediate"]) == int(intermediate)
+        and int(cached["hidden_size"]) == int(hidden)
+    )
+    if not common:
+        return False
+    return not compact or (
+        "packed_hidden" in cached and "packed_result" in cached
+    )
 
 
 def _release_host_allocator() -> None:
@@ -304,7 +327,7 @@ class PendingPackedRun:
     route_order: torch.Tensor | None = None
     ordered_weights: torch.Tensor | None = None
     metadata: torch.Tensor | None = None
-    native8_scales: torch.Tensor | None = None
+    codebook_scales: torch.Tensor | None = None
     device_route_probe: bool = False
     wait_for_device_cache: bool = False
     prelaunched_result: torch.Tensor | None = None
@@ -1001,7 +1024,7 @@ class PackedHybridPool:
         self.host_dma_mode = "pageable"
         self._host_registrations: dict[int, int] = {}
         self._resident_codebooks = (
-            os.environ.get("CCCP_KIMI_RESIDENT_CODEBOOKS", "1") != "0"
+            os.environ.get("CCCP_RESIDENT_CODEBOOKS", "1") != "0"
         )
         self.initial_free_slots = 0
         self._arenas: _PackedArenas | None = None
@@ -1061,8 +1084,8 @@ class PackedHybridPool:
         self._slot_scale_directory: torch.Tensor | None = None
         self._slot_scale_update_host: torch.Tensor | None = None
         self._prefill_directory_dirty = False
-        self._native8_route_scales: torch.Tensor | None = None
-        self._native8_route_scales_host: torch.Tensor | None = None
+        self._decode_codebook_scales: torch.Tensor | None = None
+        self._decode_codebook_scales_host: torch.Tensor | None = None
         self._compact_profile_all_resident = False
         self._route_hit_mask: torch.Tensor | None = None
         self._route_all_hit: torch.Tensor | None = None
@@ -1106,6 +1129,7 @@ class PackedHybridPool:
             else "cuda.chunked-dequant-grouped-gemm"
         )
         self._prefill_executor_announced = False
+        self._decode_executor_announced = False
         self.prefill_batch_fallbacks = 0
         self.decode_fused_submissions = 0
         self.decode_graph_submissions = 0
@@ -1123,7 +1147,7 @@ class PackedHybridPool:
             torch.Tensor,
             torch.Tensor,
         ] | None = None
-        self._prefill_native8_workspace: dict[str, torch.Tensor | int] | None = (
+        self._prefill_native8_workspace: dict[str, object] | None = (
             None
         )
         self._native8_decode_workspace: dict[str, torch.Tensor | int] | None = (
@@ -1256,7 +1280,7 @@ class PackedHybridPool:
 
     @staticmethod
     def _read_slot_mix() -> dict[str, float] | None:
-        value = os.environ.get("CCCP_KIMI_SLOT_MIX", "").strip()
+        value = os.environ.get("CCCP_VQ_SLOT_MIX", "").strip()
         if not value or value.lower() in ("model", "static", "off", "0"):
             return None
         output: dict[str, float] = {}
@@ -1264,14 +1288,14 @@ class PackedHybridPool:
             name, separator, weight = item.partition("=")
             if not separator:
                 raise ValueError(
-                    "CCCP_KIMI_SLOT_MIX must use tier=weight entries"
+                    "CCCP_VQ_SLOT_MIX must use tier=weight entries"
                 )
             name = name.strip().lower()
             if name not in {"x", "w", "v", "vv"}:
                 raise ValueError(f"unknown packed slot tier: {name}")
             output[name] = max(0.0, float(weight))
         if not any(output.values()):
-            raise ValueError("CCCP_KIMI_SLOT_MIX contains no positive weight")
+            raise ValueError("CCCP_VQ_SLOT_MIX contains no positive weight")
         return output
 
     @staticmethod
@@ -2484,7 +2508,7 @@ class PackedHybridPool:
                 )
                 for weight in expert
             )
-            if self.native8_rows_supported:
+            if self._compact_q8_decode_enabled:
                 rows, native_scales = self._decode_codebook_metadata_rows(
                     [device_view]
                 )
@@ -2568,7 +2592,7 @@ class PackedHybridPool:
         self._cache_metadata_of_id = metadata_of_id.to(device)
         self._cache_native_scales_of_id = (
             native_scales_of_id.to(device)
-            if self.native8_rows_supported
+            if self._compact_q8_decode_enabled
             else None
         )
         if self._device_cache_stream is None:
@@ -2642,9 +2666,9 @@ class PackedHybridPool:
     def decode_executor_name(self) -> str:
         """Describe the actual compact-weight Decode math path."""
 
+        if self._compact_q8_decode_enabled:
+            return "cuda.compact-vq-q8-dp4a"
         if self.native8_rows_supported:
-            if self._compact_q8_decode_enabled:
-                return "cuda.compact-vq-q8-dp4a"
             return "cuda.compact-vq-e4m3-direct-dot"
         return "cuda.compact-vq-bf16-direct-dot"
 
@@ -2655,17 +2679,19 @@ class PackedHybridPool:
         Stable arena addresses alone are insufficient: a cache miss must also
         be resolved entirely on-device.  Linux registered-host UVA provides
         stable source pointers, the segmented LRU owns stable destination
-        pointers, and compact Q8 consumes the resident codebooks without an
-        expanded weight image.  If any part is absent the ordinary eager
-        hybrid path remains authoritative.
+        pointers, and the common native-8 codebook kernels consume resident
+        codebooks without an expanded weight image.  The graph contract is
+        identical for compact E4M3 and Q8; model adapters never select it.
         """
 
         return bool(
             self.fixed_token_graph_candidate
             and getattr(self, "_device_cache_enabled", False)
-            and getattr(self, "_compact_q8_decode_enabled", False)
+            and (
+                getattr(self, "_compact_q8_decode_enabled", False)
+                or getattr(self, "native8_rows_supported", False)
+            )
             and getattr(self, "_cache_native_scales_of_id", None) is not None
-            and getattr(self, "_bound_hidden_inputs", None)
         )
 
     def bind_hidden_inputs(
@@ -2719,9 +2745,9 @@ class PackedHybridPool:
         """Capture one route-dependent compact expert graph per layer.
 
         Every replay performs route copy -> segmented LRU -> registered-host
-        UVA gather -> metadata publish -> compact Q8 MoE.  All pointers stay
-        fixed while the route IDs and cache ownership are device data, so cold
-        and hot routes share exactly the same graph executable.
+        UVA gather -> metadata publish -> compact native-8 MoE.  All pointers
+        stay fixed while route IDs and cache ownership are device data, so
+        cold and hot routes share exactly the same graph executable.
         """
 
         if not self.fixed_token_graph_capable:
@@ -2791,10 +2817,10 @@ class PackedHybridPool:
                     route_order=self._route_ids[:count],
                     ordered_weights=route_weight_buffer,
                     metadata=self._metadata[:, :count],
-                    native8_scales=self._native8_route_scales[:count],
+                    codebook_scales=self._decode_codebook_scales[:count],
                     wait_for_device_cache=False,
                 )
-                return self._launch_native8_decode(
+                return self._launch_compact_q8_decode(
                     pending,
                     pending.metadata,
                     route_weight_buffer,
@@ -2980,6 +3006,7 @@ class PackedHybridPool:
 
     def _safe_budget(self) -> int:
         allocated = torch.cuda.memory_allocated(self.device)
+        allocator_reserved = torch.cuda.memory_reserved(self.device)
         self.fixed_gpu_bytes_before_arena = int(allocated)
         free, total = torch.cuda.mem_get_info(self.device)
         safety_reserve = float(os.environ.get("CCCP_VRAM_RESERVE_GB", "1"))
@@ -3013,7 +3040,12 @@ class PackedHybridPool:
                 configured_limits.append(int(configured * 2**30))
         if configured_limits:
             process_limit = min(process_limit, min(configured_limits))
-        process_room = max(0, process_limit - allocated - reserve)
+        process_room = _process_memory_room(
+            process_limit=process_limit,
+            allocated=allocated,
+            allocator_reserved=allocator_reserved,
+            safety_reserve=reserve,
+        )
         device_room = max(0, free - reserve)
         selected = max(0, min(self.budget, process_room, device_room))
         hip_single_arena_cap = 0
@@ -3030,6 +3062,7 @@ class PackedHybridPool:
             "[cccp-vram-plan] phase=packed-arena "
             f"requested={self.budget / 2**30:.2f}GiB "
             f"allocated_before={allocated / 2**30:.2f}GiB "
+            f"allocator_reserved={allocator_reserved / 2**30:.2f}GiB "
             f"driver_free={free / 2**30:.2f}GiB "
             f"physical_total={total / 2**30:.2f}GiB "
             f"process_limit={process_limit / 2**30:.2f}GiB "
@@ -3229,7 +3262,7 @@ class PackedHybridPool:
             native8_planned = bool(
                 torch.version.hip is None
                 and hasattr(torch, "_scaled_grouped_mm")
-                and _native8_grouped_backend(
+                and select_grouped_fp8_backend(
                     (int(major), int(minor))
                 ) is not None
             )
@@ -3441,13 +3474,13 @@ class PackedHybridPool:
             device=self.device,
         )
         self._slot_scale_update_host = torch.empty(3, dtype=torch.float32)
-        self._native8_route_scales = torch.empty(
+        self._decode_codebook_scales = torch.empty(
             top_k,
             3,
             dtype=torch.float32,
             device=self.device,
         )
-        self._native8_route_scales_host = torch.empty(
+        self._decode_codebook_scales_host = torch.empty(
             top_k,
             3,
             dtype=torch.float32,
@@ -3611,19 +3644,24 @@ class PackedHybridPool:
 
         if self._adaptive_decode_arena or self._extreme_specs is not None:
             return ()
-        ranks = self.store.heat_ranks or {}
-        if not ranks:
-            return ()
         totals = Counter(
             PackedExpertSignature.of(expert) for expert in self.pinned.values()
         )
-        all_pinned_fit = bool(
-            getattr(self.store, "route_allowlist", None) is not None
-            and all(
-                int(specs.get(signature, 0)) >= int(count)
-                for signature, count in totals.items()
-            )
+        all_pinned_fit = bool(self.pinned) and all(
+            int(specs.get(signature, 0)) >= int(count)
+            for signature, count in totals.items()
         )
+        if all_pinned_fit:
+            # A full-resident Decode arena needs no empty Top-K staging set:
+            # every possible route already has a slot.  Seed its complete
+            # directory even when the model has no corpus heat profile.  The
+            # former heat-only branch rebuilt the GLM Flash arena after
+            # Prefill, left every slot unregistered, and re-uploaded the whole
+            # 70-GiB expert set repeatedly during Decode.
+            return tuple(sorted(
+                self.pinned,
+                key=lambda key: (int(key[1]), int(key[0])),
+            ))
         remaining = {
             signature: max(
                 0,
@@ -3639,6 +3677,27 @@ class PackedHybridPool:
             )
             for signature, count in specs.items()
         }
+        ranks = self.store.heat_ranks or {}
+        if not ranks:
+            # A model can be launched before the user has trained a heat
+            # profile.  Starting a nearly full Decode arena completely empty
+            # wastes the available VRAM and turns the first request into a
+            # model-sized transfer storm.  Expert-ID-major ordering spreads
+            # this neutral warm start over every layer; trained profiles still
+            # use their exact measured global hit counts below.
+            output: list[tuple[int, int]] = []
+            for key in sorted(
+                self.pinned,
+                key=lambda item: (int(item[1]), int(item[0])),
+            ):
+                signature = PackedExpertSignature.of(self.pinned[key])
+                if remaining.get(signature, 0) <= 0:
+                    continue
+                output.append(key)
+                remaining[signature] -= 1
+                if not any(value > 0 for value in remaining.values()):
+                    break
+            return tuple(output)
         heat_counts = getattr(self.store, "heat_counts", None) or {}
         candidates: list[
             tuple[float, int, int, tuple[int, int], PackedExpertSignature]
@@ -3717,6 +3776,8 @@ class PackedHybridPool:
         self._compact_profile_all_resident = (
             len(self.cache) == len(self.pinned)
         )
+        if self._compact_profile_all_resident:
+            self._publish_full_resident_directory_locked()
         print(
             "[cccp-cache] lru-hot-start="
             f"{len(selected_keys)} experts / "
@@ -3726,6 +3787,47 @@ class PackedHybridPool:
             f"RAM专家保持完整={self.host_expert_bytes / 2**30:.2f}GiB",
             flush=True,
         )
+
+    def _publish_full_resident_directory_locked(self) -> None:
+        """Publish the complete resident expert directory with one H2D copy.
+
+        A full-model arena has no cache misses to plan.  Publishing one row at
+        a time both obscured that invariant and allowed the graph-resident LRU
+        descriptors to become the effective source of truth after a Prefill
+        arena rebuild.  Build the exact layer/expert directory from the live
+        leases and publish it atomically instead.
+        """
+
+        if self._slot_directory is None:
+            raise RuntimeError("full resident route directory is unavailable")
+        host_directory = torch.zeros(
+            tuple(self._slot_directory.shape),
+            dtype=self._slot_directory.dtype,
+        )
+        host_scales = (
+            torch.zeros(
+                tuple(self._slot_scale_directory.shape),
+                dtype=self._slot_scale_directory.dtype,
+            )
+            if self._slot_scale_directory is not None
+            else None
+        )
+        for (layer, expert_id), expert in self.cache.items():
+            if self._compact_q8_decode_enabled:
+                rows, scales = self._decode_codebook_metadata_rows([expert])
+                if host_scales is not None:
+                    host_scales[int(layer), int(expert_id)].copy_(
+                        torch.tensor(scales[0], dtype=host_scales.dtype)
+                    )
+            else:
+                rows = self._metadata_rows([expert])
+            values = [row[0] for row in rows[: self._slot_directory.shape[2]]]
+            host_directory[int(layer), int(expert_id), : len(values)].copy_(
+                torch.tensor(values, dtype=host_directory.dtype)
+            )
+        self._slot_directory.copy_(host_directory, non_blocking=False)
+        if self._slot_scale_directory is not None and host_scales is not None:
+            self._slot_scale_directory.copy_(host_scales, non_blocking=False)
 
     def _warm_prefill_hot_locked(self) -> None:
         """Populate the immutable Prefill residency arena once at startup."""
@@ -4013,23 +4115,17 @@ class PackedHybridPool:
         ):
             return
         major, minor = torch.cuda.get_device_capability(self.device)
-        self._native8_grouped_backend = _native8_grouped_backend(
+        self._native8_grouped_backend = select_grouped_fp8_backend(
             (int(major), int(minor))
         )
         if self._native8_grouped_backend is None:
             return
-        for codebook in self._device_codebooks.values():
-            pointer = int(codebook.data_ptr())
-            scale = max(float(codebook.abs().amax().item()) / 448.0, 1.0e-12)
-            quantized = (
-                codebook.float()
-                .div(scale)
-                .clamp(-448.0, 448.0)
-                .to(torch.float8_e4m3fn)
-                .contiguous()
-            )
-            self._native8_codebooks[pointer] = quantized
-            self._native8_codebook_scales[pointer] = scale
+        image = compile_shared_codebook_image(
+            list(self._device_codebooks.values()),
+            mode="e4m3",
+        )
+        self._native8_codebooks = image.tensors
+        self._native8_codebook_scales = image.scales
         self._native8_prefill_enabled = bool(self._native8_codebooks)
         self.native8_rows_supported = self._native8_prefill_enabled
         if self._native8_prefill_enabled:
@@ -4064,19 +4160,12 @@ class PackedHybridPool:
         major, _minor = torch.cuda.get_device_capability(self.device)
         if int(major) < 7:
             return
-        for codebook in self._device_codebooks.values():
-            pointer = int(codebook.data_ptr())
-            scale = max(float(codebook.abs().amax().item()) / 127.0, 1.0e-12)
-            quantized = (
-                codebook.float()
-                .div(scale)
-                .clamp(-127.0, 127.0)
-                .round()
-                .to(torch.int8)
-                .contiguous()
-            )
-            self._compact_q8_codebooks[pointer] = quantized
-            self._compact_q8_codebook_scales[pointer] = scale
+        image = compile_shared_codebook_image(
+            list(self._device_codebooks.values()),
+            mode="q8",
+        )
+        self._compact_q8_codebooks = image.tensors
+        self._compact_q8_codebook_scales = image.scales
         self._compact_q8_decode_enabled = bool(self._compact_q8_codebooks)
         if self._compact_q8_decode_enabled:
             compact_bytes = sum(
@@ -4162,7 +4251,7 @@ class PackedHybridPool:
             non_blocking=False,
         )
 
-    def _copy_native8_metadata(
+    def _copy_decode_codebook_metadata(
         self,
         experts: list[DeviceExpert],
     ) -> torch.Tensor:
@@ -4178,11 +4267,11 @@ class PackedHybridPool:
         host[:, :count].copy_(torch.tensor(rows, dtype=torch.long))
         self._metadata[:, :count].copy_(host[:, :count], non_blocking=False)
 
-        scale_host = getattr(self, "_native8_route_scales_host", None)
-        scale_device = getattr(self, "_native8_route_scales", None)
+        scale_host = getattr(self, "_decode_codebook_scales_host", None)
+        scale_device = getattr(self, "_decode_codebook_scales", None)
         if scale_host is None or int(scale_host.shape[0]) < count:
             scale_host = torch.empty(count, 3, dtype=torch.float32)
-            self._native8_route_scales_host = scale_host
+            self._decode_codebook_scales_host = scale_host
         if scale_device is None or int(scale_device.shape[0]) < count:
             scale_device = torch.empty(
                 count,
@@ -4190,7 +4279,7 @@ class PackedHybridPool:
                 dtype=torch.float32,
                 device=self.device,
             )
-            self._native8_route_scales = scale_device
+            self._decode_codebook_scales = scale_device
         scale_host[:count].copy_(torch.tensor(scales, dtype=torch.float32))
         scale_device[:count].copy_(scale_host[:count], non_blocking=False)
         return scale_device[:count]
@@ -4216,7 +4305,7 @@ class PackedHybridPool:
                 scale_target.zero_()
             return
         scale_values = None
-        if self.native8_rows_supported:
+        if self._compact_q8_decode_enabled:
             rows, native_scales = self._decode_codebook_metadata_rows([expert])
             rows = rows[: target.numel()]
             scale_values = native_scales[0]
@@ -4239,7 +4328,7 @@ class PackedHybridPool:
             scale_host.copy_(torch.tensor(scale_values, dtype=torch.float32))
             scale_target.copy_(scale_host, non_blocking=False)
 
-    def _prepare_resident_native8_run_locked(
+    def _prepare_resident_compact_run_locked(
         self,
         layer: int,
         value: torch.Tensor,
@@ -4255,9 +4344,9 @@ class PackedHybridPool:
 
         if (
             self._slot_scale_directory is None
-            or self._native8_route_scales is None
+            or self._decode_codebook_scales is None
         ):
-            raise RuntimeError("native8 resident route directory is unavailable")
+            raise RuntimeError("compact Q8 resident route directory is unavailable")
         flat_ids = route_ids.reshape(-1)
         count = int(flat_ids.numel())
         from .ops import packed_route_slots
@@ -4268,12 +4357,12 @@ class PackedHybridPool:
             output=self._metadata[:, :count],
             hit_mask=self._route_hit_mask[:count],
         ):
-            raise RuntimeError("native8 resident route lookup was rejected")
+            raise RuntimeError("compact Q8 resident route lookup was rejected")
         torch.index_select(
             self._slot_scale_directory[int(layer)],
             0,
             flat_ids,
-            out=self._native8_route_scales[:count],
+            out=self._decode_codebook_scales[:count],
         )
         self.device_route_lookups += 1
         self.device_route_full_hits += 1
@@ -4291,7 +4380,7 @@ class PackedHybridPool:
             route_order=self._route_ids[:count],
             ordered_weights=route_weights.reshape(-1).float().contiguous(),
             metadata=self._metadata[:, :count],
-            native8_scales=self._native8_route_scales[:count],
+            codebook_scales=self._decode_codebook_scales[:count],
         )
 
     def _begin_device_route_metadata(
@@ -4531,11 +4620,11 @@ class PackedHybridPool:
             )
         ):
             raise RuntimeError("compact Q8 codebook L2 prefetch was rejected")
-        if self.native8_rows_supported:
+        if self._compact_q8_decode_enabled:
             if (
                 self._cache_input_logical_ids is None
                 or self._cache_native_scales_of_id is None
-                or self._native8_route_scales is None
+                or self._decode_codebook_scales is None
             ):
                 raise RuntimeError(
                     "device native8 route-scale directory is incomplete"
@@ -4549,7 +4638,7 @@ class PackedHybridPool:
                 self._cache_native_scales_of_id,
                 0,
                 self._cache_input_logical_ids[:count],
-                out=self._native8_route_scales[:count],
+                out=self._decode_codebook_scales[:count],
             )
         return flat_ids
 
@@ -4596,8 +4685,8 @@ class PackedHybridPool:
             route_order=self._route_ids[:count],
             ordered_weights=route_weights.reshape(-1).float().contiguous(),
             metadata=self._metadata[:, :count],
-            native8_scales=(
-                self._native8_route_scales[:count]
+            codebook_scales=(
+                self._decode_codebook_scales[:count]
                 if self._cache_native_scales_of_id is not None
                 else None
             ),
@@ -4687,6 +4776,20 @@ class PackedHybridPool:
             # byte slab; it does not allocate another cache.
             self._restore_decode_arena_locked()
             self._warm_profile_hot_locked()
+            if (
+                self._compact_q8_decode_enabled
+                and self._compact_profile_all_resident
+            ):
+                return self._prepare_resident_compact_run_locked(
+                    layer,
+                    value,
+                    route_ids,
+                    route_weights,
+                    activation=activation,
+                    activation_beta=activation_beta,
+                    activation_linear_beta=activation_linear_beta,
+                    limit=limit,
+                )
             if self._device_cache_enabled:
                 return self._prepare_device_cache_run_locked(
                     layer,
@@ -4698,18 +4801,7 @@ class PackedHybridPool:
                     activation_linear_beta=activation_linear_beta,
                     limit=limit,
                 )
-            if self.native8_rows_supported:
-                if self._compact_profile_all_resident:
-                    return self._prepare_resident_native8_run_locked(
-                        layer,
-                        value,
-                        route_ids,
-                        route_weights,
-                        activation=activation,
-                        activation_beta=activation_beta,
-                        activation_linear_beta=activation_linear_beta,
-                        limit=limit,
-                    )
+            if self._compact_q8_decode_enabled:
                 expert_ids = self._host_route_ids(route_ids)
                 self._record_route_ids(layer, expert_ids)
                 return self._prepare_selected_run_locked(
@@ -4820,7 +4912,7 @@ class PackedHybridPool:
 
         plan = (
             None
-            if self.native8_rows_supported
+            if self._compact_q8_decode_enabled
             else self._find_route_plan(layer, expert_ids)
         )
         if plan is not None:
@@ -4860,9 +4952,9 @@ class PackedHybridPool:
             defer_wait=True,
         )
         experts = [selected[key] for key in keys]
-        native8_scales = None
-        if self.native8_rows_supported:
-            native8_scales = self._copy_native8_metadata(experts)
+        codebook_scales = None
+        if self._compact_q8_decode_enabled:
+            codebook_scales = self._copy_decode_codebook_metadata(experts)
         else:
             self._copy_metadata(experts)
         p12_positions = [
@@ -4916,10 +5008,10 @@ class PackedHybridPool:
             route_order=self._route_ids[: len(experts)],
             ordered_weights=ordered_weights,
             metadata=self._metadata[:, : len(experts)],
-            native8_scales=native8_scales,
+            codebook_scales=codebook_scales,
         )
 
-    def _launch_native8_decode(
+    def _launch_compact_q8_decode(
         self,
         resolved: PendingPackedRun,
         metadata: torch.Tensor,
@@ -4927,9 +5019,9 @@ class PackedHybridPool:
     ) -> torch.Tensor:
         """Execute compact VQ codebook math with no weight expansion."""
 
-        scales = resolved.native8_scales
+        scales = resolved.codebook_scales
         if scales is None:
-            raise RuntimeError("native8 Decode is missing codebook scales")
+            raise RuntimeError("compact Q8 Decode is missing codebook scales")
         count = int(resolved.expert_count)
         route_order = (
             self._route_ids[:count]
@@ -4937,16 +5029,8 @@ class PackedHybridPool:
             else resolved.route_order
         )
         hidden, output, result = self._workspaces
-        from .fusedext import (
-            packed_moe_topk_compact_fp8_codebook_fused,
-            packed_moe_topk_compact_q8_codebook_fused,
-        )
+        from .ops.codebook import run_compact_q8_codebook_decode
 
-        operator = (
-            packed_moe_topk_compact_q8_codebook_fused
-            if self._compact_q8_decode_enabled
-            else packed_moe_topk_compact_fp8_codebook_fused
-        )
         operator_kwargs = {}
         if self._compact_q8_decode_enabled:
             if self._compact_q8_activation_workspaces is None:
@@ -4956,29 +5040,23 @@ class PackedHybridPool:
                 "gate_quant_workspace": gate_quant[:count],
                 "down_quant_workspace": down_quant[:count],
             }
-        launched = operator(
-            resolved.value.to(torch.bfloat16),
-            route_order,
-            ordered_weights[:count],
-            metadata,
-            scales,
+        if not self._compact_q8_decode_enabled:
+            raise RuntimeError("public compact Decode requires Q8/DP4A")
+        return run_compact_q8_codebook_decode(
+            value=resolved.value,
+            route_ids=route_order,
+            route_weights=ordered_weights[:count],
+            metadata=metadata,
+            scales=scales,
             activation=resolved.activation,
-            beta=float(resolved.activation_beta),
-            linear_beta=(
-                0.0
-                if resolved.activation_linear_beta is None
-                else float(resolved.activation_linear_beta)
-            ),
+            activation_beta=float(resolved.activation_beta),
+            activation_linear_beta=resolved.activation_linear_beta,
             limit=float(resolved.limit),
             hidden_workspace=hidden[:count],
-            out_workspace=output[:count],
+            output_workspace=output[:count],
             result=result,
             **operator_kwargs,
         )
-        if launched is None:
-            mode = "Q8-DP4A" if self._compact_q8_decode_enabled else "E4M3"
-            raise RuntimeError(f"compact {mode} codebook MoE rejected route")
-        return launched
 
     def _launch_packed_run(
         self,
@@ -5012,9 +5090,9 @@ class PackedHybridPool:
             if resolved.metadata is None
             else resolved.metadata
         )
-        if resolved.native8_scales is not None:
+        if resolved.codebook_scales is not None:
             self.decode_fused_submissions += 1
-            return self._launch_native8_decode(
+            return self._launch_compact_q8_decode(
                 resolved,
                 metadata,
                 ordered_weights,
@@ -5256,7 +5334,7 @@ class PackedHybridPool:
         expert_ids: list[int],
     ) -> PackedRoutePlan | None:
         """Reuse device pointer metadata while its arena leases stay valid."""
-        if os.environ.get("CCCP_KIMI_ROUTE_PLAN", "1") == "0":
+        if os.environ.get("CCCP_VQ_ROUTE_PLAN", "1") == "0":
             return None
         plan = self._route_plans.get(int(layer))
         if plan is None or tuple(expert_ids) != plan.expert_ids:
@@ -5337,7 +5415,7 @@ class PackedHybridPool:
         grouped_prefix: int,
         identity_order: bool,
     ) -> None:
-        if os.environ.get("CCCP_KIMI_ROUTE_PLAN", "1") == "0":
+        if os.environ.get("CCCP_VQ_ROUTE_PLAN", "1") == "0":
             return
         count = len(expert_ids)
         previous = self._route_plans.get(int(layer))
@@ -5834,13 +5912,18 @@ class PackedHybridPool:
         )
         expert_count = int(self.store.cfg["n_experts"])
         cached = self._prefill_workspace
-        if (
-            cached is not None
-            and int(cached["rows"]) >= rows
-            and int(cached["micro_batch"]) >= micro_batch
-            and int(cached["top_k"]) == top_k
-            and int(cached["intermediate"]) == intermediate
-            and int(cached["hidden_size"]) == hidden
+        compact = bool(
+            torch.version.hip is not None
+            or rows <= int(self.short_reset_decode_tokens)
+        )
+        if _prefill_workspace_matches(
+            cached,
+            rows=rows,
+            micro_batch=micro_batch,
+            top_k=top_k,
+            intermediate=intermediate,
+            hidden=hidden,
+            compact=compact,
         ):
             return cached
         cached: dict[str, torch.Tensor | int] = {
@@ -5882,10 +5965,7 @@ class PackedHybridPool:
                 pin_memory=self.device.type == "cuda",
             ),
         }
-        if (
-            torch.version.hip is not None
-            or rows <= int(self.short_reset_decode_tokens)
-        ):
+        if compact:
             # HIP cannot use the private grouped-mm implementation. Short
             # NVIDIA batches are also bandwidth-bound: expanding every routed
             # expert to FP8 writes and rereads far more bytes than the compact
@@ -6039,7 +6119,7 @@ class PackedHybridPool:
         self,
         capacity: int,
         routed_rows: int,
-    ) -> dict[str, torch.Tensor | int]:
+    ) -> dict[str, object]:
         """Return fixed E4M3 projection and activation buffers."""
 
         hidden = int(
@@ -6102,6 +6182,11 @@ class PackedHybridPool:
             ),
         }
         if self._native8_grouped_backend == "deepgemm-sm90":
+            padded_rows = deepgemm_grouped_padded_rows(
+                routed_rows,
+                capacity,
+                alignment=deepgemm_grouped_alignment(),
+            )
             cached.update({
                 "input_block_scales": torch.empty(
                     int(routed_rows),
@@ -6140,6 +6225,46 @@ class PackedHybridPool:
                     hidden,
                     dtype=torch.bfloat16,
                     device=self.device,
+                ),
+                "gate_up_deepgemm": DeepGEMMGroupedWorkspace(
+                    value=torch.empty(
+                        int(padded_rows),
+                        hidden,
+                        dtype=torch.float8_e4m3fn,
+                        device=self.device,
+                    ),
+                    scale_a=torch.empty(
+                        int(padded_rows),
+                        hidden // 128,
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
+                    output=torch.empty(
+                        int(padded_rows),
+                        2 * intermediate,
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    ),
+                ),
+                "down_deepgemm": DeepGEMMGroupedWorkspace(
+                    value=torch.empty(
+                        int(padded_rows),
+                        intermediate,
+                        dtype=torch.float8_e4m3fn,
+                        device=self.device,
+                    ),
+                    scale_a=torch.empty(
+                        int(padded_rows),
+                        intermediate // 128,
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
+                    output=torch.empty(
+                        int(padded_rows),
+                        hidden,
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    ),
                 ),
             })
         else:
@@ -6232,21 +6357,17 @@ class PackedHybridPool:
 
         if self._arenas is None or self._metadata is None:
             raise RuntimeError("packed hybrid pool is not ready")
-        # One Prefill block calls this entry once per model layer.  Retain the
-        # first layer's automatically sized dequant workspace so every
-        # following layer reuses the exact allocation; the block driver
-        # releases it through ``release_host_rows_workspace``.  Rebuilding the
-        # slab per layer forced a synchronize + empty_cache + reallocation
-        # cycle on every layer under WDDM, which stalled Prefill and surfaced
-        # as cudaErrorIllegalAddress from the driver on consumer GPUs.  The
-        # same retention covers GPU-resident rows (DSV4) and the host bridge
-        # (Kimi/GLM) identically.
-        # WDDM needs one stable block for the complete Prefill request.  Linux
-        # CUDA instead lets the allocator recycle the just-submitted MoE slab
-        # into the following layer's 4096-token Attention/Indexer workspace;
-        # retaining both live views under a 32-GiB process fraction OOMs even
-        # though their lifetimes do not overlap mathematically.
-        self._retain_prefill_workspace = os.name == "nt"
+        # One Prefill block calls this entry once per model layer.  When the
+        # common capacity planner reserved both this scratch and the next
+        # layer's Attention/KV allowance, retain one stable allocation for the
+        # whole block.  This policy is shared by every routed-VQ architecture
+        # and depends on measured capacity, never a model name or host OS.
+        self._retain_prefill_workspace = should_retain_prefill_workspace(
+            device_type=self.device.type,
+            planned_chunk_capacity=int(
+                getattr(self, "_prefill_planned_chunk_capacity", 0)
+            ),
+        )
         if not value.is_cuda:
             device_value, device_ids, device_weights = (
                 self._prepare_host_rows_bridge(
@@ -6439,12 +6560,21 @@ class PackedHybridPool:
                     stop_index - start_index
                     for start_index, stop_index in expert_chunks
                 )
+                kernel_group_capacity = int(effective_capacity)
+                if (
+                    not compact_grouped_prefill
+                    and self._native8_grouped_backend == "deepgemm-sm90"
+                ):
+                    kernel_group_capacity = grouped_jit_bucket(
+                        effective_capacity,
+                        capacity=max(effective_capacity, planned_capacity),
+                    )
                 gu_buffer = down_buffer = None
                 native8_workspace = None
                 if not compact_grouped_prefill:
                     if self._native8_prefill_enabled:
                         native8_workspace = self._prefill_native8_workspace_for(
-                            effective_capacity,
+                            kernel_group_capacity,
                             count * top_k,
                         )
                         gu_buffer = native8_workspace["gu"]
@@ -6462,15 +6592,30 @@ class PackedHybridPool:
                 self.prefill_layer_unique_max = max(
                     self.prefill_layer_unique_max, unique_count
                 )
-                print(
-                    f"[cccp-prefill] executor={active_prefill_executor}; "
-                    f"layer={layer}; token batch={count}; "
-                    f"unique experts={unique_count}; "
-                    f"expert chunk={effective_capacity}; "
-                    f"groups={len(expert_chunks)}; "
-                    "capacity=automatic free-VRAM",
-                    flush=True,
+                log_kind = _packed_executor_log_kind(
+                    rows=rows,
+                    batch_start=start,
+                    announced=self._decode_executor_announced,
                 )
+                if log_kind == "prefill":
+                    print(
+                        f"[cccp-prefill] executor={active_prefill_executor}; "
+                        f"layer={layer}; token batch={count}; "
+                        f"unique experts={unique_count}; "
+                        f"expert chunk={effective_capacity}; "
+                        f"kernel bucket={kernel_group_capacity}; "
+                        f"groups={len(expert_chunks)}; "
+                        "capacity=automatic free-VRAM",
+                        flush=True,
+                    )
+                elif log_kind == "decode":
+                    print(
+                        "[cccp-decode] "
+                        f"executor={active_prefill_executor}; "
+                        "routing=exact; detail=request-summary",
+                        flush=True,
+                    )
+                    self._decode_executor_announced = True
                 for chunk_start, chunk_stop in expert_chunks:
                     keys = [
                         (int(layer), expert_id)
@@ -6514,11 +6659,30 @@ class PackedHybridPool:
                             "grouped packed Prefill received incomplete metadata"
                         )
                     chunk_count = chunk_stop - chunk_start
-                    metadata_host[:, :chunk_count].copy_(
+                    execution_group_count = int(chunk_count)
+                    if (
+                        native8_workspace is not None
+                        and self._native8_grouped_backend == "deepgemm-sm90"
+                    ):
+                        execution_group_count = grouped_jit_bucket(
+                            chunk_count,
+                            capacity=kernel_group_capacity,
+                        )
+                    if execution_group_count > chunk_count:
+                        padding = execution_group_count - chunk_count
+                        rows_host = [
+                            list(row) + [row[-1]] * padding
+                            for row in rows_host[:15]
+                        ]
+                        if native8_scales is not None:
+                            native8_scales = list(native8_scales) + [
+                                native8_scales[-1]
+                            ] * padding
+                    metadata_host[:, :execution_group_count].copy_(
                         torch.tensor(rows_host[:15], dtype=torch.long)
                     )
-                    metadata[:, :chunk_count].copy_(
-                        metadata_host[:, :chunk_count],
+                    metadata[:, :execution_group_count].copy_(
+                        metadata_host[:, :execution_group_count],
                         non_blocking=True,
                     )
                     selected_positions = (
@@ -6538,7 +6702,7 @@ class PackedHybridPool:
                     sorted_weights = flat_weights.index_select(
                         0, sorted_positions
                     ).contiguous()
-                    deepgemm_group_ids = None
+                    deepgemm_layout = None
                     if (
                         native8_workspace is not None
                         and self._native8_grouped_backend == "deepgemm-sm90"
@@ -6548,9 +6712,11 @@ class PackedHybridPool:
                         # kernel pair paid by torch._scaled_grouped_mm.
                         group_ids = None
                         offsets = None
-                        deepgemm_group_ids = sorted_ids.to(
-                            dtype=torch.int32
-                        ).contiguous()
+                        deepgemm_layout = build_deepgemm_grouped_layout(
+                            sorted_ids,
+                            group_count=execution_group_count,
+                            alignment=deepgemm_grouped_alignment(),
+                        )
                     else:
                         group_ids = torch.arange(
                             chunk_count,
@@ -6605,16 +6771,16 @@ class PackedHybridPool:
                                     "native8 projection scales are missing"
                                 )
                             projection_expand_native8(
-                                metadata[:, :chunk_count].contiguous(),
-                                gu_buffer[:chunk_count],
-                                down_buffer[:chunk_count],
+                                metadata[:, :execution_group_count].contiguous(),
+                                gu_buffer[:execution_group_count],
+                                down_buffer[:execution_group_count],
                             )
                             scale_host = native8_workspace[
                                 "projection_scales_host"
-                            ][:chunk_count]
+                            ][:execution_group_count]
                             scale_values = native8_workspace[
                                 "projection_scales"
-                            ][:chunk_count]
+                            ][:execution_group_count]
                             scale_host.copy_(torch.tensor(
                                 native8_scales,
                                 dtype=torch.float32,
@@ -6630,10 +6796,10 @@ class PackedHybridPool:
                             if self._native8_grouped_backend == "deepgemm-sm90":
                                 gu_scales = native8_workspace[
                                     "gu_block_scales"
-                                ][:chunk_count]
+                                ][:execution_group_count]
                                 down_scales = native8_workspace[
                                     "down_block_scales"
-                                ][:chunk_count]
+                                ][:execution_group_count]
                                 projection_block_scales(
                                     scale_values,
                                     hidden=hidden,
@@ -6643,11 +6809,11 @@ class PackedHybridPool:
                                 )
                             else:
                                 gu_scales = native8_workspace["gu_scales"][
-                                    :chunk_count
+                                    :execution_group_count
                                 ]
                                 down_scales = native8_workspace[
                                     "down_scales"
-                                ][:chunk_count]
+                                ][:execution_group_count]
                                 gu_scales[:, :intermediate].copy_(
                                     scale_values[:, 0:1]
                                 )
@@ -6681,14 +6847,20 @@ class PackedHybridPool:
                                 gate_up_output = native8_workspace[
                                     "gate_up_output"
                                 ][:routed_count]
-                            gate_up = _native8_grouped_mm(
+                            gate_up = execute_grouped_fp8(
                                 native_input,
-                                gu_buffer[:chunk_count],
+                                gu_buffer[:execution_group_count],
                                 scale_a=input_gemm_scales,
                                 scale_b=gu_scales,
                                 offsets=offsets,
                                 backend=self._native8_grouped_backend,
-                                group_ids=deepgemm_group_ids,
+                                deepgemm_layout=deepgemm_layout,
+                                deepgemm_workspace=(
+                                    native8_workspace["gate_up_deepgemm"]
+                                    if self._native8_grouped_backend
+                                    == "deepgemm-sm90"
+                                    else None
+                                ),
                                 output=gate_up_output,
                             )
                         else:
@@ -6767,14 +6939,20 @@ class PackedHybridPool:
                                 down_output = native8_workspace["down_output"][
                                     :routed_count
                                 ]
-                            down = _native8_grouped_mm(
+                            down = execute_grouped_fp8(
                                 native_activated,
-                                down_buffer[:chunk_count],
+                                down_buffer[:execution_group_count],
                                 scale_a=activated_gemm_scales,
                                 scale_b=down_scales,
                                 offsets=offsets,
                                 backend=self._native8_grouped_backend,
-                                group_ids=deepgemm_group_ids,
+                                deepgemm_layout=deepgemm_layout,
+                                deepgemm_workspace=(
+                                    native8_workspace["down_deepgemm"]
+                                    if self._native8_grouped_backend
+                                    == "deepgemm-sm90"
+                                    else None
+                                ),
                                 output=down_output,
                             )
                         else:
@@ -6849,177 +7027,31 @@ class PackedHybridPool:
         activation_linear_beta: float | None,
         limit: float = 0.0,
     ) -> torch.Tensor:
-        # Public RAM-Dense/CUDA-MoE bridge.  Only the token-sized latent,
-        # Top-K route and token-sized result cross PCIe; compact expert bytes
-        # continue through the ordinary arena miss path.  The fixed buffers
-        # avoid per-layer tensor allocation and never materialize an expert.
-        if not value.is_cuda:
-            input_buffer, ids_buffer, weights_buffer = (
-                self._prepare_host_bridge(
-                    value,
-                    route_ids,
-                    route_weights,
-                )
-            )
-            device_result = self.run(
+        """Compatibility alias for the single public Decode lifecycle.
+
+        All GPU routed-VQ Decode calls use prepare_run plus finish_run.
+        Keeping a second direct cache/metadata/kernel implementation here made
+        model adapters select subtly different codebook formats and allowed the
+        native8 directory to reach the BF16 packed kernel.  The alias preserves
+        the external pool API without retaining that duplicate execution path.
+        """
+
+        pending = None
+        try:
+            pending = self.prepare_run(
                 layer,
-                input_buffer,
-                ids_buffer,
-                weights_buffer,
+                value,
+                route_ids,
+                route_weights,
                 activation=activation,
                 activation_beta=activation_beta,
                 activation_linear_beta=activation_linear_beta,
                 limit=limit,
             )
-            return self._finish_host_bridge(device_result)
-        if (
-            self._workspaces is None
-            or self._metadata is None
-            or self._route_ids is None
-            or self._ordered_weights is None
-        ):
-            raise RuntimeError("packed hybrid pool is not ready")
-        if value.ndim != 2 or int(value.shape[0]) != 1:
-            raise RuntimeError(
-                "packed decode GEMV accepts exactly one token; use run_rows "
-                "for multi-token Prefill"
-            )
-        # 这是 RAM 地址选择所需的唯一 GPU→CPU 路由同步；权重计算仍留在 GPU。
-        # 在融合核排入默认流之前不允许后台预取复用槽位。释放锁后，
-        # PinnedStage 的 wait_stream 会把后续覆盖排在本核之后。
-        with self._transfer_lock:
-            self._restore_decode_arena_locked()
-            self._warm_profile_hot_locked()
-            device_hit, expert_ids = self._device_route_metadata(
-                layer,
-                route_ids,
-            )
-            if device_hit:
-                count = int(route_ids.numel())
-                hidden, output, result = self._workspaces
-                from .ops import packed_moe_topk
-
-                return packed_moe_topk(
-                    value.to(torch.bfloat16),
-                    self._route_ids[:count],
-                    route_weights.reshape(-1).float().contiguous(),
-                    self._metadata[:, :count],
-                    activation=activation,
-                    activation_beta=float(activation_beta),
-                    activation_linear_beta=(
-                        0.0
-                        if activation_linear_beta is None
-                        else float(activation_linear_beta)
-                    ),
-                    limit=float(limit),
-                    hidden_workspace=hidden[:count],
-                    output_workspace=output[:count],
-                    result=result,
-                    grouped_prefix=-1,
-                    **self.store.man.projection_operator_capability(layer),
-                )
-            if expert_ids is None:
-                expert_ids = self._host_route_ids(route_ids)
-                self._record_route_ids(layer, expert_ids)
-            reused = self._reuse_route_plan(
-                layer,
-                value,
-                expert_ids,
-                route_weights,
-                activation=activation,
-                activation_beta=activation_beta,
-                activation_linear_beta=activation_linear_beta,
-                limit=float(limit),
-            )
-            if reused is not None:
-                return reused
-            self._last_ids[layer] = expert_ids
-            keys = [(layer, expert_id) for expert_id in expert_ids]
-            self._ensure_decode_route_capacity_locked(keys)
-            async_stage = (
-                os.environ.get("CCCP_KIMI_ASYNC_STAGE", "1") != "0"
-                and os.environ.get("CCCP_KIMI_LAYER_TIMING", "0") == "0"
-            )
-            selected = self._ensure_locked(
-                keys,
-                prefetch=False,
-                defer_wait=async_stage,
-            )
-            experts = [selected[key] for key in keys]
-            self._copy_metadata(experts)
-            p12_positions = [
-                position
-                for position, expert in enumerate(experts)
-                if (
-                    len(expert) == 2
-                    and
-                    expert[0].bits == 12
-                    and expert[0].dim in (4, 8)
-                    and expert[1].bits == 12
-                    and expert[1].dim in (4, 8)
-                )
-            ]
-            generic_positions = [
-                position
-                for position in range(len(experts))
-                if position not in p12_positions
-            ]
-            identity_order = self._set_route_order(
-                p12_positions,
-                generic_positions,
-            )
-            if identity_order:
-                ordered_weights = (
-                    route_weights.reshape(-1).float().contiguous()
-                )
-            else:
-                torch.index_select(
-                    route_weights.reshape(-1).float().contiguous(),
-                    0,
-                    self._route_ids[: len(experts)],
-                    out=self._ordered_weights[: len(experts)],
-                )
-                ordered_weights = self._ordered_weights[: len(experts)]
-            self._save_route_plan(
-                layer,
-                expert_ids,
-                keys,
-                experts,
-                len(p12_positions),
-                identity_order,
-            )
-            # 大块 expert DMA 在 copy stream 继续进行时，CPU 已完成指针元数据
-            # 和路由顺序构造；仅在融合核真正读取槽位前建立 GPU 事件依赖。
-            # 这消除每层 cudaEventSynchronize 后的主机唤醒空洞，不改变槽位
-            # 生命周期，也不把 packed 索引展开成中间矩阵。
-            if async_stage:
-                self._stage.wait()
-            hidden, output, result = self._workspaces
-            from .ops import packed_moe_topk
-
-            computed = packed_moe_topk(
-                value.to(torch.bfloat16),
-                self._route_ids[: len(experts)],
-                ordered_weights,
-                self._metadata[:, : len(experts)],
-                activation=activation,
-                activation_beta=float(activation_beta),
-                activation_linear_beta=(
-                    0.0
-                    if activation_linear_beta is None
-                    else float(activation_linear_beta)
-                ),
-                limit=float(limit),
-                hidden_workspace=hidden[: len(experts)],
-                output_workspace=output[: len(experts)],
-                result=result,
-                grouped_prefix=len(p12_positions),
-                **self.store.man.projection_operator_capability(
-                    layer
-                ),
-            )
-            return computed
-
+            return self.finish_run(pending)
+        except BaseException:
+            self.cancel_run(pending)
+            raise
     def resize_gpu_arenas(
         self,
         budget: int,
@@ -7066,8 +7098,8 @@ class PackedHybridPool:
             self._prefill_dequant_workspace = None
             self._prefill_native8_workspace = None
             self._native8_decode_workspace = None
-            self._native8_route_scales_host = None
-            self._native8_route_scales = None
+            self._decode_codebook_scales_host = None
+            self._decode_codebook_scales = None
             self._native8_decode_offsets = None
             self._metadata = None
             self._metadata_host = None
@@ -7119,11 +7151,15 @@ class PackedHybridPool:
         if target <= 0 or self._extreme_specs is not None:
             return None
         current = self.gpu_arena_bytes
-        if current <= target:
+        rebuild = self._arena_phase != "prefill"
+        if current <= target and not rebuild:
             self._arena_phase = "prefill"
             return current, current
         self._arena_phase = "prefill"
-        changed = self.resize_gpu_arenas(target)
+        changed = self.resize_gpu_arenas(
+            target,
+            force_rebuild=rebuild,
+        )
         print(
             "[cccp-vram-plan] phase=prefill-switch "
             f"arena={changed[0] / 2**30:.2f}->"

@@ -3,6 +3,11 @@
   "architecture": "dsv4",
   "display_name": "DeepSeek-V4（CCCP）",
   "supports_parallel": false,
+  "performance_gate": {
+    "prefill_tokens": 4096,
+    "prefill_tokens_per_second": 1900.0,
+    "decode_tokens_per_second": 45.0
+  },
   "speculative": {
     "provider": "dsv4_dspark",
     "max_draft": 5,

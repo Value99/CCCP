@@ -15,6 +15,7 @@ _ADAPTERS = MappingProxyType(
     {
         "dsv4": DSV4ChatAdapter,
         "glm": GLMChatAdapter,
+        "glm5_next": GLMChatAdapter,
         "kimi_k3": KimiK3ChatAdapter,
         "qwen3_5_dense": Qwen35ChatAdapter,
     }

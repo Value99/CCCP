@@ -56,9 +56,27 @@ from .api import (
     vq_compile_q4_0,
 )
 from .decode_control import DecodeControl
+from .codebook import (
+    CompiledCodebookImage,
+    compile_shared_codebook_image,
+    rewrite_packed_codebook_metadata,
+    run_compact_q8_codebook_decode,
+)
 from .attention_prefill import causal_latent_prefill
 from .hidden import TPHidden, TPPartials, TPResidualBuffer, TPSharded
-from .moe import FixedMoEPrelude, FixedMoEPreludeSpec
+from .moe import (
+    build_routed_vq_topology_plan,
+    create_routed_vq_runtime,
+    FixedMoEPrelude,
+    FixedMoEPreludeSpec,
+    RoutedVQExecutor,
+    RoutedVQCapabilities,
+    RoutedVQPoolPlan,
+    RoutedVQResidencyState,
+    RoutedVQRuntime,
+    RoutedVQRuntimeStats,
+    plan_routed_vq_pool,
+)
 from .profiling import TPHiddenStageProfiler
 from .paged_sparse import (
     IndexerFP8PagedCache,
@@ -68,11 +86,16 @@ from .paged_sparse import (
 from .config import ModelOperatorConfig
 from .registry import OperatorRegistry, REGISTRY
 from .sdpa import (
+    configure_dynamic_sdpa_backends,
     native_gqa_sdpa,
     register_transformers_native_gqa_attention,
 )
 from .spec import OperatorCapability, OperatorRequest
-from .fixed_graph import FixedAddressCudaGraph
+from .fixed_graph import (
+    FixedAddressCudaGraph,
+    FixedTokenGraph,
+    fixed_token_capacity,
+)
 from .tensor_parallel import (
     PackedMoEFinalizerSpec,
     ReplicatedLinearSpec,
@@ -105,6 +128,8 @@ def projection_expand_native8(metadata, output_gu, output_down):
 
 
 __all__ = [
+    "CompiledCodebookImage",
+    "compile_shared_codebook_image",
     "DecodeControl",
     "DenseVQFP8TileMMA",
     "ModelOperatorConfig",
@@ -115,7 +140,10 @@ __all__ = [
     "Model1FP8PagedCache",
     "cuda_architecture_features",
     "FixedAddressCudaGraph",
+    "FixedTokenGraph",
+    "fixed_token_capacity",
     "REGISTRY",
+    "configure_dynamic_sdpa_backends",
     "native_gqa_sdpa",
     "register_transformers_native_gqa_attention",
     "attention_step",
@@ -187,6 +215,15 @@ __all__ = [
     "shard_linear_output",
     "FixedMoEPrelude",
     "FixedMoEPreludeSpec",
+    "RoutedVQExecutor",
+    "RoutedVQCapabilities",
+    "RoutedVQPoolPlan",
+    "RoutedVQResidencyState",
+    "RoutedVQRuntime",
+    "RoutedVQRuntimeStats",
+    "build_routed_vq_topology_plan",
+    "create_routed_vq_runtime",
+    "plan_routed_vq_pool",
     "vq_gemv",
     "vq_gemv_packed_list",
     "vq_relayout_block_major",
@@ -194,4 +231,6 @@ __all__ = [
     "vq_compile_u16_row_tile",
     "vq_compile_q4_0",
     "projection_expand_native8",
+    "rewrite_packed_codebook_metadata",
+    "run_compact_q8_codebook_decode",
 ]

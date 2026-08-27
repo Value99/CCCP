@@ -194,7 +194,11 @@ def chat_loop(
     name = (
         "DSV4"
         if arch == "dsv4"
-        else ("Kimi K3" if arch == "kimi_k3" else "GLM")
+        else (
+            "Kimi K3"
+            if arch == "kimi_k3"
+            else "GLM-5.3" if arch == "glm5_next" else "GLM"
+        )
     )
     effort = reasoning_effort or ("max" if think else None)
     print("CCCP 对话已就绪（/stop 停止生成, "
@@ -244,10 +248,17 @@ def chat_loop(
             print(f"[think {effort or 'OFF'}]")
             continue
         if q == "/stats":
-            p = eng.model.pool
-            print(f"[专家缓存: 命中 {p.hits} / 未命中 {p.miss} "
-                  f"({p.hits / max(p.hits + p.miss, 1):.1%}), "
-                  f"驻留 {p.bytes / 2**30:.1f}GB]")
+            routed_vq = getattr(eng.model, "routed_vq", None)
+            p = (
+                routed_vq.stats()
+                if routed_vq is not None
+                else getattr(eng.model, "codebook_stats", None)
+            )
+            hits = int(getattr(p, "hits", 0))
+            misses = int(getattr(p, "misses", getattr(p, "miss", 0)))
+            print(f"[专家缓存: 命中 {hits} / 未命中 {misses} "
+                  f"({hits / max(hits + misses, 1):.1%}), "
+                  f"驻留 {getattr(p, 'bytes', 0) / 2**30:.1f}GB]")
             continue
         if q == "/kv":
             print(format_kv_stats(eng))

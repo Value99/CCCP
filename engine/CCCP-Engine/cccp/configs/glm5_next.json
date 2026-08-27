@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "architecture": "glm5_next",
+  "display_name": "GLM-5.3 Flash（CCCP）",
+  "supports_parallel": false,
+  "performance_gate": {
+    "prefill_tokens": 4096,
+    "prefill_tokens_per_second": 1500.0,
+    "decode_tokens_per_second": 30.0
+  },
+  "defaults": {
+    "device": "cuda",
+    "max_new": 512,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "spec": 0,
+    "reasoning": "chat",
+    "host": "0.0.0.0",
+    "port": 8000,
+    "max_queue": 16
+  },
+  "environment": {
+    "CCCP_FUSED": "1",
+    "CCCP_CPU_COMPILE": "q4",
+    "CCCP_CPU_THREADS": "physical",
+    "CCCP_CPU_NUMA": "auto",
+    "CCCP_RAM_RESERVE_GB": "2",
+    "CCCP_RESIDENT_RESERVE_GB": "2",
+    "CCCP_VRAM_RESERVE_GB": "1"
+  },
+  "profiles": {
+    "ram": {
+      "description": "单卡或 CPU 自动模式；完整专家集合常驻 RAM 并按需进入显存",
+      "tp": 1,
+      "environment": {
+        "CCCP_FULL_RESIDENT": "1"
+      }
+    },
+    "resident": {
+      "description": "文本 Dense 与压缩专家完整常驻单卡显存",
+      "tp": 1,
+      "environment": {
+        "CCCP_FULL_RESIDENT": "1"
+      }
+    }
+  }
+}

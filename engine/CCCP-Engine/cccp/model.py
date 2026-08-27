@@ -12,7 +12,6 @@ import gc
 import math
 import os
 import time
-from collections import Counter
 
 import torch
 import torch.nn.functional as F
@@ -78,7 +77,7 @@ def _latent_attention_context_batched(
 
 
 from .precision import compute_dtype
-from .store import CCCPStore, ExpertPool
+from .store import CCCPStore
 
 
 def _linear(
@@ -178,37 +177,6 @@ def _glm_route(
     return weights, indices
 
 
-def _create_glm_expert_pool(
-    store: CCCPStore,
-    *,
-    device: str | torch.device,
-    cache_gb: float,
-    vram_cache_gb: float,
-    pin_gb: float,
-):
-    """Select the common expert pool strictly from device/manifest capability."""
-    resolved = torch.device(device)
-    if (
-        resolved.type == "cpu"
-        and getattr(
-            store.man,
-            "packed_expert_vq",
-            getattr(store.man, "projection_vq", False),
-        )
-        and os.environ.get("CCCP_CPU_PACKED", "1") != "0"
-    ):
-        from .store import PackedCpuExpertPool
-
-        return PackedCpuExpertPool(store, budget_gb=cache_gb)
-    return ExpertPool(
-        store,
-        vram_cache_gb if resolved.type != "cpu" else cache_gb,
-        device=str(resolved),
-        ram_gb=cache_gb - pin_gb if resolved.type != "cpu" else 0.0,
-        pin_gb=pin_gb,
-    )
-
-
 class GLMModel:
     """CCCP 格式 GLM-5.2 的推理模型（CPU / CUDA 双路径）。
 
@@ -246,24 +214,33 @@ class GLMModel:
         self._pin_gb = pin_gb
         self.requested_tp_size = int(tp_size)
         self.effective_tp_size = 1
-        self.expert_parallel = None
-        if self.requested_tp_size > 1:
-            if not gpu:
-                raise ValueError("tp_size > 1 requires CUDA")
-            from .expert_parallel import GpuResidentExpertParallel
+        if self.requested_tp_size > 1 and not gpu:
+            raise ValueError("tp_size > 1 requires CUDA")
+        primary_index = (
+            torch.cuda.current_device()
+            if gpu and self.device.index is None
+            else self.device.index
+        )
+        routed_devices = (
+            tuple(
+                torch.device("cuda", int(primary_index) + rank)
+                for rank in range(self.requested_tp_size)
+            )
+            if self.requested_tp_size > 1
+            else (self.device,)
+        )
+        from .ops import create_routed_vq_runtime
 
-            self.expert_parallel = GpuResidentExpertParallel(
-                self.store, self.requested_tp_size, self.device
-            )
-            self.pool = None
-        else:
-            self.pool = _create_glm_expert_pool(
-                self.store,
-                device=self.device,
-                cache_gb=cache_gb,
-                vram_cache_gb=vram_cache_gb,
-                pin_gb=pin_gb,
-            )
+        codebook_runtime = create_routed_vq_runtime(
+            self.store,
+            device=self.device,
+            devices=routed_devices,
+            tp_size=self.requested_tp_size,
+            cache_gb=cache_gb,
+            vram_cache_gb=vram_cache_gb,
+            pin_gb=pin_gb,
+        )
+        self.routed_vq = codebook_runtime.executor
         # 逻辑上下文可很大，但把整张 RoPE 表一次性放入每层 Graph 的公共
         # 工作集会拖慢短/中上下文。先固定 32K 地址窗口，跨界时成倍扩展并
         # 统一重捕获；这不改变 max_ctx 的逻辑准入上限。
@@ -373,18 +350,20 @@ class GLMModel:
         """GPU 路径：把全部 dense 权重预载到显存（约 13GB，含 lm_head/router 常驻 f32），
         并把钉住热专家预读到 RAM（消除冷启动拖尾）。"""
         if self.device.type == "cpu":
-            if getattr(self.pool, "prefill_rows_supported", False):
+            if (
+                self.routed_vq is not None
+                and self.routed_vq.prefill_rows_supported
+            ):
                 from .cpuext import prebuild as prebuild_cpu
 
                 prebuild_cpu()
-                resident_all = self.pool.preload_all()
-                if not resident_all:
-                    self.pool.preload_pinned()
-                if self.pool.compact_full_resident:
-                    prepared_layers = self.pool.prepare_native_layers()
+                residency = self.routed_vq.initialize_residency(
+                    device_type="cpu",
+                )
+                if residency.native_layers:
                     print(
                         "[cccp-glm] CPU 多码本 MoE 执行图完成："
-                        f"{prepared_layers} 层；packed 索引保持紧凑",
+                        f"{residency.native_layers} 层；packed 索引保持紧凑",
                         flush=True,
                     )
             return
@@ -400,32 +379,27 @@ class GLMModel:
         if self.latent_kv:
             self._build_absorbed()
         if (
-            self.expert_parallel is not None
-            and self.expert_parallel.preload_if_fits()
+            self.routed_vq.resident_parallel_supported
+            and self.routed_vq.preload_resident_if_fits()
         ):
-            self.pool = self.expert_parallel
             self.effective_tp_size = self.requested_tp_size
             return
-        if self.expert_parallel is not None:
+        if self.routed_vq.resident_parallel_supported:
             print(
                 "[cccp] 全显存专家容量/P2P不满足，回退单卡 RAM+显存缓存",
                 flush=True,
             )
-            self.expert_parallel = None
-            self.pool = ExpertPool(
+            from .ops import create_routed_vq_runtime
+
+            codebook_runtime = create_routed_vq_runtime(
                 self.store,
-                self._vram_cache_gb,
                 device=self.device,
-                ram_gb=self._cache_gb - self._pin_gb,
+                cache_gb=self._cache_gb,
+                vram_cache_gb=self._vram_cache_gb,
                 pin_gb=self._pin_gb,
             )
-        resident_all = self.pool.preload_all()
-        if resident_all:
-            self.pool.pin_host_resident()
-        else:   # 内存不够（已警告）时回退热钉住 + LRU
-            self.pool.preload_pinned()
-        self.pool.build_gpu_arenas()
-        self.pool.preload_profile_gpu()
+            self.routed_vq = codebook_runtime.executor
+        self.routed_vq.initialize_residency(device_type="cuda")
 
     def _build_absorbed_layer(self, layer: int) -> None:
         """单层的 kv_b_proj → Wuk/Wuv 分解（preload 全量或首次按需懒构建）。"""
@@ -536,12 +510,10 @@ class GLMModel:
         self._wuv.pop(layer, None)
         self._masks.pop(layer, None)
         self._prev_ids.pop(layer, None)
-        release_pool = getattr(self.pool, "release_scan_layer", None)
-        expert_shards = (
-            int(bool(release_pool(layer)))
-            if callable(release_pool)
-            else 0
-        )
+        expert_shards = int(bool(
+            self.routed_vq is not None
+            and self.routed_vq.release_scan_layer(layer)
+        ))
         # Large tensors and SafeFile byte buffers are reference-counted, while
         # the collection also clears the few Python cycles built by callbacks.
         gc.collect()
@@ -639,8 +611,8 @@ class GLMModel:
             self.device.type == "cuda"
             and layer >= 4
             and os.environ.get("CCCP_ATTENTION_GRAPH", "1") != "0"
-            and self.expert_parallel is not None
-            and getattr(self.pool, "full_resident", False)
+            and self.routed_vq.resident_parallel_supported
+            and self.routed_vq.full_resident
         )
         if not graph_resident:
             return min(self.max_ctx, 2048)
@@ -910,8 +882,8 @@ class GLMModel:
         graph_enabled = (
             os.environ.get("CCCP_ATTENTION_GRAPH", "1") != "0"
             and not self._attention_graph_failed
-            and self.expert_parallel is not None
-            and getattr(self.pool, "full_resident", False)
+            and self.routed_vq.resident_parallel_supported
+            and self.routed_vq.full_resident
             and x.shape[0] == 1
             and layer >= 4
             and self._flashinfer_mla_state is not None
@@ -1532,12 +1504,9 @@ class GLMModel:
             return x
         c = self.cfg
         p = f"model.layers.{layer}.mlp"
-        parallel = self.expert_parallel
-        route_start = (
-            parallel.profile_event()
-            if parallel is not None and parallel.profile_enabled
-            else None
-        )
+        routed_vq = self.routed_vq
+        resident_parallel = routed_vq.resident_parallel_supported
+        route_start = routed_vq.begin_route_profile()
         logits = (
             route_logits
             if route_logits is not None
@@ -1550,11 +1519,7 @@ class GLMModel:
             mask,
             c["top_k"],
             c["routed_scaling"],
-            (
-                parallel.decode_route_outputs()
-                if parallel is not None
-                else None
-            ),
+            routed_vq.decode_route_outputs(),
         )
         self._record_route_counts(layer, idx)
 
@@ -1580,77 +1545,35 @@ class GLMModel:
             result = routed + shared
             return residual + result if residual is not None else result
 
-        if parallel is not None:
-            route_end = parallel.profile_event()
-            parallel.profile_cuda("route", route_start, route_end)
-
+        routed_vq.end_route_profile(route_start)
+        if resident_parallel:
             def compute_shared_expert() -> torch.Tensor:
                 return self._shared_expert_eager(x, layer)
 
-            overlapped_final = (
-                parallel.compute_final_overlap(
-                    x,
-                    layer,
-                    idx,
-                    w,
-                    compute_shared_expert,
-                    residual,
+            result = routed_vq.execute_resident_parallel(
+                layer,
+                x,
+                idx,
+                w,
+                shared_fn=compute_shared_expert,
+                residual=residual,
+                merge_fn=merge_outputs,
+            )
+            if result is None:
+                raise RuntimeError(
+                    "public routed VQ resident-parallel execution returned "
+                    "no result"
                 )
-                if residual is not None
-                else None
-            )
-            if overlapped_final is not None:
-                return overlapped_final
-
-            shared_start = parallel.profile_event()
-            shared = compute_shared_expert()
-            shared_end = parallel.profile_event()
-            final = (
-                parallel.compute_final(
-                    x,
-                    layer,
-                    idx,
-                    w,
-                    shared,
-                    residual,
-                )
-                if residual is not None
-                else None
-            )
-            routed = (
-                parallel.compute(x, layer, idx, w)
-                if final is None
-                else None
-            )
-            parallel.profile_cuda(
-                "shared_expert",
-                shared_start,
-                shared_end,
-            )
-            if final is not None:
-                return final
-            assert routed is not None
-            add_start = parallel.profile_event()
-            result = merge_outputs(routed, shared)
-            add_end = parallel.profile_event()
-            parallel.profile_cuda("final_add", add_start, add_end)
             return result
 
-        if (
-            x.shape[0] > 1
-            and getattr(self.pool, "prefill_rows_supported", False)
-            and callable(getattr(self.pool, "run_rows", None))
-        ):
+        if x.shape[0] > 1:
             # Exact routes for the whole block are already known. Use the
             # same model-independent expert-grouped packed-row operator as
             # the other CCCP architectures so every selected expert is
             # dequantized once for all of its routed tokens.
-            self.pool.prefetch([
-                (int(layer), int(expert))
-                for expert in torch.unique(idx).detach().cpu().tolist()
-            ])
+            routed_vq.prefetch_routes(layer, idx)
             shared = self._shared_expert_eager(x, layer)
-            routed = self.pool.run_rows(
+            routed = routed_vq.execute(
                 layer,
                 x,
                 idx,
@@ -1662,101 +1585,20 @@ class GLMModel:
             )
             return merge_outputs(routed, shared)
 
-        if (
-            x.shape[0] == 1
-            and self.device.type == "cpu"
-            and getattr(
-                self.store.man,
-                "packed_expert_vq",
-                getattr(self.store.man, "projection_vq", False),
-            )
-            and hasattr(self.pool, "run_native")
-        ):
-            shared = self._shared_expert_eager(x, layer)
-            expert_ids = [int(expert) for expert in idx[0].tolist()]
-            self._prev_ids[layer] = expert_ids
-            routed = self.pool.run_native(
-                layer,
-                x,
-                idx[0],
-                w[0],
-                activation=self.operator_config.expert_activation,
-                activation_beta=float(c.get("situ_beta", 4.0)),
-                activation_linear_beta=c.get("situ_linear_beta"),
-                limit=float(c.get("swiglu_limit", 0.0)),
-            )
-            if routed is None:
-                selected = self.pool.get_many([
-                    (int(layer), expert) for expert in expert_ids
-                ])
-                experts = [
-                    selected[(int(layer), expert)]
-                    for expert in expert_ids
-                ]
-                from .ops import packed_moe_selected_topk
-
-                routed = packed_moe_selected_topk(
-                    x.float(),
-                    experts,
-                    w[0].float(),
-                    activation=self.operator_config.expert_activation,
-                    activation_beta=float(c.get("situ_beta", 4.0)),
-                    activation_linear_beta=c.get("situ_linear_beta"),
-                    limit=float(c.get("swiglu_limit", 0.0)),
-                )
-                if routed is None:
-                    from .grouped import moe_mlp_grouped_mixed
-
-                    routed = moe_mlp_grouped_mixed(
-                        x.float(),
-                        experts,
-                        w[0].float(),
-                        limit=float(c.get("swiglu_limit", 0.0)),
-                        activation=self.operator_config.expert_activation,
-                        situ_beta=float(c.get("situ_beta", 4.0)),
-                        situ_linear_beta=c.get("situ_linear_beta"),
-            )
-            return merge_outputs(routed.reshape(1, -1), shared)
-
-        if x.shape[0] > 1:
-            raise RuntimeError(
-                "grouped Prefill executor unavailable; the historical "
-                "per-token/per-expert projection implementation was deleted"
-            )
-
-        # Decode is intrinsically one row, but every routed expert still has
-        # to enter the fused top-k packed operator.  The former generic
-        # per-expert projection loop is deliberately absent: an operator
-        # regression must fail loudly instead of restoring GEMV per expert.
-        if x.shape[0] == 1:
-            from .grouped import moe_mlp_grouped_mixed
-
-            shared = self._shared_expert_eager(x, layer)
-            eids = idx[0].tolist()
-            self._prev_ids[layer] = eids
-            got = self.pool.get_many([(layer, expert) for expert in eids])
-            experts = [got[(layer, expert)] for expert in eids]
-            if all(
-                isinstance(gu, VQWeight) and isinstance(dn, VQWeight)
-                for gu, dn in experts
-            ):
-                routed = moe_mlp_grouped_mixed(
-                    x,
-                    experts,
-                    w[0],
-                    limit=float(c.get("swiglu_limit", 0.0)),
-                    activation=self.operator_config.expert_activation,
-                    situ_beta=float(c.get("situ_beta", 4.0)),
-                    situ_linear_beta=c.get("situ_linear_beta"),
-                )
-                return merge_outputs(
-                    routed.unsqueeze(0),
-                    shared,
-                )
-        raise RuntimeError(
-            "fused packed top-k decode operator unavailable; the legacy "
-            "single-token expert projection implementation was deleted"
+        shared = self._shared_expert_eager(x, layer)
+        eids = [int(expert) for expert in idx[0].tolist()]
+        self._prev_ids[layer] = eids
+        routed = routed_vq.execute(
+            layer,
+            x,
+            idx[0],
+            w[0],
+            activation=self.operator_config.expert_activation,
+            activation_beta=float(c.get("situ_beta", 4.0)),
+            activation_linear_beta=c.get("situ_linear_beta"),
+            limit=float(c.get("swiglu_limit", 0.0)),
         )
+        return merge_outputs(routed.reshape(1, -1), shared)
 
     def _dense_mlp(self, x: torch.Tensor, layer: int) -> torch.Tensor:
         p = f"model.layers.{layer}.mlp"
@@ -1785,17 +1627,7 @@ class GLMModel:
         """Record exact selected experts only while route calibration is active."""
         if os.environ.get("CCCP_ROUTE_COUNTS", "0") == "0":
             return
-        pool = self.pool
-        if pool is None:
-            return
-        counts = getattr(pool, "route_counts", None)
-        if counts is None:
-            counts = Counter()
-            pool.route_counts = counts
-        counts.update(
-            (int(layer), int(expert))
-            for expert in indices.detach().reshape(-1).cpu().tolist()
-        )
+        self.routed_vq.record_routes(layer, indices)
 
     def _forward_layer(
         self,
@@ -1812,7 +1644,8 @@ class GLMModel:
             and x.shape[0] == 1
             and os.environ.get("CCCP_PREFETCH", "1") != "0"
         ):
-            self.pool.prefetch([(layer, expert) for expert in prev])
+            if self.routed_vq is not None:
+                self.routed_vq.prefetch_routes(layer, prev)
         h = self._attention(
             x,
             layer,
@@ -1842,11 +1675,7 @@ class GLMModel:
                 post_norm,
                 route_weight,
                 eps,
-                (
-                    self.expert_parallel.decode_norm_output()
-                    if self.expert_parallel is not None
-                    else None
-                ),
+                self.routed_vq.decode_norm_output(),
                 (
                     self._decode_workspace(
                         layer,
@@ -1860,7 +1689,7 @@ class GLMModel:
                     ),
                 )
                 if (
-                    self.expert_parallel is not None
+                    self.routed_vq.resident_parallel_supported
                     and os.environ.get("CCCP_DECODE_WORKSPACES", "1") != "0"
                 )
                 else None,
@@ -1905,9 +1734,8 @@ class GLMModel:
         if self._prev_ids and len(ids) == 1 and os.environ.get("CCCP_PREFETCH", "1") != "0":
             # decode 单步：token 级全层预取（窗口 = 整个 token，见 dsv4model.decode）
             for layer_id, expert_ids in self._prev_ids.items():
-                self.pool.prefetch(
-                    [(layer_id, expert_id) for expert_id in expert_ids]
-                )
+                if self.routed_vq is not None:
+                    self.routed_vq.prefetch_routes(layer_id, expert_ids)
         for layer in range(c["n_layers"]):
             x = self._forward_layer(x, layer, pos0)
         self.pos += len(ids)

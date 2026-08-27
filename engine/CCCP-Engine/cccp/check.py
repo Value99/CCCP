@@ -10,6 +10,7 @@ import argparse
 import json
 import math
 import os
+import struct
 import sys
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,41 @@ from .presets import (
 
 
 GIB = 2**30
+
+
+def _glm5_next_text_dense_bytes(
+    root: Path,
+    manifest: dict[str, Any],
+) -> int:
+    """Read safetensors headers and count the text tensors actually loaded."""
+
+    values = manifest.get("dense_files") or [
+        manifest.get("dense_file", "dense.safetensors")
+    ]
+    layer_count = int(manifest["config"].get("n_layers") or 0)
+    mtp_prefix = (
+        f"model.language_model.layers.{layer_count}."
+        if layer_count > 0 else ""
+    )
+    total = 0
+    for value in values:
+        path = root / str(value)
+        with path.open("rb") as handle:
+            size = struct.unpack("<Q", handle.read(8))[0]
+            header = json.loads(handle.read(size))
+        for name, item in header.items():
+            if name == "__metadata__":
+                continue
+            if not (
+                name == "lm_head.weight"
+                or name.startswith("model.language_model.")
+            ):
+                continue
+            if mtp_prefix and name.startswith(mtp_prefix):
+                continue
+            start, end = item["data_offsets"]
+            total += int(end) - int(start)
+    return total
 
 _DSV4_SPECIAL_TOKENS = {
     "bos": "<｜begin▁of▁sentence｜>",
@@ -152,10 +188,20 @@ def _slot_bytes(
     if quant.get("method") == "projection-vq":
         if layer is None:
             raise ValueError("projection-VQ capacity requires a layer")
-        layouts_by_layer = quant.get("projection_layouts") or {}
-        layouts = layouts_by_layer.get(
-            str(layer), layouts_by_layer.get(layer)
+        split_private = (
+            str(quant.get("expert_storage") or "").lower()
+            == "split-gate-up-down-private-codebook-v1"
         )
+        if split_private:
+            layouts_by_layer = quant.get("layer_projection_layouts") or {}
+            layouts = layouts_by_layer.get(
+                str(layer), layouts_by_layer.get(layer)
+            )
+        else:
+            layouts_by_layer = quant.get("projection_layouts") or {}
+            layouts = layouts_by_layer.get(
+                str(layer), layouts_by_layer.get(layer)
+            )
         if layouts is None:
             heterogeneous = quant.get(
                 "heterogeneous_expert_tiering"
@@ -198,7 +244,14 @@ def _slot_bytes(
         }
         total = 0
         for projection, layout in layouts.items():
-            spec = quant["layouts"][layout]
+            projection = "down" if projection == "dn" else projection
+            spec = (quant.get("layouts") or {}).get(layout)
+            if spec is None and split_private:
+                dim_text, size_text = str(layout).split("-", 1)
+                spec = {
+                    "dim": int(dim_text.removeprefix("d")),
+                    "codebook_size": int(size_text.removeprefix("k")),
+                }
             rows, columns = shapes[projection]
             indices = rows * (columns // int(spec["dim"]))
             packing = str(quant["index_packing"][layout])
@@ -206,6 +259,12 @@ def _slot_bytes(
                 packing.removeprefix("packed-u").removeprefix("u")
             )
             total += (indices * bits + 7) // 8
+            if split_private:
+                total += (
+                    int(spec["codebook_size"])
+                    * int(spec["dim"])
+                    * 4
+                )
         return total
     base = kind.rstrip("z")
     # 单字符层配额需要同时区分 v 与 vv；历史 CCCP 清单以大写
@@ -363,6 +422,11 @@ def resident_expert_bytes(
     architecture = detect_architecture(manifest)
     if architecture == "qwen3_5_dense":
         return 0
+    if architecture == "glm5_next":
+        return sum(
+            (root / str(name)).stat().st_size
+            for name in manifest.get("expert_files", {}).values()
+        )
     if architecture == "kimi_k3":
         return sum(
             (
@@ -397,6 +461,9 @@ def _initial_kv_gib(architecture: str, max_ctx: int) -> float:
     if architecture == "qwen3_5_dense":
         initial = min(max(0, int(max_ctx)), 4096)
         return 0.6 + 0.00055 * initial
+    if architecture == "glm5_next":
+        initial = min(max(0, int(max_ctx)), 4096)
+        return 0.5 + 0.00025 * initial
     initial = min(max(0, int(max_ctx)), 4096)
     return 2.3 + 0.09 * initial / 1024
 
@@ -417,6 +484,9 @@ def fixed_vram_gib(
             for name in dict.fromkeys(str(value) for value in names if value)
         ) / GIB
         return packed + 0.75 + _initial_kv_gib(architecture, max_ctx)
+    if architecture == "glm5_next":
+        dense = _glm5_next_text_dense_bytes(root, manifest) / GIB
+        return dense + 1.5 + _initial_kv_gib(architecture, max_ctx)
     if architecture == "kimi_k3":
         dense = 0.0
         audit_name = manifest.get("dense_audit_file")
@@ -487,7 +557,7 @@ def kimi_parallel_rank_bytes(
     """Estimate Kimi's real all-rank weight residency from its audits.
 
     Routed payloads remain packed and are tensor-sharded.  Per-layer codebooks
-    and safetensors metadata are replicated exactly like ``PackedExpertPool``.
+    and safetensors metadata are replicated exactly like the public routed-VQ runtime.
     Mixed dense weights keep their stored BF16/FP8 representation; column/row
     TP tensors are sharded while norms, biases and other metadata are
     replicated.  Both the legacy flat expert map and the current standardized
@@ -632,6 +702,12 @@ def _print_matrix(
         print(
             "\nQwen3.5 Dense VQ 没有动态专家或 TP 专家矩阵；"
             "容量按完整固定权重与上下文状态计算。"
+        )
+        return
+    if detect_architecture(manifest) == "glm5_next":
+        print(
+            "\nGLM-5.3 Flash 当前发布单卡/CPU 路径；"
+            "容量按文本 Dense 与完整压缩专家集合计算。"
         )
         return
     if detect_architecture(manifest) != "glm":

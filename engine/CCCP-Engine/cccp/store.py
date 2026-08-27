@@ -749,20 +749,30 @@ class SafeTensorCollection:
         """Return audited block-FP8 without expanding it to BF16."""
         entry = self._logical_entries.get(name)
         if entry is None:
-            # Source-exact archives retain an original E4M3 weight plus E8M0
-            # exponent scale pair.  Recognize that pair from the safetensors
-            # header and keep the weight byte-packed in RAM/VRAM.
+            # Source-exact archives retain an original E4M3 weight plus either
+            # an E8M0 ``.scale`` tensor or the standard fine-grained FP8
+            # ``.weight_scale_inv`` F32 tensor. Recognize both from headers so
+            # the E4M3 payload remains byte-packed in RAM/VRAM.
             shard = self._locations.get(name)
             if shard is None or not name.endswith(".weight"):
                 return None
             handle = self._handle(shard)
             info = handle.meta[name]
-            scale_name = name[: -len("weight")] + "scale"
-            if (
-                info.get("dtype") != "F8_E4M3"
-                or self._locations.get(scale_name) != shard
-                or handle.meta[scale_name].get("dtype") != "F8_E8M0"
-            ):
+            scale_names = (
+                name[: -len("weight")] + "scale",
+                name + "_scale_inv",
+            )
+            scale_name = next(
+                (
+                    candidate
+                    for candidate in scale_names
+                    if self._locations.get(candidate) == shard
+                    and handle.meta[candidate].get("dtype")
+                    in ("F8_E8M0", "F32")
+                ),
+                None,
+            )
+            if info.get("dtype") != "F8_E4M3" or scale_name is None:
                 return None
             raw = handle.get_tensor(name)
             scales = handle.get_tensor(scale_name)
@@ -959,15 +969,32 @@ class Manifest:
         layer_projection_layouts = (
             self.quant.get("layer_projection_layouts") or {}
         )
-        combined_projection_vq = bool(
+        expert_storage = str(
+            self.quant.get("expert_storage", "")
+        ).strip().lower()
+        codebook_policy = self.quant.get("codebook_policy") or {}
+        split_projection_vq = bool(
             not routed_layers
+            and m.get("expert_files")
+            and projection_method
+            and expert_storage
+            == "split-gate-up-down-private-codebook-v1"
+            and layer_projection_layouts
+            and self.quant.get("projection_layouts")
+            and codebook_policy.get("scope")
+            == "per-expert-per-projection"
+            and not bool(codebook_policy.get("gate_up_combined", False))
+        )
+        combined_projection_vq = bool(
+            not split_projection_vq
+            and not routed_layers
             and m.get("expert_files")
             and projection_method
             and layer_projection_layouts
             and self.quant.get("projection_layouts")
         )
         flat_projection_vq = bool(
-            not combined_projection_vq
+            (split_projection_vq or not combined_projection_vq)
             and not routed_layers
             and m.get("expert_files")
             and projection_method
@@ -997,8 +1024,19 @@ class Manifest:
                 and self.quant.get("layer_kinds")
             )
         )
+        # Storage geometry can be either the current per-projection packed
+        # format or the earlier combined Gate/Up codebook format.  Both are
+        # codebook execution and must enter the same public routed-VQ runtime;
+        # only its format-selected storage backend may differ.
+        self.expert_codebook_vq = bool(
+            self.projection_vq
+            or self.quant.get("vq")
+            or self.quant.get("vq_projections")
+        )
         self.heterogeneous_projection_vq = heterogeneous_projection_vq
         self.combined_projection_vq = combined_projection_vq
+        self.split_projection_vq = split_projection_vq
+        self.projection_private_codebooks = bool(split_projection_vq)
         self.projection_names: tuple[str, ...] = ()
         self.projection_layout_by_layer: dict[int, dict[str, str]] = {}
         self.projection_layout_by_expert: dict[
@@ -1062,6 +1100,37 @@ class Manifest:
                         "layer_expert_levels"
                     ].items()
                 }
+            elif split_projection_vq:
+                self.projection_layout_by_layer = {
+                    int(layer): {
+                        ("down" if str(projection) == "dn" else str(projection)):
+                            str(layout_name)
+                        for projection, layout_name in layouts.items()
+                    }
+                    for layer, layouts in layer_projection_layouts.items()
+                }
+                referenced_layouts = {
+                    layout
+                    for layouts in self.projection_layout_by_layer.values()
+                    for layout in layouts.values()
+                }
+                layout_specs = {}
+                for layout_name in referenced_layouts:
+                    try:
+                        dim_text, size_text = layout_name.split("-", 1)
+                        if not dim_text.startswith("d") or not size_text.startswith("k"):
+                            raise ValueError
+                        dim = int(dim_text[1:])
+                        size = int(size_text[1:])
+                    except (TypeError, ValueError):
+                        raise ValueError(
+                            "split projection VQ layout names must use "
+                            f"d<dim>-k<size>: {layout_name!r}"
+                        ) from None
+                    layout_specs[layout_name] = {
+                        "dim": dim,
+                        "codebook_size": size,
+                    }
             elif combined_projection_vq:
                 layout_specs = self.quant["projection_layouts"]
                 self.projection_layout_by_layer = {
@@ -1139,6 +1208,8 @@ class Manifest:
                 }
         else:
             self.heterogeneous_projection_vq = False
+            self.split_projection_vq = False
+            self.projection_private_codebooks = False
             self.expert_files = {
                 int(l): v for l, v in m["expert_files"].items()
             }
@@ -1707,11 +1778,15 @@ class CCCPStore:
         return name in self._dense_keys
 
     def dense_names(self) -> list[str]:
-        """全部 dense 权重名（不含 .qs 缩放键）。"""
+        """全部 dense 权重名（不含量化缩放伴随键）。"""
         return sorted(
             name
             for name in self._dense_keys
             if not name.endswith(".qs")
+            and not (
+                name.endswith(".weight_scale_inv")
+                and name[: -len("_scale_inv")] in self._dense_keys
+            )
             and not (
                 name.endswith(".scale")
                 and name[: -len("scale")] + "weight"
@@ -2003,6 +2078,12 @@ class CCCPStore:
     ) -> str:
         layout = self.man.projection_layouts(layer, eid)[projection]
         key = f"cb.{projection}.{layout}"
+        if self.man.projection_private_codebooks:
+            if eid is None:
+                raise ValueError(
+                    f"L{layer} {projection} private codebook requires expert_id"
+                )
+            return f"{key}.e{int(eid)}"
         group_size = self.man.projection_codebook_group_sizes.get(layout)
         if group_size is None:
             return key
