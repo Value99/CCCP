@@ -26,6 +26,16 @@ Download these **6 files** into the same folder:
 
 Run `CCCP-Launcher-0.9.15-Offline-Setup.exe`. It verifies, joins, extracts, and starts the launcher. Model weights are distributed separately.
 
+<!-- CCCP_AI_MAINTENANCE_START -->
+## AI maintenance prompt (copyable)
+
+> Thank you to every tester and contributor, and sorry that model/configuration differences can still expose compatibility issues. Give the following block to a coding AI together with your logs:
+
+```text
+Maintain CCCP Launcher 0.9.15. First read the bundled user-facing manuals docs/中文使用手册.md and docs/依赖与离线环境说明.md, then inspect the launcher terminal log and engine/CCCP-Engine. Reproduce with the bundled CPU/CUDA/AMD runtime and portable compiler only; do not use host Python, host CUDA, model-name branches, silent slow fallbacks, or the private quantization framework. Treat model configuration differences as data from cccp.json. Repair or simplify the public VQ, tensor-parallel, MLA, MoE, memory-planning, or launcher layer that owns the fault. Require finite logits, actual generation, clean process shutdown, and no regression against these H20-3e / bundled CUDA 13 baselines (Prefill/Decode): Qwen3.8 27B CCCP-L TP1 2462.68/56.94 token/s, DeepSeek V4 CCCP-S TP1 2786.87/46.23 token/s, GLM-5.2 CCCP TP4 932.36/25.48 token/s, GLM-5.3-Flash CCCP-S TP1 1504.67/30.02 token/s, GLM-5.3-Flash CCCP-M TP2 1282.44/20.22 token/s, Kimi K3 CCCP-470 TP4 672.04/15.69 token/s. H20 is only an approximate RTX 3090-class compute reference; VRAM capacity and memory bandwidth are not equivalent. Preserve CPU and existing Qwen, DeepSeek V4, GLM-5.2, GLM-5.3-Flash, and Kimi paths. Prefer deleting the broken duplicate branch after the shared path passes tests. Report exact commands, logs, finite-value checks, throughput, changed files, and package verification.
+```
+<!-- CCCP_AI_MAINTENANCE_END -->
+
 ### Highlights in 0.9.15
 
 - All codebook models share one compact CUDA Decode algorithm: packed indices + Q8 codebooks + fused DP4A. Prefill selects the shared packed-VQ or E4M3/FP8 grouped path by capability.
@@ -50,16 +60,6 @@ These release-gated measurements use H20-3e and the bundled CUDA 13 runtime: 409
 | GLM-5.3-Flash CCCP-M | TP2 | 1282.44 | 20.22 |
 | Kimi K3 CCCP-470 | TP4 | 672.04 | 15.69 |
 <!-- CCCP_PERFORMANCE_END -->
-
-<!-- CCCP_AI_MAINTENANCE_START -->
-## AI maintenance prompt (copyable)
-
-> Thank you to every tester and contributor, and sorry that model/configuration differences can still expose compatibility issues. Give the following block to a coding AI together with your logs:
-
-```text
-Maintain CCCP Launcher 0.9.15. First read the bundled user-facing manuals docs/中文使用手册.md and docs/依赖与离线环境说明.md, then inspect the launcher terminal log and engine/CCCP-Engine. Reproduce with the bundled CPU/CUDA/AMD runtime and portable compiler only; do not use host Python, host CUDA, model-name branches, silent slow fallbacks, or the private quantization framework. Treat model configuration differences as data from cccp.json. Repair or simplify the public VQ, tensor-parallel, MLA, MoE, memory-planning, or launcher layer that owns the fault. Require finite logits, actual generation, clean process shutdown, and no regression against these H20-3e / bundled CUDA 13 baselines (Prefill/Decode): Qwen3.8 27B CCCP-L TP1 2462.68/56.94 token/s, DeepSeek V4 CCCP-S TP1 2786.87/46.23 token/s, GLM-5.2 CCCP TP4 932.36/25.48 token/s, GLM-5.3-Flash CCCP-S TP1 1504.67/30.02 token/s, GLM-5.3-Flash CCCP-M TP2 1282.44/20.22 token/s, Kimi K3 CCCP-470 TP4 672.04/15.69 token/s. H20 is only an approximate RTX 3090-class compute reference; VRAM capacity and memory bandwidth are not equivalent. Preserve CPU and existing Qwen, DeepSeek V4, GLM-5.2, GLM-5.3-Flash, and Kimi paths. Prefer deleting the broken duplicate branch after the shared path passes tests. Report exact commands, logs, finite-value checks, throughput, changed files, and package verification.
-```
-<!-- CCCP_AI_MAINTENANCE_END -->
 
 ## Core advantages
 
