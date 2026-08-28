@@ -2238,6 +2238,7 @@ if _EXT is not None:
             or source.dtype not in (
                 torch.float32,
                 torch.bfloat16,
+                torch.int32,
                 torch.long,
             )
             or source.dtype != destination.dtype
@@ -2529,7 +2530,7 @@ if _EXT is not None:
     ):
         """Fuse GLM MLA Q/K RoPE while preserving the reference cat layout."""
         if (
-            os.environ.get("CCCP_GLM_ROPE_FUSED", "1") == "0"
+            os.environ.get("CCCP_ROPE_FUSED", "1") == "0"
             or not q.is_cuda
             or q.dtype != torch.float32
             or k.dtype != torch.float32
@@ -2564,7 +2565,7 @@ if _EXT is not None:
     ):
         """Fuse decode C RMSNorm, Q/K RoPE and BF16 latent-cache writes."""
         if (
-            os.environ.get("CCCP_GLM_LATENT_PREP_FUSED", "1") == "0"
+            os.environ.get("CCCP_LATENT_PREP_FUSED", "1") == "0"
             or not c_raw.is_cuda
             or c_raw.dtype != torch.float32
             or c_weight.dtype != torch.float32
@@ -2691,6 +2692,72 @@ if _EXT is not None:
             output,
         )
 
+    def latent_mla_attention_prefill_fused(
+        query_nope: torch.Tensor,
+        query_rope: torch.Tensor,
+        latent_cache: torch.Tensor,
+        rope_cache: torch.Tensor,
+        query_start: int,
+        scale_denominator: float,
+        output: torch.Tensor | None = None,
+    ):
+        """Run the bundled causal MLA Prefill with a bounded workspace."""
+        if (
+            not query_nope.is_cuda
+            or query_nope.dtype != torch.bfloat16
+            or query_rope.dtype != torch.bfloat16
+            or latent_cache.dtype != torch.bfloat16
+            or rope_cache.dtype != torch.bfloat16
+            or query_nope.ndim != 3
+            or query_rope.ndim != 3
+            or query_rope.shape[:2] != query_nope.shape[:2]
+            or latent_cache.ndim != 2
+            or rope_cache.ndim != 2
+            or latent_cache.shape[0] != rope_cache.shape[0]
+            or latent_cache.shape[1] != query_nope.shape[2]
+            or rope_cache.shape[1] != query_rope.shape[2]
+            or int(query_start) < 0
+            or int(query_start) + int(query_nope.shape[0])
+            > int(latent_cache.shape[0])
+            or float(scale_denominator) <= 0.0
+            or (output is not None and output.shape != query_nope.shape)
+        ):
+            return None
+        rows = int(query_nope.shape[0])
+        if rows == 0:
+            return output if output is not None else torch.empty_like(query_nope)
+        heads = int(query_nope.shape[1])
+        capacity = int(latent_cache.shape[0])
+        workspace_mb = max(
+            1,
+            int(os.environ.get("CCCP_MLA_NATIVE_WORKSPACE_MB", "256")),
+        )
+        workspace_rows = max(
+            1,
+            min(
+                rows,
+                workspace_mb * 1024 * 1024
+                // max(4, heads * capacity * 4),
+            ),
+        )
+        score_workspace = torch.empty(
+            workspace_rows,
+            heads,
+            capacity,
+            dtype=torch.float32,
+            device=query_nope.device,
+        )
+        return _EXT.latent_mla_attention_prefill(
+            query_nope.contiguous(),
+            query_rope.contiguous(),
+            latent_cache.contiguous(),
+            rope_cache.contiguous(),
+            int(query_start),
+            float(scale_denominator),
+            score_workspace,
+            output,
+        )
+
     def glm_merge_scores_fused(
         a: torch.Tensor,
         b: torch.Tensor,
@@ -2698,7 +2765,7 @@ if _EXT is not None:
     ):
         """Fuse latent MLA score casts, scaling and addition."""
         if (
-            os.environ.get("CCCP_GLM_SCORE_FUSED", "1") == "0"
+            os.environ.get("CCCP_SCORE_FUSED", "1") == "0"
             or not a.is_cuda
             or a.dtype != torch.bfloat16
             or b.dtype != torch.bfloat16
@@ -2942,7 +3009,7 @@ if _EXT is not None:
         if (
             os.environ.get(
                 "CCCP_ROUTE_FUSED",
-                os.environ.get("CCCP_GLM_ROUTE_FUSED", "1"),
+                os.environ.get("CCCP_ROUTE_FUSED", "1"),
             ) == "0"
             or not logits.is_cuda
             or logits.dtype != torch.float32
@@ -3451,7 +3518,7 @@ if _EXT is not None:
     ):
         """Decode Q-B directly into BF16 no-PE and FP32 RoPE rows."""
         if (
-            os.environ.get("CCCP_GLM_QB_SPLIT", "1") == "0"
+            os.environ.get("CCCP_QB_SPLIT", "1") == "0"
             or not x.is_cuda
             or x.dtype != torch.float32
             or x.shape != (1, cols)
@@ -3468,7 +3535,7 @@ if _EXT is not None:
             int(group_size),
             (
                 os.environ.get(
-                    "CCCP_GLM_QB_GROUP_VECTOR",
+                    "CCCP_QB_GROUP_VECTOR",
                     "1",
                 )
                 != "0"
@@ -3559,7 +3626,7 @@ if _EXT is not None:
     ):
         """Fuse GLM decode input RMSNorm with Q-A and KV-A INT4 GEMVs."""
         if (
-            os.environ.get("CCCP_GLM_NORM_QKV_FUSED", "1") == "0"
+            os.environ.get("CCCP_NORM_QKV_FUSED", "1") == "0"
             or not x.is_cuda
             or x.dtype != torch.float32
             or x.ndim != 2
@@ -3625,7 +3692,7 @@ if _EXT is not None:
         """Fuse a residual add into input RMSNorm plus Q-A/KV-A."""
         if (
             os.environ.get(
-                "CCCP_GLM_RESIDUAL_NORM_QKV",
+                "CCCP_RESIDUAL_NORM_QKV",
                 "1",
             ) == "0"
             or not residual.is_cuda
@@ -3687,7 +3754,7 @@ if _EXT is not None:
         """Fuse GLM decode residual add, RMSNorm and router GEMV."""
         if (
             os.environ.get(
-                "CCCP_GLM_RESIDUAL_NORM_ROUTER",
+                "CCCP_RESIDUAL_NORM_ROUTER",
                 "1",
             ) == "0"
             or not residual.is_cuda
@@ -3766,7 +3833,7 @@ if _EXT is not None:
     ):
         """Compatibility entry for the generic three-way residual operator."""
         if (
-            os.environ.get("CCCP_GLM_MOE_RESIDUAL_ADD", "1") == "0"
+            os.environ.get("CCCP_MOE_RESIDUAL_ADD", "1") == "0"
             or residual.dtype != torch.float32
         ):
             return None
@@ -3778,7 +3845,7 @@ if _EXT is not None:
     ):
         """Fuse up to 16 TP routed/shared contributions with the residual."""
         if (
-            os.environ.get("CCCP_GLM_EP_FINAL_FUSED", "1") == "0"
+            os.environ.get("CCCP_EP_FINAL_FUSED", "1") == "0"
             or not 1 <= len(contributions) <= 16
             or not contributions[0].is_cuda
             or any(
@@ -4395,6 +4462,106 @@ if _EXT is not None:
             source_event.cuda_event,
         )
 
+    def native8_moe_all_rank_fused(
+        source_inputs: torch.Tensor | list[torch.Tensor],
+        source_token_ids: torch.Tensor,
+        source_group_experts: torch.Tensor,
+        source_group_offsets: torch.Tensor,
+        source_route_weights: torch.Tensor,
+        metadata_by_rank: list[torch.Tensor],
+        scales_by_rank: list[torch.Tensor],
+        workspaces_by_rank: list[list[torch.Tensor]],
+        output: torch.Tensor | list[torch.Tensor],
+        devices: list[int],
+        streams: list[torch.cuda.Stream],
+        done_events: list[torch.cuda.Event],
+        source_event: torch.cuda.Event | list[torch.cuda.Event],
+        output_event: torch.cuda.Event | list[torch.cuda.Event],
+        *,
+        activation: str,
+        beta: float,
+        linear_beta: float,
+        limit: float,
+    ) -> torch.Tensor:
+        """Submit Native8 grouped MoE for every TP rank in one native call."""
+        activation_kind = {
+            "situ": 0,
+            "silu": 1,
+            "swiglu": 1,
+        }.get(str(activation).strip().lower())
+        if activation_kind is None:
+            raise ValueError(f"unsupported routed activation {activation!r}")
+        source_tensors = (
+            list(source_inputs)
+            if isinstance(source_inputs, (list, tuple))
+            else [source_inputs]
+        )
+        outputs = (
+            list(output)
+            if isinstance(output, (list, tuple))
+            else [output]
+        )
+        source_events = (
+            list(source_event)
+            if isinstance(source_event, (list, tuple))
+            else [source_event]
+        )
+        output_events = (
+            list(output_event)
+            if isinstance(output_event, (list, tuple))
+            else [output_event]
+        )
+        if len(source_tensors) not in (1, len(devices)):
+            raise ValueError("Native8 source tensor count must be 1 or TP")
+        if len(outputs) not in (1, len(devices)):
+            raise ValueError("Native8 output tensor count must be 1 or TP")
+        if len(source_events) != len(source_tensors):
+            raise ValueError("Native8 source events must match source tensors")
+        if len(output_events) != len(outputs):
+            raise ValueError("Native8 output events must match outputs")
+        for index, source in enumerate(source_tensors):
+            expected = int(devices[0 if len(source_tensors) == 1 else index])
+            if (
+                not source.is_cuda
+                or source.device.index != expected
+                or source.dtype != torch.bfloat16
+                or source.ndim != 2
+                or not source.is_contiguous()
+            ):
+                raise ValueError(
+                    "Native8 rank-local source is invalid: "
+                    f"rank={index}, expected=cuda:{expected}, "
+                    f"actual={source.device}, dtype={source.dtype}, "
+                    f"shape={tuple(source.shape)}, "
+                    f"contiguous={source.is_contiguous()}"
+                )
+        source_event_handles = [event.cuda_event for event in source_events]
+        output_event_handles = [event.cuda_event for event in output_events]
+        if not all(int(handle) != 0 for handle in source_event_handles):
+            raise ValueError("Native8 source event handle is null")
+        if not all(int(handle) != 0 for handle in output_event_handles):
+            raise ValueError("Native8 output event handle is null")
+        return _EXT.tp_native8_grouped_moe_all_rank(
+            source_tensors,
+            source_token_ids,
+            source_group_experts,
+            source_group_offsets,
+            source_route_weights,
+            metadata_by_rank,
+            scales_by_rank,
+            workspaces_by_rank,
+            outputs,
+            devices,
+            [stream.cuda_stream for stream in streams],
+            [event.cuda_event for event in done_events],
+            source_event_handles,
+            output_event_handles,
+            int(activation_kind),
+            float(beta),
+            float(linear_beta),
+            float(limit),
+        )
+
     def make_tp_graph_sequence_batch(
         devices: list[int],
         graph_sequences: list[list[torch.cuda.CUDAGraph]],
@@ -4857,6 +5024,9 @@ else:
     def latent_mla_attention_decode_fused(*args, **kwargs):
         return None
 
+    def latent_mla_attention_prefill_fused(*args, **kwargs):
+        return None
+
     def flashinfer_mla_batch1_plan_fused(*args, **kwargs):
         return False
 
@@ -5032,6 +5202,9 @@ else:
         return None
 
     def make_tp_graph_launch_batch(*args, **kwargs):
+        return None
+
+    def native8_moe_all_rank_fused(*args, **kwargs):
         return None
 
     def make_tp_graph_sequence_batch(*args, **kwargs):

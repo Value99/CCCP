@@ -292,7 +292,7 @@ def validate_parallel_shapes(
     attention_tp = _environment_enabled(
         environment,
         "CCCP_ATTENTION_TP",
-        _environment_value(environment, "CCCP_KIMI_ATTENTION_TP", "1"),
+        "1",
     )
     if attention_tp:
         require("n_heads", int(config["n_heads"]), small_tp)
@@ -303,7 +303,7 @@ def validate_parallel_shapes(
         _environment_value(
             environment,
             "CCCP_DENSE_TP",
-            _environment_value(environment, "CCCP_KIMI_DENSE_TP", "1"),
+            "1",
         ),
     )
     if first_dense_tp and int(config.get("first_dense_layers", 0)):
@@ -315,7 +315,7 @@ def validate_parallel_shapes(
         _environment_value(
             environment,
             "CCCP_DENSE_TP",
-            _environment_value(environment, "CCCP_KIMI_DENSE_TP", "1"),
+            "1",
         ),
     )
     if shared_tp and int(config.get("n_shared", 0)):

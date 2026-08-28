@@ -911,7 +911,7 @@ class GLM5NextCCCPModel:
         decode_graph_enabled = (
             self.device.type == "cuda"
             and self.tp_size > 1
-            and os.environ.get("CCCP_GLM_LINEAR_DECODE_GRAPH", "1") != "0"
+            and os.environ.get("CCCP_LINEAR_DECODE_GRAPH", "1") != "0"
         )
         for index, layer in enumerate(model.layers):
             decode_graph_pool = None

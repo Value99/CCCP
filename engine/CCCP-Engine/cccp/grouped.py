@@ -136,6 +136,169 @@ def activate_gate_up(
     return (activated * up_f).to(gate.dtype)
 
 
+def dense_expert_grouped_moe(
+    inputs: torch.Tensor,
+    token_ids: torch.Tensor,
+    group_offsets: torch.Tensor,
+    route_weights: torch.Tensor,
+    gate_up_weights: torch.Tensor,
+    down_weights: torch.Tensor,
+    result: torch.Tensor,
+    *,
+    activation: str,
+    activation_beta: float,
+    activation_linear_beta: float | None,
+    limit: float,
+) -> torch.Tensor:
+    """Execute one routed MoE batch from already expanded expert weights.
+
+    Routes must already be sorted by expert.  Both projections are submitted
+    as one grouped GEMM each, so callers never need a Python expert loop.  The
+    helper is shared by every projection-VQ architecture that temporarily
+    expands the active experts for long Prefill batches.
+    """
+    grouped_mm = getattr(torch, "_grouped_mm", None)
+    if grouped_mm is None:
+        raise RuntimeError(
+            "dense expert Prefill requires the CUDA grouped-GEMM operator"
+        )
+    if group_offsets.ndim != 1 or int(group_offsets.numel()) < 2:
+        raise ValueError("group_offsets must contain [0, ..., route_count]")
+    if gate_up_weights.ndim != 3 or down_weights.ndim != 3:
+        raise ValueError("dense expert weights must be rank-3 tensors")
+    group_count = int(group_offsets.numel()) - 1
+    if (
+        int(gate_up_weights.shape[0]) != group_count
+        or int(down_weights.shape[0]) != group_count
+    ):
+        raise ValueError("dense expert weights must match grouped routes")
+
+    offsets = group_offsets[1:].to(torch.int32).contiguous()
+    sorted_inputs = inputs.index_select(0, token_ids).contiguous()
+    gate_up = grouped_mm(
+        sorted_inputs,
+        gate_up_weights.transpose(1, 2),
+        offs=offsets,
+    )
+    gate, up = gate_up.chunk(2, dim=-1)
+    if float(limit) > 0.0:
+        gate = gate.clamp(max=float(limit))
+        up = up.clamp(min=-float(limit), max=float(limit))
+    activated = activate_gate_up(
+        gate,
+        up,
+        activation=activation,
+        situ_beta=float(activation_beta),
+        situ_linear_beta=activation_linear_beta,
+    )
+    down = grouped_mm(
+        activated.contiguous(),
+        down_weights.transpose(1, 2),
+        offs=offsets,
+    )
+    result.zero_()
+    result.index_add_(
+        0,
+        token_ids,
+        down.float() * route_weights.float().unsqueeze(1),
+    )
+    return result
+
+
+def native8_expert_grouped_moe(
+    inputs: torch.Tensor,
+    token_ids: torch.Tensor,
+    group_offsets: torch.Tensor,
+    route_weights: torch.Tensor,
+    metadata: torch.Tensor,
+    projection_scales: torch.Tensor,
+    workspace: dict[str, torch.Tensor],
+    result: torch.Tensor,
+    *,
+    activation: str,
+    activation_beta: float,
+    activation_linear_beta: float | None,
+    limit: float,
+) -> torch.Tensor:
+    """Run active packed experts through the common SM90/SM100 FP8 path.
+
+    The packed indices remain resident.  Only experts reached by this layer's
+    complete row batch are expanded into the reusable transient FP8 workspace;
+    two grouped Tensor-Core calls execute Gate/Up and Down without a Python
+    expert loop or a persistent dense-weight image.
+    """
+    from .fusedext import (
+        dense_fp8_quantize_rows_fused,
+        gated_activation_fp8_quantize_rows_fused,
+    )
+    from .ops import projection_expand_native8
+    from .ops.sm90_grouped import execute_grouped_fp8
+
+    groups = int(group_offsets.numel()) - 1
+    routed_rows = int(token_ids.numel())
+    if groups <= 0 or routed_rows <= 0:
+        raise ValueError("native8 grouped MoE requires routes and experts")
+    if tuple(projection_scales.shape) != (groups, 3):
+        raise ValueError("projection scales must be [active_experts, 3]")
+    offsets = group_offsets[1:].to(torch.int32).contiguous()
+    gate_up_weights = workspace["gate_up_weights"][:groups]
+    down_weights = workspace["down_weights"][:groups]
+    projection_expand_native8(metadata, gate_up_weights, down_weights)
+
+    grouped_input = inputs.index_select(0, token_ids).contiguous()
+    native_input = workspace["native_input"][:routed_rows]
+    input_scales = workspace["input_scales"][:routed_rows]
+    if dense_fp8_quantize_rows_fused(
+        grouped_input,
+        native_input,
+        input_scales,
+    ) is None:
+        raise RuntimeError("native8 input quantizer rejected routed rows")
+
+    local_intermediate = int(down_weights.shape[2])
+    gate_up_scales = workspace["gate_up_scales"][:groups]
+    down_scales = workspace["down_scales"][:groups]
+    gate_up_scales[:, :local_intermediate].copy_(projection_scales[:, 0:1])
+    gate_up_scales[:, local_intermediate:].copy_(projection_scales[:, 1:2])
+    down_scales.copy_(projection_scales[:, 2:3])
+    gate_up = execute_grouped_fp8(
+        native_input,
+        gate_up_weights,
+        scale_a=input_scales.view(-1),
+        scale_b=gate_up_scales,
+        offsets=offsets,
+        backend="torch-scaled-grouped-mm",
+    )
+
+    activated = workspace["activated"][:routed_rows]
+    activated_scales = workspace["activated_scales"][:routed_rows]
+    if gated_activation_fp8_quantize_rows_fused(
+        gate_up,
+        activated,
+        activated_scales,
+        activation=activation,
+        beta=float(activation_beta),
+        linear_beta=activation_linear_beta,
+        limit=float(limit),
+    ) is None:
+        raise RuntimeError("native8 gated activation quantizer rejected rows")
+    routed = execute_grouped_fp8(
+        activated,
+        down_weights,
+        scale_a=activated_scales.view(-1),
+        scale_b=down_scales,
+        offsets=offsets,
+        backend="torch-scaled-grouped-mm",
+    )
+    result.zero_()
+    result.index_add_(
+        0,
+        token_ids,
+        routed.float() * route_weights.float().unsqueeze(1),
+    )
+    return result
+
+
 def moe_mlp_slots_compatible(
     experts: list[tuple[VQWeight, VQWeight]],
 ) -> bool:

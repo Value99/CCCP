@@ -85,27 +85,6 @@ def prefill_block_size(
     return value if maximum is None else min(int(maximum), value)
 
 
-def prefill_block_size_with_legacy(
-    legacy_env_name: str,
-    *,
-    default: int = 4096,
-    minimum: int = 1,
-    maximum: int | None = None,
-) -> int:
-    """Use a model-specific legacy override, otherwise the shared setting."""
-    env_name = (
-        legacy_env_name
-        if legacy_env_name in os.environ
-        else "CCCP_PREFILL_BLOCK_TOKENS"
-    )
-    return prefill_block_size(
-        env_name=env_name,
-        default=default,
-        minimum=minimum,
-        maximum=maximum,
-    )
-
-
 def run_prefill_blocks(
     values: Iterable[T],
     evaluate_block: Callable[[list[T]], T],
@@ -164,7 +143,6 @@ __all__ = [
     "begin_prefill_block",
     "end_prefill_block",
     "prefill_block_size",
-    "prefill_block_size_with_legacy",
     "prefill_ranges",
     "run_prefill_blocks",
     "prefill_moe_batch_size",

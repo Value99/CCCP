@@ -1713,7 +1713,7 @@ class ProjectionGroup:
                     return target
         outputs = []
         for weight in self.weights:
-            if isinstance(weight, BlockFP8Weight):
+            if isinstance(weight, (BlockFP8Weight, Int4Weight)):
                 outputs.append(weight.matmul_T_decode_fused(x))
             else:
                 outputs.append(

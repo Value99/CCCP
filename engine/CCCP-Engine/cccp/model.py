@@ -19,63 +19,12 @@ import torch.nn.functional as F
 from .kernels import (
     BlockFP8Weight,
     Int4Weight,
+    ProjectionGroup,
     RopeCache,
     VQWeight,
-    merge_attention_scores,
     rmsnorm,
 )
-
-
-def _latent_attention_context_batched(
-    qa: torch.Tensor,
-    q_rot: torch.Tensor,
-    ckv: torch.Tensor,
-    krot: torch.Tensor,
-    *,
-    scale: float,
-    pos0: int,
-    query_batch: int,
-) -> torch.Tensor:
-    """Exact latent-MLA attention with a bounded query workspace.
-
-    ``qa`` keeps the complete outer Prefill block.  Only the quadratic score
-    and softmax workspace is query-tiled; every tile attends to the complete
-    key/value range and therefore produces the same result as the full matrix.
-    """
-    heads, tokens, _ = qa.shape
-    sequence = int(ckv.shape[0])
-    query_batch = max(1, min(int(query_batch), int(tokens)))
-    output = torch.empty(
-        (heads, tokens, int(ckv.shape[1])),
-        dtype=ckv.dtype,
-        device=qa.device,
-    )
-    key_positions = (
-        torch.arange(sequence, device=qa.device)
-        if tokens > 1
-        else None
-    )
-    krot_t = krot.t()
-    ckv_t = ckv.t()
-    qrot = q_rot if q_rot.dtype == ckv.dtype else q_rot.to(ckv.dtype)
-    for start in range(0, tokens, query_batch):
-        stop = min(tokens, start + query_batch)
-        score_nope = qa[:, start:stop] @ ckv_t
-        score_rope = qrot[:, start:stop] @ krot_t
-        scores = merge_attention_scores(score_nope, score_rope, scale)
-        if key_positions is not None:
-            query_positions = torch.arange(
-                pos0 + start,
-                pos0 + stop,
-                device=qa.device,
-            )
-            causal = key_positions[None, :] > query_positions[:, None]
-            scores.masked_fill_(causal[None], float("-inf"))
-        attention = torch.softmax(scores, dim=-1)
-        output[:, start:stop].copy_(attention.to(ckv.dtype) @ ckv)
-    return output
-
-
+from .ops import attention_step
 from .precision import compute_dtype
 from .store import CCCPStore
 
@@ -229,6 +178,8 @@ class GLMModel:
             if self.requested_tp_size > 1
             else (self.device,)
         )
+        self.devices = routed_devices
+        self.device = self.devices[0]
         from .ops import create_routed_vq_runtime
 
         codebook_runtime = create_routed_vq_runtime(
@@ -241,6 +192,8 @@ class GLMModel:
             pin_gb=pin_gb,
         )
         self.routed_vq = codebook_runtime.executor
+        self._tp_mla = None
+        self._tp_rope: list[RopeCache] = []
         # 逻辑上下文可很大，但把整张 RoPE 表一次性放入每层 Graph 的公共
         # 工作集会拖慢短/中上下文。先固定 32K 地址窗口，跨界时成倍扩展并
         # 统一重捕获；这不改变 max_ctx 的逻辑准入上限。
@@ -313,7 +266,7 @@ class GLMModel:
         self._flashinfer_mla_unavailable = False
         self._flashinfer_mla_state = None
         self._direct_mla_bmm = (
-            os.environ.get("CCCP_GLM_DIRECT_BMM", "1") != "0"
+            os.environ.get("CCCP_DIRECT_BMM", "1") != "0"
         )
         try:
             from .fusedext import (
@@ -378,6 +331,7 @@ class GLMModel:
               flush=True)
         if self.latent_kv:
             self._build_absorbed()
+            self._prepare_tp_mla()
         if (
             self.routed_vq.resident_parallel_supported
             and self.routed_vq.preload_resident_if_fits()
@@ -423,6 +377,84 @@ class GLMModel:
         vram = torch.cuda.memory_allocated(self.device) / 2**30
         print(f"[cccp] MLA 吸收矩阵预分解完成（{time.time() - t0:.1f}s，"
               f"KV 潜变量模式 ≈0.09MB/token，显存 {vram:.1f}GB）", flush=True)
+
+    def _prepare_tp_mla(self) -> None:
+        """Register GLM topology with the shared latent-attention executor."""
+        if (
+            self.device.type != "cuda"
+            or len(self.devices) <= 1
+            or os.environ.get("CCCP_ATTENTION_TP", "1") == "0"
+            or os.environ.get("CCCP_MLA_TP", "1") == "0"
+        ):
+            return
+        from .ops import create_tensor_parallel
+        from .ops.tensor_parallel import MLASpec
+
+        c = self.cfg
+        executor = create_tensor_parallel("mla", devices=self.devices, spec=MLASpec(
+            hidden_size=c["hidden"],
+            heads=c["n_heads"],
+            q_lora_rank=c["q_lora_rank"],
+            kv_lora_rank=c["kv_lora_rank"],
+            qk_nope_head_dim=c["qk_nope_head_dim"],
+            qk_rope_head_dim=c["qk_rope_head_dim"],
+            v_head_dim=c["v_head_dim"],
+            max_ctx=self.max_ctx,
+            rms_eps=c["rms_eps"],
+            output_gate=False,
+        ))
+        for layer in range(c["n_layers"]):
+            prefix = f"model.layers.{layer}.self_attn"
+            executor.add_layer(
+                layer,
+                0,
+                ProjectionGroup((
+                    self.w(f"{prefix}.q_a_proj.weight"),
+                    self.w(f"{prefix}.kv_a_proj_with_mqa.weight"),
+                )),
+                self.w(f"{prefix}.q_a_layernorm.weight"),
+                self.w(f"{prefix}.q_b_proj.weight"),
+                self.w(f"{prefix}.kv_a_layernorm.weight"),
+                self._wuk[layer],
+                self._wuv[layer],
+                self.w(f"{prefix}.o_proj.weight"),
+            )
+            state = executor.layers[layer]
+            self._latent_buffers[layer] = (
+                state.latent_cache[0],
+                state.rope_cache[0],
+            )
+        self._tp_rope = []
+        for device in self.devices:
+            cache = RopeCache(
+                c["qk_rope_head_dim"],
+                c["rope_theta"],
+                max_len=int(self.rope.cos.shape[0]),
+            )
+            cache.cos = self.rope.cos.to(device)
+            cache.sin = self.rope.sin.to(device)
+            self._tp_rope.append(cache)
+        self._tp_mla = executor
+        print(
+            "[cccp-glm] 通用 MLA Head-TP Prefill 完成："
+            f"{c['n_layers']} 层×TP{len(self.devices)}；"
+            f"backend={executor.attention_backend}",
+            flush=True,
+        )
+
+    def _tp_mla_rotary(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        position: int,
+        rank: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        query, key = self._tp_rope[rank].apply(
+            query.transpose(0, 1),
+            key.unsqueeze(0),
+            position,
+        )
+        return query.transpose(0, 1), key[0]
 
     # ---- 权重访问（带缓存） ----
     def w(self, name: str):
@@ -489,6 +521,8 @@ class GLMModel:
     def reset_kv(self) -> None:
         self.kv = [None] * self.cfg["n_layers"]
         self._flashinfer_mla_state = None
+        if self._tp_mla is not None:
+            self._tp_mla.reset()
         self.pos = 0
 
     def _release_completed_scan_layer(self, layer: int) -> dict[str, int]:
@@ -627,17 +661,24 @@ class GLMModel:
         )
         return min(self.max_ctx, graph_window)
 
-    def _prepare_flashinfer_mla_decode(self, end: int):
-        """单 token 规划一次 FlashInfer MLA，随后 78 层复用。"""
+    def _prepare_paged_latent_attention(
+        self,
+        query_length: int,
+        end: int,
+    ):
+        """Resolve and prepare one public paged-latent operator plan."""
+        from .ops.mla_backend import select_cuda_mla_backend
+
         if (
             not self.latent_kv
             or self.cdt != torch.bfloat16
+            or select_cuda_mla_backend(flashinfer_ready=True)
+            != "flashinfer"
             or os.environ.get("CCCP_FLASHINFER_MLA", "1") == "0"
             or self._flashinfer_mla_unavailable
         ):
             return None
         from .flashinfer_mla import last_error
-        from .ops import attention_step
 
         if self._flashinfer_mla_runner is None:
             try:
@@ -657,31 +698,42 @@ class GLMModel:
             if self._flashinfer_mla_runner is None:
                 self._flashinfer_mla_unavailable = True
                 print(
-                    "[cccp] FlashInfer MLA 不可用，回退原 PyTorch MLA："
+                    "[cccp] 公共 paged latent attention 不可用："
                     f"{last_error()}",
                     flush=True,
                 )
                 return None
             print(
-                "[cccp] FlashInfer MLA decode 已启用（复用分离 latent KV）",
+                "[cccp] 公共 paged latent attention 已启用"
+                "（Prefill/Decode 复用分离 latent KV）",
                 flush=True,
             )
         runner = self._flashinfer_mla_runner
         if runner is None:
             return None
         try:
-            prepared = attention_step(
-                "paged_latent_prepare",
-                self.device.type,
-                runner=runner,
-                length=end,
+            prepared = (
+                attention_step(
+                    "paged_latent_prepare",
+                    self.device.type,
+                    runner=runner,
+                    length=end,
+                )
+                if int(query_length) == 1
+                else attention_step(
+                    "paged_latent_prepare_prefill",
+                    self.device.type,
+                    runner=runner,
+                    query_length=int(query_length),
+                    length=end,
+                )
             )
         except (LookupError, RuntimeError):
             prepared = False
         if not prepared:
             self._flashinfer_mla_unavailable = True
             print(
-                "[cccp] FlashInfer MLA 运行失败，回退原 PyTorch MLA："
+                "[cccp] 公共 paged latent attention 规划失败："
                 f"{last_error()}",
                 flush=True,
             )
@@ -698,6 +750,9 @@ class GLMModel:
             # Attention Graph 直接捕获 cos/sin 地址；扩容后只需在边界
             # 重捕获一次，不能继续重放旧地址。
             self._attention_graphs.clear()
+            for rank, cache in enumerate(self._tp_rope):
+                cache.cos = self.rope.cos.to(self.devices[rank])
+                cache.sin = self.rope.sin.to(self.devices[rank])
 
     # ---- 基本件 ----
     def _decode_workspace(
@@ -861,6 +916,19 @@ class GLMModel:
         pos0: int,
         input_norm_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self._tp_mla is not None and x.shape[0] > 1:
+            if input_norm_weight is not None:
+                x = rmsnorm(x, input_norm_weight, self.cfg["rms_eps"])
+            output = self._tp_mla.prefill_primary(
+                layer,
+                x.to(torch.bfloat16),
+                pos0,
+                rotary=self._tp_mla_rotary,
+            )
+            end = pos0 + int(x.shape[0])
+            ckv, krot = self._latent_buffers[layer]
+            self.kv[layer] = (ckv[:end], krot[:end])
+            return output.float()
         if self.latent_kv:
             return self._attention_latent(
                 x,
@@ -887,7 +955,7 @@ class GLMModel:
             and x.shape[0] == 1
             and layer >= 4
             and self._flashinfer_mla_state is not None
-            and os.environ.get("CCCP_GLM_QB_SPLIT", "1") != "0"
+            and os.environ.get("CCCP_QB_SPLIT", "1") != "0"
             and os.environ.get("CCCP_DECODE_WORKSPACES", "1") != "0"
         )
         if not graph_enabled:
@@ -1214,12 +1282,12 @@ class GLMModel:
                     and self._mla_bmm_decode is not None
                     and (
                         os.environ.get(
-                            "CCCP_GLM_CUBLAS_Q",
+                            "CCCP_CUBLAS_Q",
                             "0",
                         )
                         != "0"
                         or os.environ.get(
-                            "CCCP_GLM_CUBLAS_DECODE",
+                            "CCCP_CUBLAS_DECODE",
                             "0",
                         )
                         != "0"
@@ -1248,14 +1316,17 @@ class GLMModel:
                 q_nope.to(dt),
                 self._wuk[layer],
             )
-        flash_state = self._flashinfer_mla_state if T == 1 else None
+        flash_state = self._flashinfer_mla_state
         if flash_state is not None:
             from .flashinfer_mla import last_error
-            from .ops import attention_step
 
             page = flash_state.page_size
             flash_out = attention_step(
-                "paged_latent_decode",
+                (
+                    "paged_latent_decode"
+                    if T == 1
+                    else "paged_latent_prefill"
+                ),
                 self.device.type,
                 runner=flash_state,
                 query_nope=qa.transpose(0, 1),
@@ -1291,12 +1362,12 @@ class GLMModel:
                             and self._mla_bmm_decode is not None
                             and (
                                 os.environ.get(
-                                    "CCCP_GLM_CUBLAS_VALUE",
+                                    "CCCP_CUBLAS_VALUE",
                                     "1",
                                 )
                                 != "0"
                                 or os.environ.get(
-                                    "CCCP_GLM_CUBLAS_DECODE",
+                                    "CCCP_CUBLAS_DECODE",
                                     "0",
                                 )
                                 != "0"
@@ -1337,50 +1408,74 @@ class GLMModel:
             self._flashinfer_mla_unavailable = True
             self._flashinfer_mla_state = None
             print(
-                "[cccp] FlashInfer MLA kernel 失败，回退原 PyTorch MLA："
+                "[cccp] 公共 paged latent attention 执行失败："
                 f"{last_error()}",
                 flush=True,
             )
-        if T > 1:
-            workspace_mib = max(
-                128,
-                int(os.environ.get(
-                    "CCCP_GLM_PREFILL_ATTENTION_WORKSPACE_MIB",
-                    "512",
-                )),
+        if not getattr(self, "_glm_public_attention_announced", False):
+            print(
+                "[cccp-prefill] attention=cccp.paged-latent-cuda; "
+                f"outer tokens={T}; ordinary-bf16-fallback=forbidden",
+                flush=True,
             )
-            # Two BF16 score components, one FP32 merged score, FP32
-            # softmax, one BF16 cast and a small causal mask.  This estimate
-            # intentionally leaves allocator headroom on 24 GiB cards.
-            bytes_per_query = max(
-                1,
-                H * S * (2 + 2 + 4 + 4 + 2) + S,
+            self._glm_public_attention_announced = True
+        if T == 1:
+            position = self._decode_position
+            if position is None:
+                raise RuntimeError("CCCP native MLA decode position is missing")
+            score_workspace = self._decode_tensor_workspace(
+                layer,
+                "native_mla_scores",
+                (H, int(ckv_buffer.shape[0])),
+                torch.float32,
             )
-            query_batch = min(
-                T,
-                max(32, workspace_mib * 2**20 // bytes_per_query),
-            )
-            if query_batch >= 32:
-                query_batch = max(32, query_batch // 32 * 32)
-            if not getattr(self, "_glm_prefill_attention_announced", False):
-                print(
-                    "[cccp-prefill] attention=cuda.latent-mla-query-batched; "
-                    f"outer tokens={T}; query batch={query_batch}; "
-                    "single-token projection=forbidden",
-                    flush=True,
+            if score_workspace is None:
+                score_workspace = torch.empty(
+                    H,
+                    int(ckv_buffer.shape[0]),
+                    dtype=torch.float32,
+                    device=self.device,
                 )
-                self._glm_prefill_attention_announced = True
+            ctx = attention_step(
+                "compressed_kv_decode",
+                "cuda",
+                query_nope=qa.contiguous(),
+                query_rope=q_rot.to(dt).contiguous(),
+                latent_cache=ckv_buffer,
+                rope_cache=krot_buffer,
+                position=position,
+                scale_denominator=scale,
+                score_workspace=score_workspace,
+            )
         else:
-            query_batch = 1
-        ctx = _latent_attention_context_batched(
-            qa,
-            q_rot,
-            ckv,
-            krot,
-            scale=scale,
-            pos0=pos0,
-            query_batch=query_batch,
-        )
+            native_context = torch.empty(
+                T,
+                H,
+                c["kv_lora_rank"],
+                dtype=dt,
+                device=self.device,
+            )
+            native_context = attention_step(
+                "cccp_paged_latent_prefill",
+                "cuda",
+                query_nope=qa.transpose(0, 1).contiguous(),
+                query_rope=q_rot.to(dt).transpose(0, 1).contiguous(),
+                latent_cache=ckv_buffer,
+                rope_cache=krot_buffer,
+                query_start=pos0,
+                scale_denominator=scale,
+                output=native_context,
+            )
+            ctx = (
+                native_context.transpose(0, 1)
+                if native_context is not None
+                else None
+            )
+        if ctx is None:
+            raise RuntimeError(
+                "CCCP optimized paged latent CUDA attention is unavailable; "
+                "ordinary BF16 attention is forbidden"
+            )
         if self._direct_mla_bmm:
             out = (
                 self._mla_bmm_decode(
@@ -1399,12 +1494,12 @@ class GLMModel:
                     and self._mla_bmm_decode is not None
                     and (
                         os.environ.get(
-                            "CCCP_GLM_CUBLAS_VALUE",
+                            "CCCP_CUBLAS_VALUE",
                             "1",
                         )
                         != "0"
                         or os.environ.get(
-                            "CCCP_GLM_CUBLAS_DECODE",
+                            "CCCP_CUBLAS_DECODE",
                             "0",
                         )
                         != "0"
@@ -1725,10 +1820,9 @@ class GLMModel:
         self._ensure_latent_capacity(pos0 + len(ids))
         if len(ids) == 1 and self._decode_position is not None:
             self._decode_position.fill_(pos0)
-        self._flashinfer_mla_state = (
-            self._prepare_flashinfer_mla_decode(pos0 + len(ids))
-            if len(ids) == 1
-            else None
+        self._flashinfer_mla_state = self._prepare_paged_latent_attention(
+            len(ids),
+            pos0 + len(ids),
         )
         x = self.embed(ids)
         if self._prev_ids and len(ids) == 1 and os.environ.get("CCCP_PREFETCH", "1") != "0":

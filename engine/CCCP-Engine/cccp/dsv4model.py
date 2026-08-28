@@ -25,7 +25,6 @@ import torch.nn.functional as F
 from .dsv4cache import ContextCapacityError, PagedKV
 from .dsv4indexer import IndexerState
 from .prefill import (
-    batched_packed_prefill_available as _batched_packed_prefill_available,
     prefill_block_size,
     prefill_ranges as _prefill_ranges,
     run_prefill_blocks,
@@ -1440,7 +1439,7 @@ class DSV4CCCPModel:
             # stable expert addresses, so the TP1 parent graph is mandatory.
             self._single_gpu_layer_graph_requested = True
             os.environ["CCCP_SINGLE_GPU_LAYER_GRAPH"] = "1"
-            os.environ["CCCP_DSV4_TOKEN_GRAPH"] = "1"
+            os.environ["CCCP_TOKEN_GRAPH"] = "1"
         self._single_gpu_layer_graph = False
         if not self.store.man.projection_vq and self.tp_size != 1:
             raise ValueError(
@@ -2653,7 +2652,7 @@ class DSV4CCCPModel:
         if (
             (self.tp_size <= 1 and not self._single_gpu_layer_graph)
             or self._tp_shared_mlp is None
-            or os.environ.get("CCCP_DSV4_FULL_TP", "1") == "0"
+            or os.environ.get("CCCP_FULL_TP", "1") == "0"
         ):
             return
         if os.environ.get("CCCP_TP_HIDDEN", "0") == "0":
@@ -3574,73 +3573,21 @@ class DSV4CCCPModel:
                     self.routed_vq.cancel(pending_routed)
                 raise
             mark_moe("shared")
-            if B * T > 1 and _batched_packed_prefill_available(
-                self.routed_vq,
-                self._packed_full_gpu,
-            ):
+            if pending_routed is not None:
+                routed = self.routed_vq.finish(pending_routed)
+                pending_routed = None
+            else:
                 routed = self.routed_vq.execute(
                     layer,
                     x_rows,
-                    indices,
-                    weights,
+                    indices if B * T > 1 else indices[0],
+                    weights if B * T > 1 else weights[0],
                     activation=activation,
                     activation_beta=float(c.get("situ_beta", 4.0)),
                     activation_linear_beta=c.get("situ_linear_beta"),
                     limit=limit,
                 )
-                mark_moe("routed_batch")
-                output = (routed.to(shared.dtype) + shared).view(
-                    B, T, D
-                ).to(output_dtype)
-                mark_moe("merge")
-                if profile_moe:
-                    self._moe_profile_records.append(
-                        (layer, tuple(moe_events))
-                    )
-                return output
-            if B * T > 1 and self._packed_device_pool:
-                # A CUDA packed pool must never execute Prefill through the
-                # token-at-a-time decode path below.  That fallback silently
-                # turns an [N,K] prompt into N GEMV submissions per layer and
-                # has repeatedly hidden operator regressions behind a merely
-                # "slow" launch.  Decode remains width-one by definition;
-                # multi-token CUDA execution is a hard batched capability.
-                raise RuntimeError(
-                    "CUDA packed Prefill requires the batched run_rows "
-                    "operator; per-token GEMV fallback is forbidden"
-                )
-            routed_rows = []
-            for row in range(B * T):
-                if os.environ.get("CCCP_DEBUG_LAYER_TRACE", "0") != "0":
-                    print(
-                        f"[cccp-debug] moe layer {layer} row {row} "
-                        f"experts={indices[row].detach().cpu().tolist()}",
-                        flush=True,
-                    )
-                if row == 0 and pending_routed is not None:
-                    routed = self.routed_vq.finish(pending_routed)
-                    pending_routed = None
-                else:
-                    routed = self.routed_vq.execute(
-                        layer,
-                        x_rows[row : row + 1],
-                        indices[row],
-                        weights[row],
-                        activation=activation,
-                        activation_beta=float(c.get("situ_beta", 4.0)),
-                        activation_linear_beta=c.get(
-                            "situ_linear_beta"
-                        ),
-                        limit=limit,
-                    )
-                # Device expert pools intentionally return one fixed-address
-                # result workspace.  During a multi-token fallback every
-                # subsequent row overwrites that buffer, so retaining views
-                # aliases all Prefill rows to the final token and corrupts the
-                # model state.  Materialize each row before the next routed
-                # call; true row-batched pools bypass this fallback entirely.
-                routed_rows.append(routed.reshape(-1).clone())
-            mark_moe("routed")
+            mark_moe("routed_batch" if B * T > 1 else "routed")
             # Full-resident packed experts have nothing to prefetch.  Hybrid
             # pools expose the exact host route already resolved for compact
             # slots, so RAM/LRU mode must not pull the same IDs through a
@@ -3664,15 +3611,12 @@ class DSV4CCCPModel:
                         (layer, tuple(moe_events))
                     )
                 return (
-                    routed_rows[0].view(1, D),
+                    routed.reshape(1, D),
                     shared.reshape(1, D),
                 )
-            routed = (
-                routed_rows[0].view(1, D)
-                if len(routed_rows) == 1
-                else torch.stack(routed_rows)
-            ).to(shared.dtype)
-            output = (routed + shared).view(B, T, D).to(output_dtype)
+            output = (routed.to(shared.dtype) + shared).view(B, T, D).to(
+                output_dtype
+            )
             mark_moe("merge")
             if profile_moe:
                 self._moe_profile_records.append(
@@ -5717,7 +5661,7 @@ class DSV4CCCPModel:
         if (
             self.tp_size != 1
             or not self._single_gpu_layer_graph
-            or os.environ.get("CCCP_DSV4_TOKEN_GRAPH", "1") == "0"
+            or os.environ.get("CCCP_TOKEN_GRAPH", "1") == "0"
         ):
             return
         if (
@@ -6113,7 +6057,7 @@ class DSV4CCCPModel:
         if (
             self.tp_size <= 1
             or not self._packed_full_gpu
-            or os.environ.get("CCCP_DSV4_TP_ATTENTION_GRAPH", "1") == "0"
+            or os.environ.get("CCCP_TP_ATTENTION_GRAPH", "1") == "0"
             or self._tp_attention_contexts is None
             or self._tp_decode_input is None
         ):

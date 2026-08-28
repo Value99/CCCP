@@ -31,7 +31,7 @@ from .kimi_ops import (
 )
 from .precision import compute_dtype
 from .prefill import (
-    prefill_block_size_with_legacy,
+    prefill_block_size,
     run_prefill_blocks,
 )
 from .store import CCCPStore
@@ -1210,10 +1210,7 @@ class KimiK3CCCPModel:
             or self._tp_moe_prelude is not None
             or os.environ.get(
                 "CCCP_SHARED_MLP_TP",
-                os.environ.get(
-                    "CCCP_DENSE_TP",
-                    os.environ.get("CCCP_KIMI_DENSE_TP", "1"),
-                ),
+                os.environ.get("CCCP_DENSE_TP", "1"),
             ) == "0"
         ):
             return
@@ -1376,10 +1373,7 @@ class KimiK3CCCPModel:
             or self.config.first_dense_layers <= 0
             or os.environ.get(
                 "CCCP_FIRST_DENSE_TP",
-                os.environ.get(
-                    "CCCP_DENSE_TP",
-                    os.environ.get("CCCP_KIMI_DENSE_TP", "1"),
-                ),
+                os.environ.get("CCCP_DENSE_TP", "1"),
             ) == "0"
         ):
             return
@@ -2037,10 +2031,7 @@ class KimiK3CCCPModel:
     def _prepare_tp_kda(self) -> None:
         if (
             self._pipeline_plan is None
-            or os.environ.get(
-                "CCCP_ATTENTION_TP",
-                os.environ.get("CCCP_KIMI_ATTENTION_TP", "1"),
-            ) == "0"
+            or os.environ.get("CCCP_ATTENTION_TP", "1") == "0"
         ):
             return
         from .ops.tensor_parallel import KDASpec
@@ -2098,10 +2089,7 @@ class KimiK3CCCPModel:
     def _prepare_tp_mla(self) -> None:
         if (
             self._pipeline_plan is None
-            or os.environ.get(
-                "CCCP_ATTENTION_TP",
-                os.environ.get("CCCP_KIMI_ATTENTION_TP", "1"),
-            ) == "0"
+            or os.environ.get("CCCP_ATTENTION_TP", "1") == "0"
             or os.environ.get("CCCP_MLA_TP", "1") == "0"
         ):
             return
@@ -3731,8 +3719,8 @@ class KimiK3CCCPModel:
 
         overlap_shared = (
             (device.type == "cuda" or self._ram_dense_cuda)
-            and os.environ.get("CCCP_KIMI_OVERLAP_SHARED", "1") != "0"
-            and os.environ.get("CCCP_KIMI_LAYER_TIMING", "0") == "0"
+            and os.environ.get("CCCP_OVERLAP_SHARED", "1") != "0"
+            and os.environ.get("CCCP_LAYER_TIMING", "0") == "0"
             and (
                 (
                     self._ram_dense_cuda
@@ -4594,7 +4582,7 @@ class KimiK3CCCPModel:
             os.environ.get("CCCP_TP_HIDDEN_TIMING", "0") != "0"
         )
         cuda_event_profile = self._profile_enabled or (
-            os.environ.get("CCCP_KIMI_CUDA_EVENTS", "0") != "0"
+            os.environ.get("CCCP_CUDA_EVENTS", "0") != "0"
         )
         stage_profiler = None
         if cuda_event_profile:
@@ -4988,17 +4976,17 @@ class KimiK3CCCPModel:
             return self._forward_token_hidden(token)
         config = self.config
         profile = self._profile_enabled or (
-            os.environ.get("CCCP_KIMI_LAYER_TIMING", "0") != "0"
+            os.environ.get("CCCP_LAYER_TIMING", "0") != "0"
         )
         cuda_event_profile = (
             (
                 self._profile_enabled
-                or os.environ.get("CCCP_KIMI_CUDA_EVENTS", "0") != "0"
+                or os.environ.get("CCCP_CUDA_EVENTS", "0") != "0"
             )
             and self.device.type == "cuda"
         )
         profile_print = (
-            os.environ.get("CCCP_KIMI_LAYER_TIMING_PRINT", "0") != "0"
+            os.environ.get("CCCP_LAYER_TIMING_PRINT", "0") != "0"
         )
         layer_profile: list[dict[str, float | int]] = []
         cuda_events: list[
@@ -6016,44 +6004,11 @@ class KimiK3CCCPModel:
         """长后缀是否走分块批量 prefill（供引擎路由判断）。"""
         if not self._tp_hidden_state_ready:
             return True
-        return (
-            self._tp_hidden_state_ready
-            and os.environ.get("CCCP_KIMI_BATCHED_PREFILL", "1") != "0"
-            and self._prefill_tp_available()
-        )
+        return self._prefill_tp_available()
 
     @staticmethod
     def _prefill_linear(value: torch.Tensor, weight) -> torch.Tensor:
-        """Use the model-independent compact projection dispatcher.
-
-        ``CCCP_PREFILL_LINEAR=token`` is a diagnostic escape hatch.  It
-        deliberately invokes the same batch-one ``linear`` entry point as
-        decode for every row, which is useful when a batched GEMM/GEMV or
-        compact-weight reduction is suspected of causing numerical drift.
-        The production/default value (``batch``) retains the fast batched
-        dispatcher and is intentionally model-independent.
-        """
-        mode = os.environ.get("CCCP_PREFILL_LINEAR", "batch").strip().lower()
-        if mode in {"token", "decode", "strict"}:
-            if value.ndim < 2:
-                raise ValueError("token prefill linear expects batched input")
-            from .ops import linear
-
-            rows = value.reshape(-1, value.shape[-1])
-            if rows.shape[0] <= 1:
-                return linear(rows, weight, output_dtype=value.dtype)
-            outputs = [
-                linear(row.reshape(1, -1), weight, output_dtype=value.dtype)
-                for row in rows
-            ]
-            return torch.cat(outputs, dim=0).reshape(
-                *value.shape[:-1], outputs[0].shape[-1]
-            )
-        if mode not in {"batch", ""}:
-            raise ValueError(
-                "CCCP_PREFILL_LINEAR must be batch or token, got "
-                f"{mode!r}"
-            )
+        """Use the sole public batched compact projection dispatcher."""
         from .ops import linear_batch
 
         return linear_batch(value, weight)
@@ -6644,180 +6599,6 @@ class KimiK3CCCPModel:
             state.output_projection[rank],
         ).float()
 
-    def _prefill_mla_rank(
-        self,
-        layer: int,
-        rank: int,
-        value: torch.Tensor,
-        position: int,
-        paged_prefill: bool,
-    ) -> torch.Tensor:
-        """MLA 单 rank：批量投影、缓存写入与因果 latent attention。"""
-        from .ops import attention_step
-
-        executor = self._tp_mla
-        spec = executor.spec
-        state = executor.layers[layer]
-        device = self.devices[rank]
-        local_heads = executor.local_heads
-        rows = int(value.shape[0])
-        q_width = spec.qk_nope_head_dim + spec.qk_rope_head_dim
-        projected = self._prefill_linear(
-            value,
-            state.input_projection[rank],
-        ).to(torch.bfloat16)
-        query_source, compressed, output_gate = projected.split(
-            (
-                spec.q_lora_rank,
-                spec.kv_lora_rank + spec.qk_rope_head_dim,
-                local_heads * spec.v_head_dim,
-            ),
-            dim=-1,
-        )
-        query_source = rmsnorm(
-            query_source.contiguous(),
-            state.query_norm[rank],
-            1e-6,
-        )
-        query = (
-            self._prefill_linear(
-                query_source,
-                state.query_projection[rank],
-            )
-            .to(torch.bfloat16)
-            .view(rows, local_heads, q_width)
-        )
-        query_nope, query_rope = query.split(
-            (spec.qk_nope_head_dim, spec.qk_rope_head_dim),
-            dim=-1,
-        )
-        latent, key_rope = compressed.split(
-            (spec.kv_lora_rank, spec.qk_rope_head_dim),
-            dim=-1,
-        )
-        latent = rmsnorm(
-            latent.contiguous(),
-            state.kv_norm[rank],
-            1e-6,
-        )
-        positions = torch.arange(
-            position,
-            position + rows,
-            dtype=torch.long,
-            device=device,
-        )
-        state.latent_cache[rank].index_copy_(0, positions, latent)
-        state.rope_cache[rank].index_copy_(
-            0, positions, key_rope.contiguous()
-        )
-        # Keep heads as the BMM batch dimension.  Broadcasting ``matmul``
-        # over [tokens, heads, 1, width] can materialize a tokens×heads
-        # expansion (12 GiB at Kimi TP4/4096) before Split-KV starts.
-        absorbed = torch.bmm(
-            query_nope.transpose(0, 1).contiguous(),
-            state.key_absorb[rank],
-        ).transpose(0, 1)
-        contexts = torch.empty(
-            rows,
-            local_heads,
-            spec.kv_lora_rank,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        runners = executor._paged_runners
-        mla_backend = os.environ.get(
-            "CCCP_PREFILL_MLA_BACKEND", "auto"
-        ).strip().lower()
-        if mla_backend not in {
-            "auto",
-            "paged",
-            "causal",
-            "reference",
-        }:
-            raise ValueError(
-                "CCCP_PREFILL_MLA_BACKEND must be auto, paged, causal, "
-                f"or reference, got {mla_backend!r}"
-            )
-        context = None
-        if mla_backend == "reference":
-            # Bypass the registry (which may select Triton) so numerical
-            # diagnosis has a portable PyTorch reference independent of
-            # optional kernel registration and compiler state.
-            from .ops.attention_prefill import causal_latent_prefill
-
-            context = causal_latent_prefill(
-                query_nope=absorbed,
-                query_rope=query_rope,
-                latent_cache=state.latent_cache[rank],
-                rope_cache=state.rope_cache[rank],
-                query_start=position,
-                scale_denominator=float(q_width**0.5),
-                output=contexts,
-            )
-            self._prefill_stat_add("mla_reference_calls", 1)
-            self._prefill_stat_add("mla_reference_tokens", rows)
-        if (
-            context is None
-            and mla_backend in {"auto", "paged"}
-            and paged_prefill
-            and runners is not None
-        ):
-            runner = runners[rank]
-            page_size = int(runner.page_size)
-            latent_pages = state.latent_cache[rank].view(
-                executor._cache_capacity // page_size,
-                page_size,
-                spec.kv_lora_rank,
-            )
-            rope_pages = state.rope_cache[rank].view(
-                executor._cache_capacity // page_size,
-                page_size,
-                spec.qk_rope_head_dim,
-            )
-            context = attention_step(
-                "paged_latent_prefill",
-                "cuda",
-                runner=runner,
-                query_nope=absorbed,
-                query_rope=query_rope,
-                latent_cache=latent_pages,
-                rope_cache=rope_pages,
-                output=contexts,
-            )
-            if context is not None:
-                self._prefill_stat_add("mla_paged_calls", 1)
-                self._prefill_stat_add("mla_paged_tokens", rows)
-        if context is None and mla_backend != "paged":
-            context = attention_step(
-                "causal_latent_prefill",
-                "cuda",
-                query_nope=absorbed,
-                query_rope=query_rope,
-                latent_cache=state.latent_cache[rank],
-                rope_cache=state.rope_cache[rank],
-                query_start=position,
-                scale_denominator=float(q_width**0.5),
-                output=contexts,
-            )
-            if context is not None:
-                self._prefill_stat_add("mla_fallback_calls", 1)
-                self._prefill_stat_add("mla_fallback_tokens", rows)
-        elif context is None:
-            raise RuntimeError(
-                "TP MLA paged prefill backend was requested but unavailable"
-            )
-        if context is None:
-            raise RuntimeError("TP MLA 批量 prefill 注意力不可用")
-        output = torch.bmm(
-            contexts.transpose(0, 1).contiguous(),
-            state.value_absorb[rank].transpose(1, 2),
-        ).transpose(0, 1).reshape(rows, -1)
-        output.mul_(output_gate.sigmoid())
-        return self._prefill_linear(
-            output,
-            state.output_projection[rank],
-        ).float()
-
     def _prefill_route_reference(
         self,
         logits: torch.Tensor,
@@ -6920,21 +6701,10 @@ class KimiK3CCCPModel:
         # router logits 各 rank 持有互不重叠的专家切片，拼接即为全量；
         # latent 是 Row-TP 部分和，按 rank 0..R-1 定序 f32 求和。
         logits = self._prefill_gather(logit_slices, owner, reduce=False)
-        # Row-TP latent partials are already computed on every rank.  Publish
-        # the reduced latent replicas once and let the packed expert executor
-        # consume them in place; the old owner gather would copy [N,hidden]
-        # to one rank and broadcast the same bytes back to all ranks.
-        replicated_moe = os.environ.get("CCCP_KIMI_REPLICATED_MOE", "0") != "0"
-        if replicated_moe:
-            latent_replicas = self._prefill_reduce_all(latent_partials)
-            latent = latent_replicas[owner]
-        else:
-            # Preserve the measured owner path exactly while the replicated
-            # executor is behind its own numerical/performance gate.
-            latent = self._prefill_reduce_to_owner(
-                latent_partials,
-                owner,
-            )
+        # Row-TP latent partials are reduced once to rank-local replicas.  The
+        # same public Native8 Prefill executor used by every codebook model
+        # consumes those replicas directly; there is no owner-only alternate.
+        latent_replicas = self._prefill_reduce_all(latent_partials)
         with torch.cuda.device(owner_device):
             route = route_topk(
                 logits,
@@ -6956,63 +6726,24 @@ class KimiK3CCCPModel:
             weights, indices = route
             self._prefill_mark_end("moe_route", mark)
             mark = self._prefill_mark("moe_experts")
-            # The replicated executor is intentionally opt-in until its
-            # cross-rank numerical and throughput gates pass on every target
-            # GPU layout.  The proven owner path remains the default so a
-            # normal service launch cannot silently regress correctness.
-            if replicated_moe:
-                routed_replicas = self.routed_vq.execute_replicated(
-                    layer,
-                    latent_replicas,
-                    indices,
-                    weights,
-                    activation=self.operator_config.expert_activation,
-                    activation_beta=config.situ_beta,
-                    activation_linear_beta=config.situ_linear_beta,
-                    # Kimi's full-resident TP8 path has been measured with an
-                    # 8192-row scratch budget.  This is an explicit model policy;
-                    # the shared packed operator keeps the conservative 256
-                    # default for DSV4 and other callers.
-                    prefill_default=8192,
-                )
-                if config.latent_moe_use_norm:
-                    routed_replicas = tuple(
-                        rmsnorm(
-                            routed.to(torch.bfloat16),
-                            self._tp_routed_norm_weights[layer][rank],
-                            config.rms_eps,
-                        )
-                        for rank, routed in enumerate(routed_replicas)
-                    )
-            else:
-                routed = self.routed_vq.execute(
-                    layer,
-                    latent,
-                    indices,
-                    weights,
-                    activation=self.operator_config.expert_activation,
-                    activation_beta=config.situ_beta,
-                    activation_linear_beta=config.situ_linear_beta,
-                ).to(torch.bfloat16)
-                if config.latent_moe_use_norm:
-                    routed = rmsnorm(
-                        routed,
-                        self._tp_routed_norm_weights[layer][owner],
+            routed_replicas = self.routed_vq.execute_replicated(
+                layer,
+                latent_replicas,
+                indices,
+                weights,
+                activation=self.operator_config.expert_activation,
+                activation_beta=config.situ_beta,
+                activation_linear_beta=config.situ_linear_beta,
+            )
+            if config.latent_moe_use_norm:
+                routed_replicas = tuple(
+                    rmsnorm(
+                        routed.to(torch.bfloat16),
+                        self._tp_routed_norm_weights[layer][rank],
                         config.rms_eps,
                     )
-                routed_ready = torch.cuda.Event()
-                routed_ready.record(torch.cuda.current_stream(owner_device))
-                routed_replicas = []
-                for rank, device in enumerate(self.devices):
-                    with torch.cuda.device(device):
-                        stream = torch.cuda.current_stream(device)
-                        stream.wait_event(routed_ready)
-                        routed_replicas.append(
-                            routed
-                            if rank == owner
-                            else routed.to(device, non_blocking=True)
-                        )
-                routed_replicas = tuple(routed_replicas)
+                    for rank, routed in enumerate(routed_replicas)
+                )
         self._prefill_mark_end("moe_experts", mark)
         mark = self._prefill_mark("moe_up")
         routed_partials = []
@@ -7170,12 +6901,13 @@ class KimiK3CCCPModel:
                         )
                     else:
                         partials.append(
-                            self._prefill_mla_rank(
+                            self._tp_mla.prefill_rank(
                                 layer,
                                 rank,
                                 attention_inputs[rank],
                                 position,
                                 paged_mla,
+                                stat_add=self._prefill_stat_add,
                             )
                         )
             attentions = self._prefill_timed(
@@ -7253,15 +6985,9 @@ class KimiK3CCCPModel:
         return_last_only: bool = False,
     ) -> torch.Tensor:
         """分块批量 prefill：块大小与 packed MoE 微批上限对齐。"""
-        # The outer block is intentionally independent of the packed-MoE
-        # micro-batch (CCCP_PREFILL_MOE_BATCH).  Kimi requests an 8192 default
-        # in _prefill_moe_hidden; run_rows still bounds its activation
-        # workspace internally and an explicit environment override wins.
-        block = prefill_block_size_with_legacy(
-            "CCCP_KIMI_PREFILL_BLOCK",
-            default=8192,
-            minimum=2,
-        )
+        # Every codebook architecture uses the same outer block scheduler.
+        # The public routed-VQ executor owns its smaller internal micro-batch.
+        block = prefill_block_size(default=4096, minimum=2)
         self.last_prefill_stats = {
             "tokens": len(values),
             "block_size": block,
@@ -7359,12 +7085,11 @@ class KimiK3CCCPModel:
             and not self._tp_hidden_state_ready
         ):
             return self._forward_prefill_blocks_cpu(values)
-        if (
-            len(values) > 1
-            and self._tp_hidden_state_ready
-            and os.environ.get("CCCP_KIMI_BATCHED_PREFILL", "1") != "0"
-            and self._prefill_tp_available()
-        ):
+        if len(values) > 1 and self._tp_hidden_state_ready:
+            if not self._prefill_tp_available():
+                raise RuntimeError(
+                    "Kimi TP Prefill requires the public batched executor"
+                )
             return self._forward_prefill_blocks_tp(values)
         return torch.cat(
             [self._forward_token(int(token)) for token in values],
@@ -7419,12 +7144,11 @@ class KimiK3CCCPModel:
                 values,
                 return_last_only=True,
             )
-        elif (
-            len(values) > 1
-            and self._tp_hidden_state_ready
-            and os.environ.get("CCCP_KIMI_BATCHED_PREFILL", "1") != "0"
-            and self._prefill_tp_available()
-        ):
+        elif len(values) > 1 and self._tp_hidden_state_ready:
+            if not self._prefill_tp_available():
+                raise RuntimeError(
+                    "Kimi TP Prefill requires the public batched executor"
+                )
             hidden = self._forward_prefill_blocks_tp(
                 values,
                 return_last_only=True,

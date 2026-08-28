@@ -43,8 +43,7 @@
       "description": "文本 Dense 与压缩专家完整常驻单卡显存",
       "tp": 1,
       "environment": {
-        "CCCP_FULL_RESIDENT": "1",
-        "CCCP_RESIDENT_NATIVE8_PREFILL": "1"
+        "CCCP_FULL_RESIDENT": "1"
       }
     },
     "parallel": {
@@ -53,8 +52,7 @@
       "environment": {
         "CCCP_FULL_RESIDENT": "1",
         "CCCP_PACKED_FULL_GPU": "1",
-        "CCCP_MOE_PARALLELISM": "tensor",
-        "CCCP_RESIDENT_NATIVE8_PREFILL": "1"
+        "CCCP_MOE_PARALLELISM": "tensor"
       }
     }
   }

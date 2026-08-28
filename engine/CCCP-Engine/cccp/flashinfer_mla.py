@@ -1,7 +1,8 @@
-"""FlashInfer MLA decode 的可选适配层。
+"""Linux/CUDA 的首选 FlashInfer MLA 适配层。
 
-适配层直接复用 CCCP 原有的分离 cKV/kPE 缓冲。依赖缺失、显式关闭或运行
-失败时返回 ``None``，调用方继续执行原 PyTorch MLA 路径。
+适配层直接复用 CCCP 的分离 cKV/kPE 缓冲。依赖缺失、显式关闭或执行失败
+时返回 ``None``，调用方只能选择 CCCP 自带的 paged latent CUDA 算子；原生
+Windows 从不进入本适配层，也不允许静默落入普通 PyTorch BF16 Attention。
 """
 
 from __future__ import annotations

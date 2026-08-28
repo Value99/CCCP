@@ -50,12 +50,11 @@
       "tp": 1,
       "environment": {
         "CCCP_PACKED_FULL_GPU": "1",
-        "CCCP_RESIDENT_NATIVE8_PREFILL": "1",
         "CCCP_ROUTED_WARPS": "8",
         "CCCP_RAM_MIRROR": "0",
         "CCCP_DENSE_BF16": "all",
         "CCCP_SINGLE_GPU_LAYER_GRAPH": "1",
-        "CCCP_DSV4_TOKEN_GRAPH": "1",
+        "CCCP_TOKEN_GRAPH": "1",
         "CCCP_TP_LAYER_GRAPH": "1",
         "CCCP_TP_HIDDEN": "1",
         "CCCP_TP_NO_OWNER": "1"
@@ -75,7 +74,7 @@
         "CCCP_RAM_MIRROR": "0",
         "CCCP_DENSE_BF16": "none",
         "CCCP_SINGLE_GPU_LAYER_GRAPH": "0",
-        "CCCP_DSV4_TOKEN_GRAPH": "0",
+        "CCCP_TOKEN_GRAPH": "0",
         "CCCP_TP_LAYER_GRAPH": "0"
       }
     },
@@ -91,7 +90,7 @@
         "CCCP_TP_EVENT_BARRIER": "1",
         "CCCP_TP_HC_LAYER_PLAN": "1",
         "CCCP_TP_PARALLEL_LAUNCH": "0",
-        "CCCP_DSV4_FULL_TP": "1",
+        "CCCP_FULL_TP": "1",
         "CCCP_SHARED_MLP_TP": "1",
         "CCCP_ROUTED_WARPS": "8",
         "CCCP_RAM_MIRROR": "0"
@@ -109,7 +108,7 @@
         "CCCP_TP_EVENT_BARRIER": "1",
         "CCCP_TP_HC_LAYER_PLAN": "1",
         "CCCP_TP_PARALLEL_LAUNCH": "0",
-        "CCCP_DSV4_FULL_TP": "1",
+        "CCCP_FULL_TP": "1",
         "CCCP_SHARED_MLP_TP": "1",
         "CCCP_ROUTED_WARPS": "8",
         "CCCP_RAM_MIRROR": "0"
@@ -126,7 +125,7 @@
         "CCCP_TP_FUSED_MOE_FINALIZE": "1",
         "CCCP_TP_EVENT_BARRIER": "1",
         "CCCP_TP_HC_LAYER_PLAN": "1",
-        "CCCP_DSV4_FULL_TP": "1",
+        "CCCP_FULL_TP": "1",
         "CCCP_SHARED_MLP_TP": "1",
         "CCCP_ROUTED_WARPS": "8",
         "CCCP_RAM_MIRROR": "0"

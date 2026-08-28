@@ -8,30 +8,58 @@
   <a href="README.md">简体中文</a> · <a href="README_EN.md">English</a> · <strong>Русский</strong>
 </p>
 
-## ⬇️ Полный автономный пакет для Windows (v0.9.13)
+## ⬇️ Полный автономный пакет для Windows (v0.9.15)
 
 > [!IMPORTANT]
 > Для первого запуска загрузите полный автономный пакет, а не только `CCCP-Launcher.exe`. Python, Miniconda, среды CPU/CUDA/AMD, готовые операторы NVIDIA и зависимости уже включены.
 
-### [👉 Открыть страницу загрузки GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.13)
+### [👉 Открыть страницу загрузки GitHub Release](https://github.com/Value99/CCCP/releases/tag/v0.9.15)
 
 Сохраните эти **6 файлов** в одной папке:
 
-1. `CCCP-Launcher-0.9.13-Offline-Setup.exe`
-2. `CCCP-Launcher-v0.9.13-offline.parts.json`
-3. `CCCP-Launcher-v0.9.13-win-x64-offline.zip.001`
-4. `CCCP-Launcher-v0.9.13-win-x64-offline.zip.002`
-5. `CCCP-Launcher-v0.9.13-win-x64-offline.zip.003`
-6. `CCCP-Launcher-v0.9.13-win-x64-offline.zip.004`
+1. `CCCP-Launcher-0.9.15-Offline-Setup.exe`
+2. `CCCP-Launcher-v0.9.15-offline.parts.json`
+3. `CCCP-Launcher-v0.9.15-win-x64-offline.zip.001`
+4. `CCCP-Launcher-v0.9.15-win-x64-offline.zip.002`
+5. `CCCP-Launcher-v0.9.15-win-x64-offline.zip.003`
+6. `CCCP-Launcher-v0.9.15-win-x64-offline.zip.004`
 
-Запустите `CCCP-Launcher-0.9.13-Offline-Setup.exe`. Установщик проверит, объединит и распакует пакет. Веса моделей распространяются отдельно.
+Запустите `CCCP-Launcher-0.9.15-Offline-Setup.exe`. Установщик проверит, объединит и распакует пакет. Веса моделей распространяются отдельно.
 
-### Главное в версии 0.9.13
+### Главное в версии 0.9.15
 
 - Все модели с кодовыми книгами используют один CUDA Decode: packed-индексы + Q8-кодовые книги + слитый DP4A; Prefill выбирает общий packed-VQ либо E4M3/FP8 grouped путь.
+- Linux/CUDA в первую очередь использует FlashInfer MLA; нативный Windows/CUDA явно использует встроенный CCCP paged latent CUDA-оператор без скрытого отката на обычный BF16 Attention.
 - DSV4, Qwen, GLM и Kimi описывают структуру в манифесте и используют одну математику кодовых книг, планирование памяти и кэш без удаления экспертов.
 - Удалены однотокенный E4M3 MoE Decode и другие старые ветви; исправлены жизненный цикл Kimi/MTP и сборка CUDA из путей с не-ASCII символами.
-- Измерено на H20-3e со встроенной CUDA 13 (Prefill/Decode, token/s): Qwen 2323.66/55.18 (TP1, 4096-token Prefill)、DSV4 2611.86/46.22 (TP1, 4096-token Prefill)、GLM Flash S 1503.56/30.01 (TP1, 4096-token Prefill)、GLM Flash M 1268.54/20.27 (TP2, 4096-token Prefill)、Kimi 608.03/15.25 (TP4, 4096-token Prefill). Все модели проходят пороги производительности и проверку конечных logits.
+- Измерено на H20-3e со встроенной CUDA 13 (Prefill/Decode, token/s): Qwen 2462.68/56.94 (TP1, 4096-token Prefill)、DSV4 2786.87/46.23 (TP1, 4096-token Prefill)、GLM-5.2 932.36/25.48 (TP4, 4096-token Prefill)、GLM Flash S 1504.67/30.02 (TP1, 4096-token Prefill)、GLM Flash M 1282.44/20.22 (TP2, 4096-token Prefill)、Kimi 672.04/15.69 (TP4, 4096-token Prefill). Все модели проходят пороги производительности и проверку конечных logits.
+
+<!-- CCCP_PERFORMANCE_START -->
+## Измеренная производительность
+
+Результаты проверены на H20-3e со встроенной CUDA 13: Prefill 4096 токенов и Decode после контекста 4096 токенов.
+
+![CCCP 0.9.15 H20-3e performance](assets/cccp-performance-v0.9.15.svg)
+
+| Полное имя модели | Параллелизм | Prefill token/s | Decode token/s |
+|---|---:|---:|---:|
+| Qwen3.8 27B CCCP-L | TP1 | 2462.68 | 56.94 |
+| DeepSeek V4 CCCP-S | TP1 | 2786.87 | 46.23 |
+| GLM-5.2 CCCP | TP4 | 932.36 | 25.48 |
+| GLM-5.3-Flash CCCP-S | TP1 | 1504.67 | 30.02 |
+| GLM-5.3-Flash CCCP-M | TP2 | 1282.44 | 20.22 |
+| Kimi K3 CCCP-470 | TP4 | 672.04 | 15.69 |
+<!-- CCCP_PERFORMANCE_END -->
+
+<!-- CCCP_AI_MAINTENANCE_START -->
+## Подсказка для AI по сопровождению
+
+> Спасибо всем тестировщикам и участникам. Различия моделей и конфигураций всё ещё могут выявлять ошибки совместимости; передайте этот блок AI вместе с журналами:
+
+```text
+Maintain CCCP Launcher 0.9.15. First read the bundled user-facing manuals docs/中文使用手册.md and docs/依赖与离线环境说明.md, then inspect the launcher terminal log and engine/CCCP-Engine. Reproduce with the bundled CPU/CUDA/AMD runtime and portable compiler only; do not use host Python, host CUDA, model-name branches, silent slow fallbacks, or the private quantization framework. Treat model configuration differences as data from cccp.json. Repair or simplify the public VQ, tensor-parallel, MLA, MoE, memory-planning, or launcher layer that owns the fault. Require finite logits, actual generation, clean process shutdown, and no regression against these H20-3e / bundled CUDA 13 baselines (Prefill/Decode): Qwen3.8 27B CCCP-L TP1 2462.68/56.94 token/s, DeepSeek V4 CCCP-S TP1 2786.87/46.23 token/s, GLM-5.2 CCCP TP4 932.36/25.48 token/s, GLM-5.3-Flash CCCP-S TP1 1504.67/30.02 token/s, GLM-5.3-Flash CCCP-M TP2 1282.44/20.22 token/s, Kimi K3 CCCP-470 TP4 672.04/15.69 token/s. H20 is only an approximate RTX 3090-class compute reference; VRAM capacity and memory bandwidth are not equivalent. Preserve CPU and existing Qwen, DeepSeek V4, GLM-5.2, GLM-5.3-Flash, and Kimi paths. Prefer deleting the broken duplicate branch after the shared path passes tests. Report exact commands, logs, finite-value checks, throughput, changed files, and package verification.
+```
+<!-- CCCP_AI_MAINTENANCE_END -->
 
 ## Основные преимущества
 
@@ -125,7 +153,7 @@ CCCP использует настройку маршрутизации: кор�
 
 ## Быстрый старт
 
-1. Скачайте Offline Setup, манифест частей и все четыре части из [GitHub Release v0.9.13](https://github.com/Value99/CCCP/releases/tag/v0.9.13).
+1. Скачайте Offline Setup, манифест частей и все четыре части из [GitHub Release v0.9.15](https://github.com/Value99/CCCP/releases/tag/v0.9.15).
 2. Запустите Offline Setup из каталога с правом записи и дождитесь проверки и распаковки.
 3. Поместите совместимую модель с файлом `cccp.json` в каталог `models` рядом с приложением.
 4. Дважды щёлкните `CCCP-Launcher.exe`.
@@ -210,8 +238,8 @@ for chunk in stream:
 | Windows 11 x64 · Core i9-13900H · 31,59 GiB RAM | Запускатор, EXE, CPU-инференс, OpenAI API, профили, реальная генерация, автоматические тесты и smoke-тест пакета | **CPU-функциональность пройдена**; скорость огромных моделей на CPU зависит от пропускной способности RAM и не смешивается с результатами H20 |
 | Windows 11 · NVIDIA RTX 3090 (лимит процесса 20 GiB) · CUDA 13 | DeepSeek-V4 в режиме ограниченной VRAM CUDA/RAM, прямая передача из locked RAM, strict LRU, fused decode и многотуровая генерация | **Аппаратный тест 0.9.2 пройден** |
 | NVIDIA RTX 5090 | Реальные CUDA/RAM-тесты DeepSeek-V4 и GLM-5.2 | **Движок протестирован** |
-| Linux · NVIDIA H20-3e · TP1 | Встроенная CUDA 13; Prefill 4096 токенов / Decode с контекста 4096 | **Qwen 2323.66/55.18, DSV4 2611.86/46.22 token/s**; пороги 0.9.13 и finite-logits пройдены |
-| NVIDIA H20-3e · протоколы выпуска | GLM Flash S TP1, GLM Flash M TP2, Kimi TP4 (GPU 2/3/4/5); Prefill 4096 / Decode с контекста 4096 | **GLM S 1503.56/30.01, GLM M 1268.54/20.27, Kimi 608.03/15.25 token/s**; пороги 0.9.13 и finite-logits пройдены |
+| Linux · NVIDIA H20-3e · TP1 | Встроенная CUDA 13; Prefill 4096 токенов / Decode с контекста 4096 | **Qwen 2462.68/56.94, DSV4 2786.87/46.23 token/s**; пороги 0.9.15 и finite-logits пройдены |
+| NVIDIA H20-3e · протоколы выпуска | GLM-5.2 TP4, GLM Flash S TP1, GLM Flash M TP2, Kimi TP4 (GPU 2/3/4/5); Prefill 4096 / Decode с контекста 4096 | **GLM-5.2 932.36/25.48, GLM S 1504.67/30.02, GLM M 1282.44/20.22, Kimi 672.04/15.69 token/s**; пороги 0.9.15 и finite-logits пройдены |
 | Двухсокетный CPU-сервер (96 физических ядер) | Qwen3.5 27B Dense VQ, NUMA-разделение Q4 и 64-токенный Decode | **Исторический результат 0.9.4: 9,77 token/s**; это не текущий тест и обещания 30 token/s нет |
 | Windows CUDA 13.0 / `sm_120` | Полная компиляция NVCC, линковка и загрузка модуля | **Цепочка сборки пройдена**; граница проверки — загрузка модуля |
 | Windows ROCm 7.2.1 / `gfx1151` | HIPIFY, генерация кода устройства, линковка и загрузка модуля | **Цепочка сборки пройдена**; аппаратная проверка AMD запланирована |
@@ -255,7 +283,7 @@ $release.launcher.sha256
 
 ## Ссылки
 
-- Скачать: [GitHub Release v0.9.13](https://github.com/Value99/CCCP/releases/tag/v0.9.13)
+- Скачать: [GitHub Release v0.9.15](https://github.com/Value99/CCCP/releases/tag/v0.9.15)
 - Сообщество: [Discord](https://discord.gg/eNnwmAUY4M)
 - Модели: [ModelScope · ValueFX](https://www.modelscope.cn/profile/ValueFX)
 - Страница проекта: [GitHub · Value99/CCCP](https://github.com/Value99/CCCP)

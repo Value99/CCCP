@@ -90,9 +90,7 @@
         "CCCP_TP_LAYER_GRAPH": "1",
         "CCCP_TP_MOE_PLAN": "1",
         "CCCP_TP_DECODE_LAYER_PLAN": "0",
-        "CCCP_MOE_ROUTE_DOWN_TP": "1",
-        "CCCP_KIMI_REPLICATED_MOE": "1",
-        "CCCP_RESIDENT_NATIVE8_PREFILL": "1"
+        "CCCP_MOE_ROUTE_DOWN_TP": "1"
       }
     },
     "parallel_tp4": {
@@ -107,9 +105,7 @@
         "CCCP_TP_LAYER_GRAPH": "1",
         "CCCP_TP_MOE_PLAN": "1",
         "CCCP_TP_DECODE_LAYER_PLAN": "0",
-        "CCCP_MOE_ROUTE_DOWN_TP": "1",
-        "CCCP_KIMI_REPLICATED_MOE": "1",
-        "CCCP_RESIDENT_NATIVE8_PREFILL": "1"
+        "CCCP_MOE_ROUTE_DOWN_TP": "1"
       }
     },
     "parallel_tp8": {
@@ -127,10 +123,7 @@
         "CCCP_TP_FUSED_MOE_FINALIZE": "1",
         "CCCP_TP_EVENT_BARRIER": "1",
         "CCCP_MOE_ROUTE_DOWN_TP": "1",
-        "CCCP_KIMI_REPLICATED_MOE": "1",
-        "CCCP_RESIDENT_NATIVE8_PREFILL": "1",
-        "CCCP_PREFILL_MOE_BATCH": "4096",
-        "CCCP_KIMI_PREFILL_BLOCK": "4096"
+        "CCCP_PREFILL_MOE_BATCH": "4096"
       }
     }
   }

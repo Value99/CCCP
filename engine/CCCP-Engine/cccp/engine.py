@@ -1452,42 +1452,8 @@ class Engine:
         media_state: object = None,
         media_slots: object = (),
     ) -> torch.Tensor:
-        """Prefill a short GLM prompt or exact-prefix chat suffix.
-
-        Full-GPU CodeGEMM stores experts in its decode-optimized Psumbook
-        layout.  The old multi-token path unpacked hundreds of routed experts
-        per layer for a normal 30-50 token follow-up.  Replaying the already
-        fused single-token path is substantially faster and also measures
-        closer to the FP8 KLD baseline.  Keep RAM expert mode and large
-        prefill batches unchanged: their cache/H2D reuse has different costs.
-        """
+        """Prefill a GLM/Kimi suffix through the public batched executor."""
         suffix = ids[skip:]
-        routed_vq = getattr(self.model, "routed_vq", None)
-        try:
-            max_sequential = int(os.environ.get(
-                "CCCP_GLM_SEQUENTIAL_PREFILL_MAX",
-                "512",
-            ))
-        except ValueError:
-            max_sequential = 0
-        # kimi_k3 的批量 prefill 在全部已测规模上都快于逐 token 回放
-        #（130 tok：2.7s vs 8.4s），具备批量能力时不再走短后缀逐 token
-        # 策略；GLM 的 CodeGEMM 布局结论不变（无 prefill_batch_available）。
-        batch_available = getattr(
-            self.model, "prefill_batch_available", None
-        )
-        sequential = (
-            0 < len(suffix) <= max_sequential
-            and getattr(self.model, "device", torch.device("cpu")).type
-            == "cuda"
-            and os.environ.get(
-                "CCCP_GLM_SEQUENTIAL_PREFILL",
-                "1",
-            )
-            != "0"
-            and bool(routed_vq is not None and routed_vq.full_resident)
-            and not (callable(batch_available) and batch_available())
-        )
         if media_state is not None and getattr(self, "arch", "glm") == "kimi_k3":
             hidden = self.model.forward_hidden(
                 suffix,
@@ -1495,56 +1461,7 @@ class Engine:
                 media_slots=media_slots,
             )
             return self.model.logits_of(hidden[-1:]).squeeze(0)
-        if not sequential:
-            #（prefill_batch_available 探测）时，forward() 经 forward_hidden
-            # 自动分流到分块批量路径；未就绪时维持逐 token 回放，行为不变。
-            return self.model.forward(suffix)
-        if skip == 0:
-            graph_target = max(
-                0,
-                int(
-                    getattr(self.model, "cfg", {}).get(
-                        "n_layers",
-                        4,
-                    )
-                )
-                - 4,
-            )
-            graph_needs_warmup = (
-                graph_target > 0
-                and os.environ.get(
-                    "CCCP_ATTENTION_GRAPH",
-                    "1",
-                )
-                != "0"
-                and os.environ.get(
-                    "CCCP_GLM_QB_SPLIT",
-                    "1",
-                )
-                != "0"
-                and not getattr(
-                    self.model,
-                    "_attention_graph_failed",
-                    False,
-                )
-                and len(
-                    getattr(
-                        self.model,
-                        "_attention_graphs",
-                        {},
-                    )
-                )
-                < graph_target
-            )
-            if graph_needs_warmup:
-                # Capture with a sacrificial token before it can influence
-                # the real prompt state, then retain only the stable graphs.
-                self.model.forward(suffix[:1])
-                torch.cuda.synchronize(self.model.device)
-                self.reset()
-        for token in suffix[:-1]:
-            self.model.forward_hidden([token])
-        return self.model.forward(suffix[-1:])
+        return self.model.forward(suffix)
 
     def _media_cache_matches(
         self,
@@ -2335,7 +2252,7 @@ class Engine:
                 )
                 != "0"
                 and os.environ.get(
-                    "CCCP_GLM_QB_SPLIT",
+                    "CCCP_QB_SPLIT",
                     "1",
                 )
                 != "0"
@@ -2392,7 +2309,7 @@ class Engine:
                     )
                     != "0"
                     and os.environ.get(
-                        "CCCP_GLM_QB_SPLIT",
+                        "CCCP_QB_SPLIT",
                         "1",
                     )
                     != "0"

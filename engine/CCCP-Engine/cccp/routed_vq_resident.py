@@ -31,19 +31,17 @@ from .ops.codebook import (
 from .prefill import prefill_moe_batch_size
 
 
-def _dequant_scratch_bytes(
-    expert_count: int,
-    local_inter: int,
-    hidden: int,
-) -> int:
-    """Return BF16 bytes for gate/up and down dense scratch."""
-    return (
-        int(expert_count)
-        * int(local_inter)
-        * int(hidden)
-        * 3
-        * 2
-    )
+def _capacity_prefix_matrix(
+    storage: torch.Tensor,
+    *,
+    rows: int,
+    columns: int,
+) -> torch.Tensor:
+    """View the active matrix in a larger contiguous capacity slab."""
+    required = int(rows) * int(columns)
+    if not storage.is_contiguous() or required > storage.numel():
+        raise ValueError("active matrix exceeds its contiguous capacity slab")
+    return storage.view(-1)[:required].view(int(rows), int(columns))
 
 
 def _native8_residency_supported(
@@ -219,6 +217,7 @@ _ROOT = "language_model"
 
 @dataclass(frozen=True)
 class RoutedVQLayoutPlan:
+    runtime_layers: tuple[int, ...]
     ranges: tuple[tuple[int, int], ...]
     owner_by_layer: tuple[int, ...]
     bytes_by_rank: tuple[int, ...]
@@ -234,20 +233,6 @@ class RoutedVQLayoutPlan:
 
 
 @dataclass
-class _PackedPrefillWorkspace:
-    """Bounded rank-local scratch for exact row-batched packed MoE."""
-
-    capacity: int
-    top_k: int
-    inputs: torch.Tensor
-    route_ids: torch.Tensor
-    route_weights: torch.Tensor
-    hidden: torch.Tensor
-    output: torch.Tensor
-    result: torch.Tensor
-
-
-@dataclass
 class _Native8PrefillRankWorkspace:
     """Small TP transport scratch; FP8 GEMM owns the projection buffers."""
 
@@ -256,16 +241,6 @@ class _Native8PrefillRankWorkspace:
     inputs: torch.Tensor
     route_ids: torch.Tensor
     route_weights: torch.Tensor
-    result: torch.Tensor
-
-
-@dataclass
-class _GroupedPrefillWorkspace:
-    token_ids: torch.Tensor
-    weights: torch.Tensor
-    group_experts: torch.Tensor
-    group_offsets: torch.Tensor
-    hidden: torch.Tensor
     result: torch.Tensor
 
 
@@ -348,30 +323,97 @@ def build_routed_vq_layer_plan(store, tp_size: int) -> RoutedVQLayoutPlan:
             os.path.join(store.root, filename)
         )
         audit_name = store.man.expert_audit_files.get(layer)
-        if audit_name is None:
+        n_experts = int(store.cfg.get("n_experts", 0))
+        if audit_name is not None:
+            with open(
+                os.path.join(store.root, audit_name),
+                "r",
+                encoding="utf-8",
+            ) as handle:
+                audit = json.load(handle)
+            experts = audit.get("experts", {})
+            maximum = max(
+                (
+                    int(str(expert_id).lstrip("e"))
+                    for expert_id in experts
+                ),
+                default=-1,
+            )
+            n_experts = int(store.cfg.get("n_experts", maximum + 1))
+            payloads = [0] * n_experts
+            for expert_id, item in experts.items():
+                index = int(str(expert_id).lstrip("e"))
+                payloads[index] = _expert_audit_payload_bytes(item)
+            complete_payload_bytes = sum(payloads)
+            auxiliary_bytes = max(
+                0,
+                expert_file_by_layer[layer] - complete_payload_bytes,
+            )
+        elif (
+            bool(getattr(store.man, "expert_codebook_vq", False))
+            and not bool(getattr(store.man, "projection_vq", False))
+        ):
+            if n_experts <= 0:
+                raise ValueError("combined codebook archive has no experts")
+            hidden = int(store.cfg["hidden"])
+            intermediate = int(store.cfg["moe_inter"])
+            payloads = []
+            used_kinds: set[str] = set()
+            for expert_id in range(n_experts):
+                kind = str(store.expert_kind(layer, expert_id))
+                if kind == "drop":
+                    payloads.append(0)
+                    continue
+                base_kind = kind.rstrip("z")
+                try:
+                    dim, codebook_size = store.man.vq_dims[base_kind]
+                except KeyError as error:
+                    raise ValueError(
+                        f"L{layer}/e{expert_id} references unknown VQ kind "
+                        f"{base_kind!r}"
+                    ) from error
+                dim = int(dim)
+                codebook_size = int(codebook_size)
+                if (
+                    dim <= 0
+                    or hidden % dim
+                    or intermediate % dim
+                    or codebook_size <= 0
+                ):
+                    raise ValueError(
+                        f"L{layer}/e{expert_id} has invalid combined VQ "
+                        f"geometry dim={dim}, size={codebook_size}"
+                    )
+                index_bits = (codebook_size - 1).bit_length()
+                index_count = (
+                    2 * intermediate * (hidden // dim)
+                    + hidden * (intermediate // dim)
+                )
+                packed_bits = index_count * index_bits
+                if packed_bits % 8:
+                    raise ValueError(
+                        f"L{layer}/e{expert_id} combined VQ payload is not "
+                        "byte aligned"
+                    )
+                payloads.append(packed_bits // 8)
+                used_kinds.add(base_kind)
+            complete_payload_bytes = sum(payloads)
+            # Combined archives keep one Gate/Up and one Down codebook for
+            # every concrete tier. Charge their uncompressed BF16 footprint
+            # even when zlib makes the physical shard smaller than its arena.
+            codebook_bytes = sum(
+                2 * int(dim) * int(size) * 2
+                for kind, (dim, size) in store.man.vq_dims.items()
+                if str(kind) in used_kinds
+            )
+            auxiliary_bytes = max(
+                codebook_bytes,
+                expert_file_by_layer[layer] - complete_payload_bytes,
+            )
+        else:
             raise ValueError(
                 f"packed residency requires expert audit for layer {layer}"
             )
-        with open(
-            os.path.join(store.root, audit_name),
-            "r",
-            encoding="utf-8",
-        ) as handle:
-            audit = json.load(handle)
-        experts = audit.get("experts", {})
-        maximum = max(
-            (
-                int(str(expert_id).lstrip("e"))
-                for expert_id in experts
-            ),
-            default=-1,
-        )
-        n_experts = int(store.cfg.get("n_experts", maximum + 1))
-        payloads = [0] * n_experts
-        for expert_id, item in experts.items():
-            index = int(str(expert_id).lstrip("e"))
-            payloads[index] = _expert_audit_payload_bytes(item)
-        complete_payload_bytes = sum(payloads)
         allowlist = getattr(store, "route_allowlist", None)
         if allowlist is not None:
             allowed = allowlist.get(int(layer), set())
@@ -381,19 +423,25 @@ def build_routed_vq_layer_plan(store, tp_size: int) -> RoutedVQLayoutPlan:
             ]
         expert_payload_by_expert[layer] = tuple(payloads)
         expert_payload_by_layer[layer] = sum(payloads)
-        if allowlist is not None and complete_payload_bytes > 0:
-            selected_file_bytes = (
-                expert_file_by_layer[layer]
-                * expert_payload_by_layer[layer]
-                + complete_payload_bytes
-                - 1
-            ) // complete_payload_bytes
+        if audit_name is not None:
+            if allowlist is not None and complete_payload_bytes > 0:
+                selected_file_bytes = (
+                    expert_file_by_layer[layer]
+                    * expert_payload_by_layer[layer]
+                    + complete_payload_bytes
+                    - 1
+                ) // complete_payload_bytes
+            else:
+                selected_file_bytes = expert_file_by_layer[layer]
+            expert_aux_by_layer[layer] = max(
+                0,
+                selected_file_bytes - expert_payload_by_layer[layer],
+            )
         else:
-            selected_file_bytes = expert_file_by_layer[layer]
-        expert_aux_by_layer[layer] = max(
-            0,
-            selected_file_bytes - expert_payload_by_layer[layer],
-        )
+            selected_file_bytes = (
+                expert_payload_by_layer[layer] + auxiliary_bytes
+            )
+            expert_aux_by_layer[layer] = auxiliary_bytes
         # A strict route profile changes runtime residency, not the physical
         # archive.  Budget only selected expert payloads plus the layer's
         # shared codebooks/metadata; charging the complete shard prevents a
@@ -430,6 +478,13 @@ def build_routed_vq_layer_plan(store, tp_size: int) -> RoutedVQLayoutPlan:
         dense_bytes_by_rank.append(dense)
         expert_bytes_by_rank.append(expert)
     return RoutedVQLayoutPlan(
+        runtime_layers=tuple(
+            sorted(
+                int(layer)
+                for layer in store.man.expert_files
+                if 0 <= int(layer) < n_layers
+            )
+        ),
         ranges=tuple(ranges),
         owner_by_layer=tuple(owner),
         bytes_by_rank=tuple(bytes_by_rank),
@@ -466,6 +521,7 @@ def build_primary_dense_packed_plan(store, tp_size: int) -> RoutedVQLayoutPlan:
     )
     dense_by_rank = (dense_total,) + (0,) * (int(tp_size) - 1)
     return RoutedVQLayoutPlan(
+        runtime_layers=base.runtime_layers,
         ranges=ranges,
         owner_by_layer=(0,) * n_layers,
         bytes_by_rank=tuple(
@@ -506,47 +562,6 @@ def _packed_startup_required_bytes(
     if dense_resident:
         required = max(0, required - plan.dense_bytes_by_rank[rank])
     return required + 512 * 2**20
-
-
-def _packed_grouped_prefill_supported(manifest, layer: int) -> bool:
-    """Validate grouped Prefill from per-expert projection layouts.
-
-    A heterogeneous layer can use more than three distinct layout names in
-    total even though every expert still has exactly Gate/Up/Down.  Testing
-    the deduplicated layer-wide capability length therefore rejected valid
-    resident models after they had loaded successfully.  The compiled grouped
-    kernel consumes one 15-row metadata directory and supports mixed packed
-    widths on CUDA and HIP, so the correct contract is three projections for
-    every concrete expert capability.
-    """
-    if not manifest.projection_vq:
-        return False
-    capabilities = manifest.projection_operator_capabilities(int(layer))
-    return bool(capabilities) and all(
-        len(capability.get("packed_formats", ())) == 3
-        and len(capability.get("code_dims", ())) == 3
-        and len(capability.get("codebook_sizes", ())) == 3
-        for capability in capabilities
-    )
-
-
-def _select_packed_grouped_prefill(
-    manifest,
-    layer: int,
-    *,
-    metadata_rows: int,
-    dequant_prefill: bool,
-    hip_runtime: bool,
-) -> bool:
-    """Choose the packed grouped executor without changing CUDA fast paths."""
-    capable = bool(
-        int(metadata_rows) == 10
-        or (
-            int(metadata_rows) == 15
-            and _packed_grouped_prefill_supported(manifest, layer)
-        )
-    )
-    return bool(capable and (bool(hip_runtime) or not dequant_prefill))
 
 
 class ResidentRoutedVQPool:
@@ -684,30 +699,11 @@ class ResidentRoutedVQPool:
             int,
             tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         ] = {}
-        # Prefill reuses one bounded packed workspace per rank.  Expert
-        # indices remain packed in the resident arena; this is only the
-        # activation/output scratch required by the fused CUDA kernels.
-        self._prefill_workspaces: dict[
-            int,
-            _PackedPrefillWorkspace,
-        ] = {}
-        self._prefill_grouped_workspaces: dict[
-            int,
-            _GroupedPrefillWorkspace,
-        ] = {}
         # TP grouped prefill 的本地专家掩码缓存：(layer, rank) -> [E] bool。
         self._grouped_local_masks: dict[
             tuple[int, int],
             torch.Tensor,
         ] = {}
-        # dequant+grouped GEMM prefill 的稠密权重 scratch（每 rank 一份，
-        # 跨层/跨微批复用）与能力缓存。
-        self._dequant_buffers: dict[
-            int,
-            tuple[torch.Tensor, torch.Tensor],
-        ] = {}
-        self._dequant_supported_cache: dict[int, bool] = {}
-        self._dequant_id_ranges: dict[int, torch.Tensor] = {}
         self._native8_prefill_enabled = False
         self._native8_grouped_backend: str | None = None
         self._native8_codebooks: dict[int, torch.Tensor] = {}
@@ -721,8 +717,14 @@ class ResidentRoutedVQPool:
             int, tuple[torch.Tensor, ...]
         ] = {}
         self._native8_workspaces: dict[int, dict[str, object]] = {}
+        self._native8_group_ranges: dict[
+            tuple[int, int], torch.Tensor
+        ] = {}
         self._native8_prefill_workspaces: dict[
             int, _Native8PrefillRankWorkspace
+        ] = {}
+        self._native8_all_rank_transport: dict[
+            tuple[int, int], dict[str, torch.Tensor | int]
         ] = {}
         self._compact_decode_enabled = False
         self._compact_decode_codebooks: dict[int, torch.Tensor] = {}
@@ -735,6 +737,7 @@ class ResidentRoutedVQPool:
         self._compact_decode_workspaces: dict[int, dict[str, torch.Tensor]] = {}
         self._streams: list[torch.cuda.Stream] = []
         self._source_events: list[torch.cuda.Event] = []
+        self._replicated_source_events: list[list[torch.cuda.Event]] = []
         self._done_events: list[list[torch.cuda.Event]] = []
         self._output_events: list[list[torch.cuda.Event]] = []
         self._routed_inputs: list[torch.Tensor] = []
@@ -1350,7 +1353,7 @@ class ResidentRoutedVQPool:
                 )
             else:
                 size_counts: dict[int, int] = {}
-                for layer in sorted(self.store.man.expert_files):
+                for layer in self.plan.runtime_layers:
                     for size in self.plan.expert_payload_by_expert[
                         int(layer)
                     ]:
@@ -1395,7 +1398,7 @@ class ResidentRoutedVQPool:
                 self._mapped_total_slots = sum(slot_counts.values())
                 self._mapped_slots_per_layer = (
                     self._mapped_total_slots
-                    // max(1, len(self.store.man.expert_files))
+                    // max(1, len(self.plan.runtime_layers))
                 )
         try:
             for rank, device in enumerate(self.devices):
@@ -1407,7 +1410,7 @@ class ResidentRoutedVQPool:
                             device=device,
                         ))
                     else:
-                        for layer in sorted(self.store.man.expert_files):
+                        for layer in self.plan.runtime_layers:
                             layer_bytes = self._resident_layer_payload_bytes(
                                 rank, int(layer)
                             )
@@ -1606,7 +1609,7 @@ class ResidentRoutedVQPool:
             key: 0 for key in self._resident_layer_arenas
         }
         loaded = 0
-        for layer in sorted(self.store.man.expert_files):
+        for layer in self.plan.runtime_layers:
             projection_vq = bool(self.store.man.projection_vq)
             metadata_by_rank = [
                 torch.zeros(
@@ -1953,6 +1956,13 @@ class ResidentRoutedVQPool:
                 torch.cuda.Event()
                 for _ in range(int(self.store.cfg["n_layers"]))
             ]
+            self._replicated_source_events = [
+                [
+                    torch.cuda.Event()
+                    for _ in range(int(self.store.cfg["n_layers"]))
+                ]
+                for _ in self.devices
+            ]
             self._done_events = [
                 [
                     torch.cuda.Event()
@@ -1973,6 +1983,8 @@ class ResidentRoutedVQPool:
                     event.cuda_event
             for rank, events in enumerate(self._done_events):
                 with torch.cuda.device(self.devices[rank]):
+                    for event in self._replicated_source_events[rank]:
+                        event.cuda_event
                     for event in events:
                         event.cuda_event
                     for event in self._output_events[rank]:
@@ -2061,7 +2073,7 @@ class ResidentRoutedVQPool:
         activation_limit = float(
             self.store.cfg.get("swiglu_limit", 0.0)
         )
-        for layer in sorted(self.store.man.expert_files):
+        for layer in self.plan.runtime_layers:
             owner = self.plan.owner_by_layer[layer]
             owner_device = self.devices[owner]
             local_layer = layer - self.plan.ranges[owner][0]
@@ -2545,9 +2557,8 @@ class ResidentRoutedVQPool:
         deleted instead of retained as another fallback.
         """
         if (
-            os.environ.get("CCCP_RESIDENT_NATIVE8_PREFILL", "0") != "1"
-            or torch.version.hip is not None
-            or not self.store.man.projection_vq
+            torch.version.hip is not None
+            or not bool(getattr(self.store.man, "expert_codebook_vq", False))
             or not self.devices
         ):
             return
@@ -2817,8 +2828,7 @@ class ResidentRoutedVQPool:
             # E4M3 image while allocating its larger replacement.  Kimi TP4
             # then failed despite the final workspace fitting.  Resizing is a
             # rare context-boundary event, so synchronize and release first.
-            with torch.cuda.device(device):
-                torch.cuda.synchronize(device)
+            self._synchronize_native8_consumers()
             self._native8_workspaces.pop(int(rank), None)
             del cached
             with torch.cuda.device(device):
@@ -2957,6 +2967,20 @@ class ResidentRoutedVQPool:
         self._native8_workspaces[int(rank)] = cached
         return cached
 
+    def _synchronize_native8_consumers(self) -> None:
+        """Finish every P2P consumer before replacing shared TP storage.
+
+        A rank-local Native8 result is read by the reduction stream on every
+        destination rank.  Synchronizing only the producer does not protect
+        those remote reads and can free/reuse the slab while a peer kernel is
+        still consuming it.  Workspace growth is a context-capacity event,
+        not a token hot path, so an all-rank barrier is the correct lifetime
+        boundary.
+        """
+        for device in self.devices:
+            with torch.cuda.device(device):
+                torch.cuda.synchronize(device)
+
     def _run_rows_native8_rank(
         self,
         layer: int,
@@ -2971,6 +2995,7 @@ class ResidentRoutedVQPool:
         activation_beta: float,
         activation_linear_beta: float | None,
         limit: float,
+        workspace_capacity: int,
     ) -> torch.Tensor:
         """Execute one resident layer via common E4M3 grouped Tensor Cores."""
         from .fusedext import (
@@ -3151,12 +3176,13 @@ class ResidentRoutedVQPool:
                 selected_scales[:, 1:2]
             )
             down_scales.copy_(selected_scales[:, 2:3])
-            expert_ids = self._dequant_id_ranges.get(rank)
-            if expert_ids is None or expert_ids.numel() != execution_groups:
+            range_key = (int(rank), int(execution_groups))
+            expert_ids = self._native8_group_ranges.get(range_key)
+            if expert_ids is None:
                 expert_ids = torch.arange(
                     execution_groups, dtype=torch.long, device=device
                 )
-                self._dequant_id_ranges[rank] = expert_ids
+                self._native8_group_ranges[range_key] = expert_ids
             offsets = torch.searchsorted(
                 sorted_experts, expert_ids, right=True
             ).to(torch.int32)
@@ -3236,275 +3262,6 @@ class ResidentRoutedVQPool:
             raise RuntimeError("resident native8 route reduction was rejected")
         return reduced
 
-    def _dequant_supported(self, layer: int) -> bool:
-        """dequant+grouped GEMM 路径是否适用于该层（全部专家本地有效）。
-
-        b 矩阵按全局专家 id 行对齐，因此要求 rank 上每个专家的三投影
-        元数据都有效（张量并行按 intermediate 分片时成立）。同时按
-        空闲显存门控 scratch 分配，避免超大模型挤占 KV/运行时预算。
-        """
-        cached = self._dequant_supported_cache.get(layer)
-        if cached is not None:
-            return cached
-        # Windows ROCm's private torch._grouped_mm currently terminates the
-        # process inside torch_hip.dll on gfx1150. AMD uses CCCP's public
-        # packed grouped operator and never probes this native crash path.
-        ok = torch.version.hip is None and hasattr(torch, "_grouped_mm")
-        if ok:
-            for rank, device in enumerate(self.devices):
-                mask = self._grouped_local_mask(layer, rank)
-                if not bool(mask.all()):
-                    ok = False
-                    break
-                expert_count = int(mask.numel())
-                intermediate = int(self.store.cfg["moe_inter"])
-                hidden = int(
-                    self.store.cfg.get(
-                        "routed_hidden", self.store.cfg["hidden"]
-                    )
-                )
-                local_inter = (
-                    intermediate // self.tensor_group_size
-                    if self.parallelism in {"tensor", "hybrid"}
-                    else intermediate
-                )
-                needed = _dequant_scratch_bytes(
-                    expert_count,
-                    local_inter,
-                    hidden,
-                )
-                try:
-                    free, _total = torch.cuda.mem_get_info(device)
-                except Exception:
-                    free = 0
-                if free < needed * 2:
-                    ok = False
-                    break
-        self._dequant_supported_cache[layer] = ok
-        return ok
-
-    def _dequant_scratch(
-        self,
-        rank: int,
-        expert_count: int,
-        local_inter: int,
-        hidden: int,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        entry = self._dequant_buffers.get(rank)
-        gu_shape = (expert_count, 2 * local_inter, hidden)
-        down_shape = (expert_count, hidden, local_inter)
-        if (
-            entry is None
-            or tuple(entry[0].shape) != gu_shape
-            or tuple(entry[1].shape) != down_shape
-        ):
-            with torch.cuda.device(device):
-                entry = (
-                    torch.empty(
-                        gu_shape, dtype=torch.bfloat16, device=device
-                    ),
-                    torch.empty(
-                        down_shape, dtype=torch.bfloat16, device=device
-                    ),
-                )
-            self._dequant_buffers[rank] = entry
-        return entry
-
-    def _prefill_dequant_launch(
-        self,
-        layer: int,
-        intermediate: int,
-        hidden: int,
-    ) -> None:
-        """本层全部 rank 的稠密权重展开（每次 run_rows 调用一次）。"""
-        from .ops import projection_dequant
-
-        local_inter = (
-            intermediate // self.tensor_group_size
-            if self.parallelism in {"tensor", "hybrid"}
-            else intermediate
-        )
-        for rank, device in enumerate(self.devices):
-            metadata = self._metadata[layer][rank]
-            stream = self._prefill_expansion_stream(rank, device)
-            with torch.cuda.device(device), torch.cuda.stream(stream):
-                gu, down = self._dequant_scratch(
-                    rank,
-                    int(metadata.shape[1]),
-                    local_inter,
-                    hidden,
-                    device,
-                )
-                projection_dequant(metadata, gu, down)
-
-    def _prefill_expansion_stream(
-        self,
-        rank: int,
-        device: torch.device,
-    ):
-        """Use the eventual GEMM consumer stream for packed expansion."""
-        if len(self.devices) == 1 or not self._streams:
-            return torch.cuda.current_stream(device)
-        return self._streams[int(rank)]
-
-    def _run_rows_dequant_rank(
-        self,
-        layer: int,
-        rank: int,
-        inputs: torch.Tensor,
-        route_ids_mb: torch.Tensor,
-        route_weights_mb: torch.Tensor,
-        result: torch.Tensor,
-        count: int,
-        top_k: int,
-        activation: str,
-        activation_beta: float,
-        activation_linear_beta: float | None,
-        limit: float,
-    ) -> torch.Tensor:
-        """单 rank dequant + 公共 grouped GEMM 的 Top-K MoE 部分和。
-
-        稠密权重已由 ``_prefill_dequant_launch`` 展开到本 rank scratch；
-        这里只做路由排序与两次 ``torch._grouped_mm``（cuBLAS 分组
-        GEMM），权重读取从每 (row,k) 一次降为每层一次。
-        """
-        from .grouped import activate_gate_up
-
-        device = self.devices[rank]
-        gu_buf, down_buf = self._dequant_buffers[rank]
-        expert_ids = self._dequant_id_ranges.get(rank)
-        if expert_ids is None or expert_ids.numel() != gu_buf.shape[0]:
-            expert_ids = torch.arange(
-                int(gu_buf.shape[0]), dtype=torch.long, device=device
-            )
-            self._dequant_id_ranges[rank] = expert_ids
-        flat_ids = route_ids_mb.reshape(-1)
-        order = torch.argsort(flat_ids)
-        sorted_experts = flat_ids[order].contiguous()
-        token_ids = (
-            torch.arange(count, dtype=torch.long, device=device)
-            .view(-1, 1)
-            .expand(count, top_k)
-            .reshape(-1)
-        )
-        sorted_tokens = token_ids[order].contiguous()
-        sorted_weights = (
-            route_weights_mb.reshape(-1)[order].float().contiguous()
-        )
-        offs = torch.searchsorted(
-            sorted_experts, expert_ids, right=True
-        ).to(torch.int32)
-        x_sorted = inputs.index_select(0, sorted_tokens)
-        gu = torch._grouped_mm(
-            x_sorted, gu_buf.transpose(1, 2), offs=offs
-        )
-        gate, up = gu.chunk(2, dim=-1)
-        if float(limit) > 0.0:
-            # 与 csrc projection_gate_up_activation 的 swiglu 分支一致：
-            # gate 截上限、up 对称截断后再走激活（DSV4 swiglu_limit=10）。
-            gate = gate.clamp(max=float(limit))
-            up = up.clamp(min=-float(limit), max=float(limit))
-        activated = activate_gate_up(
-            gate,
-            up,
-            activation=activation,
-            situ_beta=float(activation_beta),
-            situ_linear_beta=(
-                None
-                if activation_linear_beta is None
-                else float(activation_linear_beta)
-            ),
-        )
-        down = torch._grouped_mm(
-            activated.contiguous(), down_buf.transpose(1, 2), offs=offs
-        )
-        result.zero_()
-        result.index_add_(
-            0,
-            sorted_tokens,
-            down.float() * sorted_weights.unsqueeze(1),
-        )
-        return result
-
-    def _run_rows_packed_grouped_rank(
-        self,
-        layer: int,
-        rank: int,
-        inputs: torch.Tensor,
-        route_ids_mb: torch.Tensor,
-        route_weights_mb: torch.Tensor,
-        hidden_workspace: torch.Tensor,
-        result: torch.Tensor,
-        count: int,
-        top_k: int,
-        activation: str,
-        activation_beta: float,
-        activation_linear_beta: float | None,
-        limit: float,
-    ) -> torch.Tensor:
-        """Run a complete AMD Prefill micro-batch from resident packed data."""
-
-        from .ops import packed_moe_topk_grouped
-
-        device = self.devices[rank]
-        flat_ids = route_ids_mb.reshape(-1)
-        token_ids = (
-            torch.arange(count, dtype=torch.long, device=device)
-            .view(-1, 1)
-            .expand(count, top_k)
-            .reshape(-1)
-        )
-        flat_weights = route_weights_mb.reshape(-1).float()
-        local_mask = self._grouped_local_mask(layer, rank)
-        local_positions = local_mask.index_select(0, flat_ids).nonzero(
-            as_tuple=False
-        ).reshape(-1)
-        result.zero_()
-        if local_positions.numel() == 0:
-            return result
-        local_experts = flat_ids.index_select(0, local_positions)
-        order = torch.argsort(local_experts)
-        sorted_positions = local_positions.index_select(0, order)
-        sorted_experts = local_experts.index_select(0, order).contiguous()
-        group_experts, group_counts = torch.unique_consecutive(
-            sorted_experts,
-            return_counts=True,
-        )
-        group_offsets = torch.empty(
-            int(group_experts.numel()) + 1,
-            dtype=torch.int32,
-            device=device,
-        )
-        group_offsets[0] = 0
-        group_offsets[1:].copy_(torch.cumsum(group_counts, dim=0).to(
-            torch.int32
-        ))
-        sorted_tokens = token_ids.index_select(
-            0, sorted_positions
-        ).contiguous()
-        sorted_weights = flat_weights.index_select(
-            0, sorted_positions
-        ).contiguous()
-        return packed_moe_topk_grouped(
-            inputs,
-            sorted_tokens,
-            group_experts.contiguous(),
-            group_offsets,
-            sorted_weights,
-            self._metadata[layer][rank],
-            activation=activation,
-            activation_beta=float(activation_beta),
-            activation_linear_beta=(
-                0.0
-                if activation_linear_beta is None
-                else float(activation_linear_beta)
-            ),
-            limit=float(limit),
-            hidden_workspace=hidden_workspace[: int(sorted_tokens.numel())],
-            result=result,
-        )
-
     def _native8_prefill_rank_workspace(
         self,
         rank: int,
@@ -3555,6 +3312,299 @@ class ResidentRoutedVQPool:
         self._native8_prefill_workspaces[int(rank)] = cached
         return cached
 
+    def _native8_all_rank_transport_workspace(
+        self,
+        rank: int,
+        *,
+        rows: int,
+        routed_rows: int,
+        groups: int,
+        hidden: int,
+        metadata_rows: int,
+    ) -> dict[str, torch.Tensor | int]:
+        """Return reusable publication buffers for one native TP submission."""
+
+        cache_key = (int(rank), int(metadata_rows))
+        cached = self._native8_all_rank_transport.get(cache_key)
+        if (
+            cached is not None
+            and int(cached["rows"]) >= int(rows)
+            and int(cached["routed_rows"]) >= int(routed_rows)
+            and int(cached["groups"]) >= int(groups)
+            and int(cached["hidden"]) == int(hidden)
+        ):
+            return cached
+        device = self.devices[int(rank)]
+        if cached is not None:
+            self._synchronize_native8_consumers()
+            self._native8_all_rank_transport.pop(cache_key, None)
+            del cached
+            with torch.cuda.device(device):
+                torch.cuda.empty_cache()
+        with torch.cuda.device(device):
+            cached = {
+                "rows": int(rows),
+                "routed_rows": int(routed_rows),
+                "groups": int(groups),
+                "hidden": int(hidden),
+                "metadata_rows": int(metadata_rows),
+                "inputs": torch.empty(
+                    rows, hidden, dtype=torch.bfloat16, device=device
+                ),
+                "token_ids": torch.empty(
+                    routed_rows, dtype=torch.long, device=device
+                ),
+                "group_experts": torch.empty(
+                    groups, dtype=torch.long, device=device
+                ),
+                "group_offsets": torch.empty(
+                    groups + 1, dtype=torch.int32, device=device
+                ),
+                "route_weights": torch.empty(
+                    routed_rows, dtype=torch.float32, device=device
+                ),
+                "selected_metadata": torch.empty(
+                    metadata_rows, groups, dtype=torch.long, device=device
+                ),
+                "selected_scales": torch.empty(
+                    groups, 3, dtype=torch.float32, device=device
+                ),
+                "result": torch.empty(
+                    rows, hidden, dtype=torch.float32, device=device
+                ),
+            }
+        self._native8_all_rank_transport[cache_key] = cached
+        return cached
+
+    def _run_rows_native8_all_rank(
+        self,
+        layer: int,
+        inputs: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
+        route_ids: torch.Tensor,
+        route_weights: torch.Tensor,
+        result: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
+        *,
+        activation: str,
+        activation_beta: float,
+        activation_linear_beta: float | None,
+        limit: float,
+        workspace_capacity: int,
+    ) -> torch.Tensor:
+        """Submit tensor-sharded Native8 MoE for every rank in one C++ call."""
+
+        if self.parallelism != "tensor" or len(self.devices) <= 1:
+            raise RuntimeError(
+                "native all-rank Prefill requires multi-device tensor shards"
+            )
+        from .fusedext import native8_moe_all_rank_fused
+        from .ops.sm90_grouped import build_active_grouped_routes
+
+        replicated = isinstance(inputs, (tuple, list))
+        input_replicas = list(inputs) if replicated else []
+        result_replicas = (
+            list(result) if isinstance(result, (tuple, list)) else []
+        )
+        if replicated and (
+            len(input_replicas) != len(self.devices)
+            or len(result_replicas) != len(self.devices)
+        ):
+            raise ValueError(
+                "Native8 replicated inputs/results must match TP rank count"
+            )
+        primary_input = input_replicas[0] if replicated else inputs
+        primary_result = result_replicas[0] if replicated else result
+        rows = int(primary_input.shape[0])
+        hidden = int(primary_input.shape[1])
+        top_k = int(route_ids.shape[1])
+        routed_rows = rows * top_k
+        workspace_capacity = max(int(workspace_capacity), routed_rows)
+        flat_ids = route_ids.reshape(-1)
+        groups = build_active_grouped_routes(
+            flat_ids,
+            group_capacity=int(self._metadata[int(layer)][0].shape[1]),
+            bucketed=False,
+        )
+        order = groups.order
+        token_ids = (
+            torch.arange(rows, dtype=torch.long, device=route_ids.device)
+            .view(-1, 1)
+            .expand(rows, top_k)
+            .reshape(-1)
+            .index_select(0, order)
+            .contiguous()
+        )
+        sorted_weights = (
+            route_weights.reshape(-1)
+            .index_select(0, order)
+            .float()
+            .contiguous()
+        )
+        group_experts = groups.unique_group_ids.contiguous()
+        group_offsets = torch.empty(
+            int(groups.active_group_count) + 1,
+            dtype=torch.int32,
+            device=route_ids.device,
+        )
+        group_offsets[0] = 0
+        group_offsets[1:].copy_(
+            torch.searchsorted(
+                groups.sorted_group_ids,
+                torch.arange(
+                    int(groups.active_group_count),
+                    dtype=torch.long,
+                    device=route_ids.device,
+                ),
+                right=True,
+            ).to(torch.int32)
+        )
+
+        source_rank = next(
+            (
+                rank
+                for rank, device in enumerate(self.devices)
+                if device == route_ids.device
+            ),
+            -1,
+        )
+        if source_rank < 0:
+            raise RuntimeError(
+                "native all-rank Prefill routes must use a TP device"
+            )
+        if replicated:
+            for rank, device in enumerate(self.devices):
+                if (
+                    input_replicas[rank].device != device
+                    or result_replicas[rank].device != device
+                    or input_replicas[rank].shape != primary_input.shape
+                    or result_replicas[rank].shape != primary_result.shape
+                ):
+                    raise ValueError(
+                        "Native8 replicated tensors must be rank-local and "
+                        "shape-equal"
+                    )
+        elif primary_result.device != primary_input.device:
+            raise RuntimeError(
+                "native all-rank Prefill source/output must share a TP device"
+            )
+        rank_order = (
+            source_rank,
+            *(
+                rank
+                for rank in range(len(self.devices))
+                if rank != source_rank
+            ),
+        )
+        intermediate = int(self.store.cfg["moe_inter"])
+        local_intermediate = intermediate // self.tensor_group_size
+        metadata_by_rank = []
+        scales_by_rank = []
+        workspaces_by_rank = []
+        for rank in rank_order:
+            metadata = self._native8_metadata[int(layer)][int(rank)]
+            transport = self._native8_all_rank_transport_workspace(
+                rank,
+                rows=(workspace_capacity + top_k - 1) // top_k,
+                routed_rows=workspace_capacity,
+                groups=int(metadata.shape[1]),
+                hidden=hidden,
+                metadata_rows=int(metadata.shape[0]),
+            )
+            native = self._native8_workspace(
+                rank,
+                expert_count=int(metadata.shape[1]),
+                routed_rows=int(workspace_capacity),
+                local_intermediate=local_intermediate,
+                hidden=hidden,
+            )
+            group_count = int(groups.active_group_count)
+            metadata_by_rank.append(metadata)
+            scales_by_rank.append(
+                self._native8_scales[int(layer)][int(rank)]
+            )
+            workspaces_by_rank.append([
+                transport["inputs"][:rows],
+                transport["token_ids"][:routed_rows],
+                transport["group_experts"][:group_count],
+                transport["group_offsets"][: group_count + 1],
+                transport["route_weights"][:routed_rows],
+                _capacity_prefix_matrix(
+                    transport["selected_metadata"],
+                    rows=int(metadata.shape[0]),
+                    columns=group_count,
+                ),
+                transport["selected_scales"][:group_count],
+                native["gu"][:group_count],
+                native["down"][:group_count],
+                native["input"][:routed_rows],
+                native["input_scales"][:routed_rows],
+                native["gu_scales"][:group_count],
+                native["down_scales"][:group_count],
+                native["activated"][:routed_rows],
+                native["activated_scales"][:routed_rows],
+                transport["result"][:rows],
+            ])
+        ordered_inputs = (
+            [input_replicas[rank].contiguous() for rank in rank_order]
+            if replicated
+            else primary_input.contiguous()
+        )
+        ordered_results = (
+            [result_replicas[rank] for rank in rank_order]
+            if replicated
+            else primary_result
+        )
+        source_events = (
+            [
+                self._replicated_source_events[rank][int(layer)]
+                for rank in rank_order
+            ]
+            if replicated
+            else self._source_events[int(layer)]
+        )
+        if replicated:
+            # torch.cuda.Event keeps a null handle until its first record.
+            # Record each rank-local producer stream here; the native call
+            # then consumes stable handles and preserves the same dependency.
+            for rank in rank_order:
+                device = self.devices[rank]
+                with torch.cuda.device(device):
+                    self._replicated_source_events[rank][int(layer)].record(
+                        torch.cuda.current_stream(device)
+                    )
+        output_events = (
+            [
+                self._output_events[rank][int(layer)]
+                for rank in rank_order
+            ]
+            if replicated
+            else self._output_events[source_rank][int(layer)]
+        )
+        native8_moe_all_rank_fused(
+            ordered_inputs,
+            token_ids,
+            group_experts,
+            group_offsets,
+            sorted_weights,
+            metadata_by_rank,
+            scales_by_rank,
+            workspaces_by_rank,
+            ordered_results,
+            [int(self.devices[rank].index) for rank in rank_order],
+            [self._streams[rank] for rank in rank_order],
+            [self._done_events[rank][int(layer)] for rank in rank_order],
+            source_events,
+            output_events,
+            activation=activation,
+            beta=float(activation_beta),
+            linear_beta=(
+                0.0
+                if activation_linear_beta is None
+                else float(activation_linear_beta)
+            ),
+            limit=float(limit),
+        )
+        return result
+
     def run_rows(
         self,
         layer: int,
@@ -3568,14 +3618,12 @@ class ResidentRoutedVQPool:
         limit: float = 0.0,
         prefill_default: int = 4096,
     ) -> torch.Tensor:
-        """Run exact packed Top-K MoE for a prefill row batch.
+        """Run the sole resident CUDA Prefill algorithm.
 
-        The public CUDA operator consumes ``[N,K]`` routes directly.  Every
-        tensor/expert rank executes its resident packed shard with those exact
-        routes, then one public Row-TP collective reduces the FP32 partials.
-        A bounded micro-batch prevents activation scratch from growing with
-        context length and reduces Python/CUDA submissions from N per layer
-        to ceil(N/micro_batch).  No packed index or full expert is expanded.
+        Every codebook model follows the same sequence: group complete layer
+        routes, expand packed codebooks to bounded Native8 projection images,
+        execute grouped Tensor-Core GEMM, and reduce once.  TP changes only
+        tensor placement; it never selects a different mathematical backend.
         """
         if not self.active:
             raise RuntimeError("packed experts are not ready")
@@ -3587,82 +3635,23 @@ class ResidentRoutedVQPool:
         top_k = int(route_ids.shape[1])
         if rows <= 0 or top_k <= 0:
             raise ValueError("packed prefill requires non-empty rows and routes")
-        # The full-resident TP path uses a 4096-row scratch by default;
-        # callers may override CCCP_PREFILL_MOE_BATCH after measuring a larger
-        # workspace on the target GPU.  8192 raises the MLA prefill score
-        # tensor past the per-GPU headroom on H20 TP8 (OOM at ~13k tokens);
-        # 2048 is stable but caps throughput ~65% lower than 4096.
-        micro_batch = min(
-            prefill_moe_batch_size(default=int(prefill_default)),
-            rows,
+        if not self._native8_layer_supported(int(layer)):
+            raise RuntimeError(
+                "resident CUDA Prefill requires the public Native8 grouped "
+                "executor; alternate model paths are not supported"
+            )
+
+        self.prefill_executor = (
+            "cuda.vq-to-native8-scaled-grouped-gemm."
+            f"{self._native8_grouped_backend}"
         )
-        owner = self.plan.owner_by_layer[layer]
+        configured_batch = prefill_moe_batch_size(
+            default=int(prefill_default)
+        )
+        micro_batch = min(configured_batch, rows)
+        owner = int(self.plan.owner_by_layer[int(layer)])
         owner_device = self.devices[owner]
-        intermediate = int(self.store.cfg["moe_inter"])
-        hidden = int(
-            self.store.cfg.get("routed_hidden", self.store.cfg["hidden"])
-        )
-        local_intermediate = (
-            intermediate // self.tensor_group_size
-            if self.parallelism in {"tensor", "hybrid"}
-            else intermediate
-        )
-
-        def workspace(rank: int) -> _PackedPrefillWorkspace:
-            cached = self._prefill_workspaces.get(rank)
-            if (
-                cached is not None
-                and cached.capacity >= micro_batch
-                and cached.top_k == top_k
-                and cached.hidden.shape[1] == 2 * local_intermediate
-                and cached.result.shape[1] == hidden
-            ):
-                return cached
-            device = self.devices[rank]
-            with torch.cuda.device(device):
-                cached = _PackedPrefillWorkspace(
-                    capacity=micro_batch,
-                    top_k=top_k,
-                    inputs=torch.empty(
-                        micro_batch,
-                        hidden,
-                        dtype=torch.bfloat16,
-                        device=device,
-                    ),
-                    route_ids=torch.empty(
-                        micro_batch,
-                        top_k,
-                        dtype=torch.long,
-                        device=device,
-                    ),
-                    route_weights=torch.empty(
-                        micro_batch,
-                        top_k,
-                        dtype=torch.float32,
-                        device=device,
-                    ),
-                    hidden=torch.empty(
-                        micro_batch * top_k,
-                        2 * local_intermediate,
-                        dtype=torch.bfloat16,
-                        device=device,
-                    ),
-                    output=torch.empty(
-                        micro_batch * top_k,
-                        hidden,
-                        dtype=torch.bfloat16,
-                        device=device,
-                    ),
-                    result=torch.empty(
-                        micro_batch,
-                        hidden,
-                        dtype=torch.float32,
-                        device=device,
-                    ),
-                )
-            self._prefill_workspaces[rank] = cached
-            return cached
-
+        hidden = int(value.shape[1])
         result = torch.empty(
             rows,
             hidden,
@@ -3670,218 +3659,57 @@ class ResidentRoutedVQPool:
             device=owner_device,
         )
 
-        # Packed multi-token execution is never allowed to fall back to the
-        # width-one decode/GEMV operator. NVIDIA keeps the measured exact
-        # dequant + cuBLAS grouped-GEMM path. Windows ROCm cannot safely call
-        # PyTorch's private grouped-mm and uses CCCP's compiled packed grouped
-        # kernel for the same complete micro-batch instead.
-        native8_prefill = self._native8_layer_supported(layer)
-        dequant_prefill = bool(
-            not native8_prefill and self._dequant_supported(layer)
-        )
-        metadata_rows = int(self._metadata[layer][owner].shape[0])
-        # NVIDIA retains its faster measured dequant+cuBLAS path whenever the
-        # complete scratch image fits.  When it does not (for example Kimi
-        # TP4 with 896 experts/rank), the same public packed grouped kernel is
-        # the exact no-expansion fallback. HIP always uses the public packed
-        # operator because torch._grouped_mm is unsafe on Windows ROCm.
-        packed_grouped_prefill = _select_packed_grouped_prefill(
-            self.store.man,
-            layer,
-            metadata_rows=metadata_rows,
-            dequant_prefill=bool(dequant_prefill or native8_prefill),
-            hip_runtime=torch.version.hip is not None,
-        )
-        if native8_prefill:
-            self.prefill_executor = (
-                "cuda.vq-to-e4m3-scaled-grouped-gemm."
-                f"{self._native8_grouped_backend}"
-            )
-        elif packed_grouped_prefill:
-            self.prefill_executor = "cuda.packed-moe-grouped-fused"
-            print(
-                "[cccp-prefill] "
-                f"executor={self.prefill_executor}; "
-                f"layer={layer}; token batch={rows}; "
-                "resident_experts=GPU-only; H2D=0",
-                flush=True,
-            )
-        elif dequant_prefill:
-            self.prefill_executor = "cuda.dequant-grouped-gemm"
-            self._prefill_dequant_launch(layer, intermediate, hidden)
-
-        # The width-one path deliberately remains free of collectives.  It is
-        # the exact fast path used by the measured 8192-token TP1 prefill.
         if len(self.devices) == 1:
-            if native8_prefill or dequant_prefill or packed_grouped_prefill:
-                for start in range(0, rows, micro_batch):
-                    stop = min(rows, start + micro_batch)
-                    count = stop - start
-                    with torch.cuda.device(owner_device):
-                        inputs = value[start:stop].to(
-                            torch.bfloat16
-                        ).contiguous()
-                        ids = route_ids[start:stop].contiguous()
-                        weights = route_weights[start:stop].float().contiguous()
-                        if native8_prefill:
-                            self._run_rows_native8_rank(
-                                layer, owner, inputs, ids, weights,
-                                result[start:stop], count, top_k, activation,
-                                activation_beta, activation_linear_beta, limit,
-                            )
-                        elif packed_grouped_prefill:
-                            cached = workspace(owner)
-                            self._run_rows_packed_grouped_rank(
-                                layer, owner, inputs, ids, weights,
-                                cached.hidden, result[start:stop], count,
-                                top_k, activation, activation_beta,
-                                activation_linear_beta, limit,
-                            )
-                        else:
-                            self._run_rows_dequant_rank(
-                                layer, owner, inputs, ids, weights,
-                                result[start:stop], count, top_k, activation,
-                                activation_beta, activation_linear_beta, limit,
-                            )
-                    self.prefill_batch_submissions += 1
-                    self.prefill_batch_max = max(
-                        self.prefill_batch_max,
-                        count,
-                    )
-                self.prefill_batch_rows += rows
-                self.hits += int(route_ids.numel())
-                return result
-            raise RuntimeError(
-                "packed GPU Prefill requires a registered grouped executor; "
-                "decode GEMV and compact grouped fallbacks are forbidden"
-            )
-
-        if self.parallelism == "pipeline":
-            raise RuntimeError(
-                "multi-rank row batching requires sharded packed experts"
-            )
-        if not self._streams or not self._source_events:
-            raise RuntimeError("packed prefill TP streams are unavailable")
-
-        from .fusedext import tp_all_rank_reduce_from_events_fused
-
-        rank_order = tuple(range(len(self.devices)))
-        rank_workspaces = tuple(
-            self._native8_prefill_rank_workspace(
-                rank,
-                capacity=micro_batch,
-                top_k=top_k,
-                hidden=hidden,
-            )
-            if native8_prefill
-            else workspace(rank)
-            for rank in rank_order
-        )
-        source_ready = self._source_events[layer]
-        done_events = [
-            self._done_events[rank][layer] for rank in rank_order
-        ]
-        output_event = self._output_events[owner][layer]
-        with torch.cuda.device(owner_device):
-            owner_stream = torch.cuda.current_stream(owner_device)
             for start in range(0, rows, micro_batch):
                 stop = min(rows, start + micro_batch)
                 count = stop - start
-                source_values = value[start:stop].to(
-                    torch.bfloat16
-                ).contiguous()
-                source_ids = route_ids[start:stop].contiguous()
-                source_weights = route_weights[start:stop].float().contiguous()
-                source_ready.record(owner_stream)
-                contributions = []
-                for rank, cached in zip(rank_order, rank_workspaces):
-                    device = self.devices[rank]
-                    stream = self._streams[rank]
-                    with (
-                        torch.cuda.device(device),
-                        torch.cuda.stream(stream),
-                    ):
-                        stream.wait_event(source_ready)
-                        cached.inputs[:count].copy_(
-                            source_values,
-                            non_blocking=True,
-                        )
-                        cached.route_ids[:count].copy_(
-                            source_ids,
-                            non_blocking=True,
-                        )
-                        cached.route_weights[:count].copy_(
-                            source_weights,
-                            non_blocking=True,
-                        )
-                        if native8_prefill:
-                            partial = self._run_rows_native8_rank(
-                                layer,
-                                rank,
-                                cached.inputs[:count],
-                                cached.route_ids[:count],
-                                cached.route_weights[:count],
-                                cached.result[:count],
-                                count,
-                                top_k,
-                                activation,
-                                activation_beta,
-                                activation_linear_beta,
-                                limit,
-                            )
-                        elif packed_grouped_prefill:
-                            partial = self._run_rows_packed_grouped_rank(
-                                layer,
-                                rank,
-                                cached.inputs[:count],
-                                cached.route_ids[:count],
-                                cached.route_weights[:count],
-                                cached.hidden,
-                                cached.result[:count],
-                                count,
-                                top_k,
-                                activation,
-                                activation_beta,
-                                activation_linear_beta,
-                                limit,
-                            )
-                        elif dequant_prefill:
-                            partial = self._run_rows_dequant_rank(
-                                layer,
-                                rank,
-                                cached.inputs[:count],
-                                cached.route_ids[:count],
-                                cached.route_weights[:count],
-                                cached.result[:count],
-                                count,
-                                top_k,
-                                activation,
-                                activation_beta,
-                                activation_linear_beta,
-                                limit,
-                            )
-                        else:
-                            raise RuntimeError(
-                                "packed Row-TP Prefill requires a registered "
-                                "grouped executor; decode GEMV is forbidden"
-                            )
-                        contributions.append(partial)
-                        done_events[rank].record(stream)
-                reduced = tp_all_rank_reduce_from_events_fused(
-                    contributions,
-                    done_events,
-                    [result[start:stop]],
-                    [output_event],
+                with torch.cuda.device(owner_device):
+                    self._run_rows_native8_rank(
+                        int(layer),
+                        owner,
+                        value[start:stop].to(torch.bfloat16).contiguous(),
+                        route_ids[start:stop].contiguous(),
+                        route_weights[start:stop].float().contiguous(),
+                        result[start:stop],
+                        count,
+                        top_k,
+                        activation,
+                        activation_beta,
+                        activation_linear_beta,
+                        limit,
+                        workspace_capacity=configured_batch * top_k,
+                    )
+                self.prefill_batch_submissions += 1
+                self.prefill_batch_max = max(self.prefill_batch_max, count)
+        else:
+            if self.parallelism != "tensor":
+                raise RuntimeError(
+                    "multi-device resident CUDA Prefill requires the public "
+                    "tensor-sharded Native8 executor"
                 )
-                if reduced is None:
-                    raise RuntimeError(
-                        "packed prefill Row-TP reduction was rejected"
+            if not self._streams or not self._source_events:
+                raise RuntimeError("Native8 tensor Prefill streams are unavailable")
+            for start in range(0, rows, micro_batch):
+                stop = min(rows, start + micro_batch)
+                with torch.cuda.device(value.device):
+                    self._run_rows_native8_all_rank(
+                        int(layer),
+                        value[start:stop].to(torch.bfloat16).contiguous(),
+                        route_ids[start:stop].contiguous(),
+                        route_weights[start:stop].float().contiguous(),
+                        result[start:stop],
+                        activation=activation,
+                        activation_beta=activation_beta,
+                        activation_linear_beta=activation_linear_beta,
+                        limit=limit,
+                        workspace_capacity=configured_batch * top_k,
                     )
                 self.prefill_batch_submissions += 1
                 self.prefill_batch_max = max(
                     self.prefill_batch_max,
-                    count,
+                    stop - start,
                 )
+
         self.prefill_batch_rows += rows
         self.hits += int(route_ids.numel())
         return result
@@ -3972,6 +3800,7 @@ class ResidentRoutedVQPool:
                 )
         owner = self.plan.owner_by_layer[layer]
         route_device = self.devices[owner]
+        owner_device = route_device
         if (
             route_ids.device != route_device
             or route_weights.device != route_device
@@ -3980,95 +3809,19 @@ class ResidentRoutedVQPool:
                 "replicated packed prefill routes must be on the layer owner"
             )
 
-        micro_batch = min(
-            prefill_moe_batch_size(default=int(prefill_default)),
-            rows,
+        configured_batch = prefill_moe_batch_size(
+            default=int(prefill_default)
         )
-        intermediate = int(self.store.cfg["moe_inter"])
-        local_intermediate = (
-            intermediate // self.tensor_group_size
-            if self.parallelism in {"tensor", "hybrid"}
-            else intermediate
-        )
-
-        def workspace(rank: int) -> _PackedPrefillWorkspace:
-            cached = self._prefill_workspaces.get(rank)
-            if (
-                cached is not None
-                and cached.capacity >= micro_batch
-                and cached.top_k == top_k
-                and cached.hidden.shape[1] == 2 * local_intermediate
-                and cached.result.shape[1] == hidden
-            ):
-                return cached
-            device = self.devices[rank]
-            with torch.cuda.device(device):
-                cached = _PackedPrefillWorkspace(
-                    capacity=micro_batch,
-                    top_k=top_k,
-                    inputs=torch.empty(
-                        micro_batch,
-                        hidden,
-                        dtype=torch.bfloat16,
-                        device=device,
-                    ),
-                    route_ids=torch.empty(
-                        micro_batch,
-                        top_k,
-                        dtype=torch.long,
-                        device=device,
-                    ),
-                    route_weights=torch.empty(
-                        micro_batch,
-                        top_k,
-                        dtype=torch.float32,
-                        device=device,
-                    ),
-                    hidden=torch.empty(
-                        micro_batch * top_k,
-                        2 * local_intermediate,
-                        dtype=torch.bfloat16,
-                        device=device,
-                    ),
-                    output=torch.empty(
-                        micro_batch * top_k,
-                        hidden,
-                        dtype=torch.bfloat16,
-                        device=device,
-                    ),
-                    result=torch.empty(
-                        micro_batch,
-                        hidden,
-                        dtype=torch.float32,
-                        device=device,
-                    ),
-                )
-            self._prefill_workspaces[rank] = cached
-            return cached
-
-        from .fusedext import tp_all_rank_reduce_from_events_fused
-
-        native8_prefill = self._native8_layer_supported(layer)
-        capability = self.store.man.projection_operator_capability(layer)
-        dequant_prefill = bool(
-            not native8_prefill
-            and len(capability.get("packed_formats", ())) == 3
-            and self.store.man.projection_vq
-            and self._dequant_supported(layer)
-        )
-        if not native8_prefill and not dequant_prefill:
+        micro_batch = min(configured_batch, rows)
+        if not self._native8_layer_supported(layer):
             raise RuntimeError(
-                "replicated packed CUDA Prefill requires Native8 or exact "
-                "dequant + grouped GEMM; decode GEMV fallback is forbidden"
+                "replicated CUDA Prefill requires the public Native8 grouped "
+                "executor; alternate model paths are not supported"
             )
-        if native8_prefill:
-            self.prefill_executor = (
-                "cuda.vq-to-e4m3-scaled-grouped-gemm."
-                f"{self._native8_grouped_backend}"
-            )
-        else:
-            self.prefill_executor = "cuda.dequant-grouped-gemm"
-            self._prefill_dequant_launch(layer, intermediate, hidden)
+        self.prefill_executor = (
+            "cuda.vq-to-native8-scaled-grouped-gemm."
+            f"{self._native8_grouped_backend}"
+        )
         outputs = [
             torch.empty(
                 rows,
@@ -4078,108 +3831,26 @@ class ResidentRoutedVQPool:
             )
             for device in self.devices
         ]
-        rank_workspaces = tuple(
-            self._native8_prefill_rank_workspace(
-                rank,
-                capacity=micro_batch,
-                top_k=top_k,
-                hidden=hidden,
-            )
-            if native8_prefill
-            else workspace(rank)
-            for rank in range(len(self.devices))
-        )
-        done_events = [
-            self._done_events[rank][layer]
-            for rank in range(len(self.devices))
-        ]
-        output_events = [
-            self._output_events[rank][layer]
-            for rank in range(len(self.devices))
-        ]
-        # Each source replica may have been produced on a different current
-        # stream by the preceding Row-TP reduction.  Record one local event
-        # and make the packed streams wait before reading it.
-        source_events = []
-        for rank, device in enumerate(self.devices):
-            with torch.cuda.device(device):
-                event = torch.cuda.Event()
-                event.record(torch.cuda.current_stream(device))
-                source_events.append(event)
-        owner_device = self.devices[owner]
-        with torch.cuda.device(owner_device):
-            route_ready = torch.cuda.Event()
-            route_ready.record(torch.cuda.current_stream(owner_device))
-
         for start in range(0, rows, micro_batch):
             stop = min(rows, start + micro_batch)
-            count = stop - start
-            contributions = []
-            for rank, cached in enumerate(rank_workspaces):
-                device = self.devices[rank]
-                stream = self._streams[rank]
-                with torch.cuda.device(device), torch.cuda.stream(stream):
-                    # The previous reduction must no longer read this rank's
-                    # scratch before its next result/kernel is overwritten.
-                    stream.wait_event(output_events[rank])
-                    stream.wait_event(source_events[rank])
-                    stream.wait_event(route_ready)
-                    cached.inputs[:count].copy_(
-                        values[rank][start:stop],
-                        non_blocking=True,
-                    )
-                    cached.route_ids[:count].copy_(
-                        route_ids[start:stop],
-                        non_blocking=True,
-                    )
-                    cached.route_weights[:count].copy_(
-                        route_weights[start:stop],
-                        non_blocking=True,
-                    )
-                    if native8_prefill:
-                        partial = self._run_rows_native8_rank(
-                            layer,
-                            rank,
-                            cached.inputs[:count],
-                            cached.route_ids[:count],
-                            cached.route_weights[:count],
-                            cached.result[:count],
-                            count,
-                            top_k,
-                            activation,
-                            activation_beta,
-                            activation_linear_beta,
-                            limit,
-                        )
-                    else:
-                        partial = self._run_rows_dequant_rank(
-                            layer,
-                            rank,
-                            cached.inputs[:count],
-                            cached.route_ids[:count],
-                            cached.route_weights[:count],
-                            cached.result[:count],
-                            count,
-                            top_k,
-                            activation,
-                            activation_beta,
-                            activation_linear_beta,
-                            limit,
-                        )
-                    contributions.append(partial)
-                    done_events[rank].record(stream)
-            reduced = tp_all_rank_reduce_from_events_fused(
-                contributions,
-                done_events,
-                [output[start:stop] for output in outputs],
-                output_events,
-            )
-            if reduced is None:
-                raise RuntimeError(
-                    "replicated packed prefill Row-TP reduction was rejected"
+            with torch.cuda.device(owner_device):
+                self._run_rows_native8_all_rank(
+                    layer,
+                    [value[start:stop] for value in values],
+                    route_ids[start:stop].contiguous(),
+                    route_weights[start:stop].float().contiguous(),
+                    [output[start:stop] for output in outputs],
+                    activation=activation,
+                    activation_beta=activation_beta,
+                    activation_linear_beta=activation_linear_beta,
+                    limit=limit,
+                    workspace_capacity=configured_batch * top_k,
                 )
             self.prefill_batch_submissions += 1
-            self.prefill_batch_max = max(self.prefill_batch_max, count)
+            self.prefill_batch_max = max(
+                self.prefill_batch_max,
+                stop - start,
+            )
 
         # The fused reducer enqueues one kernel per destination device.  Make
         # the caller's ordinary stream observe that completion before it
@@ -4187,7 +3858,7 @@ class ResidentRoutedVQPool:
         for rank, device in enumerate(self.devices):
             with torch.cuda.device(device):
                 torch.cuda.current_stream(device).wait_event(
-                    output_events[rank]
+                    self._output_events[rank][layer]
                 )
         self.prefill_batch_rows += rows
         self.hits += int(route_ids.numel())

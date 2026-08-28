@@ -2441,7 +2441,7 @@ def main(argv: list[str] | None = None) -> None:
                 "CCCP_H2D_BATCH",
                 "CCCP_PACKED_MOE_GRAPH",
                 "CCCP_LOAD_WORKERS",
-                "CCCP_DSV4_TOKEN_GRAPH",
+                "CCCP_TOKEN_GRAPH",
                 "CCCP_TP_LAYER_GRAPH",
                 "CCCP_ROUTED_WARPS",
                 "CCCP_PREFILL_BLOCK_TOKENS",

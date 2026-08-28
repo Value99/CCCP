@@ -127,24 +127,14 @@ def plan_routed_vq_pool(
     )
     if resolved.type == "cpu":
         return RoutedVQPoolPlan(
-            (
-                "packed_cpu"
-                if packed_cpu
-                else "codebook_combined" if expert_codebook_vq else "legacy"
-            )
+            "packed_cpu" if expert_codebook_vq else "legacy"
         )
-    if not projection_vq:
-        return RoutedVQPoolPlan(
-            (
-                "codebook_combined_parallel"
-                if expert_codebook_vq and tp_size > 1
-                else "codebook_combined"
-                if expert_codebook_vq
-                else "legacy_parallel"
-                if tp_size > 1
-                else "legacy"
+    if not expert_codebook_vq:
+        if tp_size > 1:
+            raise ValueError(
+                "multi-device routed experts require a codebook archive"
             )
-        )
+        return RoutedVQPoolPlan("legacy")
     if tp_size > 1 and tensor_hybrid_requested:
         return RoutedVQPoolPlan(
             "packed_tensor_hybrid",
@@ -164,10 +154,12 @@ def plan_routed_vq_pool(
                 )
             ),
         )
-    return RoutedVQPoolPlan(
-        "packed_hybrid",
-        packed_device_pool=True,
-    )
+    if projection_vq:
+        return RoutedVQPoolPlan(
+            "packed_hybrid",
+            packed_device_pool=True,
+        )
+    return RoutedVQPoolPlan("codebook_combined")
 
 
 def _runtime_flag(name: str, default: str = "0") -> bool:
@@ -309,10 +301,6 @@ def create_routed_vq_runtime(
             vram_cache_gb,
             ram_gb=cache_gb,
         )
-    elif plan.kind in {"legacy_parallel", "codebook_combined_parallel"}:
-        from ..expert_parallel import GpuResidentExpertParallel
-
-        pool = GpuResidentExpertParallel(store, tp_size, resolved)
     else:
         from ..store import ExpertPool
 
@@ -1140,7 +1128,7 @@ class RoutedVQExecutor:
         )
         if rows == 1 and not callable(operation):
             operation = getattr(self._pool, "run_native", None)
-        if not callable(operation) and rows > 1:
+        if not callable(operation):
             mode = "Prefill" if rows > 1 else "Decode"
             raise RuntimeError(
                 f"public routed VQ executor has no {mode} implementation"
@@ -1161,39 +1149,10 @@ class RoutedVQExecutor:
         )
         if result is not None:
             return result
-        if rows != 1:
-            raise RuntimeError("public routed VQ Prefill returned no result")
-        get_many = getattr(self._pool, "get_many", None)
-        if not callable(get_many):
-            raise RuntimeError("public routed VQ Decode returned no result")
-        ids = [int(item) for item in route_ids.reshape(-1).tolist()]
-        keys = [(int(layer), expert_id) for expert_id in ids]
-        selected = get_many(keys)
-        experts = [selected[key] for key in keys]
-        from .api import packed_moe_selected_topk
-
-        fallback = packed_moe_selected_topk(
-            value.float(),
-            experts,
-            route_weights.reshape(-1).float(),
-            activation=activation,
-            activation_beta=float(activation_beta),
-            activation_linear_beta=activation_linear_beta,
-            limit=float(limit),
+        mode = "Prefill" if rows > 1 else "Decode"
+        raise RuntimeError(
+            f"public routed VQ executor has no {mode} implementation"
         )
-        if fallback is None:
-            from ..grouped import moe_mlp_grouped_mixed
-
-            fallback = moe_mlp_grouped_mixed(
-                value.float(),
-                experts,
-                route_weights.reshape(-1).float(),
-                limit=float(limit),
-                activation=activation,
-                situ_beta=float(activation_beta),
-                situ_linear_beta=activation_linear_beta,
-            )
-        return fallback
 
     def prepare(
         self,

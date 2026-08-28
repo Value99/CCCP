@@ -504,6 +504,20 @@ def _causal_latent_prefill(**kwargs):
     return causal_latent_prefill(**kwargs)
 
 
+def _cccp_paged_latent_prefill(**kwargs):
+    from ..fusedext import latent_mla_attention_prefill_fused
+
+    return latent_mla_attention_prefill_fused(
+        kwargs["query_nope"],
+        kwargs["query_rope"],
+        kwargs["latent_cache"],
+        kwargs["rope_cache"],
+        int(kwargs["query_start"]),
+        float(kwargs["scale_denominator"]),
+        kwargs.get("output"),
+    )
+
+
 def _latent_mla_decode(**kwargs):
     from ..fusedext import latent_mla_attention_decode_fused
 
@@ -1033,6 +1047,11 @@ def register(registry: OperatorRegistry) -> None:
             _causal_latent_prefill,
         ),
         (
+            "cuda.attention.cccp_paged_latent.prefill",
+            "cccp_paged_latent_prefill",
+            _cccp_paged_latent_prefill,
+        ),
+        (
             "cuda.attention.compressed_kv.decode",
             "compressed_kv_decode",
             _latent_mla_decode,
@@ -1056,6 +1075,7 @@ def register(registry: OperatorRegistry) -> None:
                         "kda_recurrent_batch",
                         "paged_latent_prefill",
                         "causal_latent_prefill",
+                        "cccp_paged_latent_prefill",
                     )
                     else (1,)
                 ),

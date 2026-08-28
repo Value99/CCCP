@@ -14,7 +14,7 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
-from ..kernels import BlockFP8Weight, ProjectionGroup
+from ..kernels import BlockFP8Weight, Int4Weight, ProjectionGroup
 
 
 def _weight_shape(weight) -> torch.Size:
@@ -23,7 +23,7 @@ def _weight_shape(weight) -> torch.Size:
 
 def _weight_is_bf16_linear(weight) -> bool:
     return (
-        isinstance(weight, (BlockFP8Weight, ProjectionGroup))
+        isinstance(weight, (BlockFP8Weight, Int4Weight, ProjectionGroup))
         or (
             isinstance(weight, torch.Tensor)
             and weight.dtype == torch.bfloat16
@@ -40,6 +40,32 @@ def _linear(
     from .api import linear
 
     return linear(value, weight, output_dtype=output_dtype)
+
+
+def _linear_batch(
+    value: torch.Tensor,
+    weight,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Public shape-based batched projection dispatcher."""
+    from .api import linear_batch
+
+    return linear_batch(value, weight, output_dtype=output_dtype)
+
+
+def _int4_tensor_core_half(
+    weight: Int4Weight,
+    device: torch.device,
+) -> bool:
+    """Select compact Int4 expansion dtype from the target device."""
+    mode = os.environ.get("CCCP_INT4_HALF", "auto").strip().lower()
+    if mode in {"1", "true", "on", "yes"}:
+        return True
+    if mode in {"0", "false", "off", "no"}:
+        return False
+    if mode not in {"", "auto"}:
+        raise ValueError("CCCP_INT4_HALF must be auto, 0, or 1")
+    return bool(weight.half or device.type == "cuda")
 
 
 def _projection_parts(weight, rows: tuple[int, ...]) -> tuple:
@@ -72,6 +98,14 @@ def _row_slice(weight, start: int, stop: int, device: torch.device):
                 torch.bfloat16,
             ).to(device).contiguous()
         return weight.row_slice(start, stop).to(device)
+    if isinstance(weight, Int4Weight):
+        return Int4Weight(
+            weight.q[start:stop].to(device).contiguous(),
+            weight.s[start:stop].to(device).contiguous(),
+            weight.cols,
+            weight.gs,
+            half=_int4_tensor_core_half(weight, device),
+        )
     shard = weight[start:stop]
     if shard.device == device:
         return shard.clone(memory_format=torch.contiguous_format)
@@ -95,6 +129,20 @@ def _column_slice(weight, start: int, stop: int, device: torch.device):
                 torch.bfloat16,
             )[:, start:stop].to(device).contiguous()
         return weight.column_slice(start, stop).to(device)
+    if isinstance(weight, Int4Weight):
+        if start % weight.gs or stop % weight.gs:
+            return weight.dequant_rows(0, weight.shape[0])[
+                :, start:stop
+            ].to(device).contiguous()
+        return Int4Weight(
+            weight.q[:, start // 2:stop // 2].to(device).contiguous(),
+            weight.s[:, start // weight.gs:stop // weight.gs]
+            .to(device)
+            .contiguous(),
+            stop - start,
+            weight.gs,
+            half=_int4_tensor_core_half(weight, device),
+        )
     return weight[:, start:stop].to(device).contiguous()
 
 
@@ -3943,6 +3991,7 @@ class MLASpec:
     v_head_dim: int
     max_ctx: int
     rms_eps: float
+    output_gate: bool = True
 
 
 @dataclass
@@ -4008,19 +4057,25 @@ class TensorParallelMLA:
         self._paged_ready_events: list[torch.cuda.Event] | None = None
         self._paged_init_error: str | None = None
         self._cache_capacity = spec.max_ctx
+        self._prefill_input_events: list[torch.cuda.Event] | None = None
+        self._prefill_output_events: list[torch.cuda.Event] | None = None
         self._prepare_paged_runners()
 
     @property
     def attention_backend(self) -> str:
-        return (
-            "flashinfer-split-kv"
-            if self._paged_runners is not None
-            else "native-serial-kv"
+        from .mla_backend import select_cuda_mla_backend
+
+        return select_cuda_mla_backend(
+            flashinfer_ready=self._paged_runners is not None,
         )
 
     def _prepare_paged_runners(self) -> None:
         """Create one shared split-KV runner per rank, not per layer."""
+        from .mla_backend import select_cuda_mla_backend
+
         if (
+            select_cuda_mla_backend(flashinfer_ready=True) != "flashinfer"
+            or
             os.environ.get("CCCP_FLASHINFER_MLA", "1") == "0"
             or self.spec.kv_lora_rank != 512
             or self.spec.qk_rope_head_dim != 64
@@ -4165,7 +4220,11 @@ class TensorParallelMLA:
             spec.q_lora_rank
             + spec.kv_lora_rank
             + spec.qk_rope_head_dim
-            + spec.heads * spec.v_head_dim
+            + (
+                spec.heads * spec.v_head_dim
+                if spec.output_gate
+                else 0
+            )
         )
         if (
             not _weight_is_bf16_linear(combined_input)
@@ -4194,14 +4253,21 @@ class TensorParallelMLA:
             raise ValueError(
                 f"TP MLA layer {layer} weight shape/dtype mismatch"
             )
-        query_a, kv_a, gate = _projection_parts(
-            combined_input,
+        input_rows = (
             (
                 spec.q_lora_rank,
                 spec.kv_lora_rank + spec.qk_rope_head_dim,
                 spec.heads * spec.v_head_dim,
-            ),
+            )
+            if spec.output_gate
+            else (
+                spec.q_lora_rank,
+                spec.kv_lora_rank + spec.qk_rope_head_dim,
+            )
         )
+        input_parts = _projection_parts(combined_input, input_rows)
+        query_a, kv_a = input_parts[:2]
+        gate = input_parts[2] if spec.output_gate else None
         key_parts = key_absorb.chunk(len(self.devices), dim=0)
         value_parts = value_absorb.chunk(len(self.devices), dim=0)
         local_gate_width = self.local_heads * spec.v_head_dim
@@ -4232,19 +4298,14 @@ class TensorParallelMLA:
                 local_positions.append(
                     torch.zeros(1, dtype=torch.long, device=device)
                 )
+                replicated = (
+                    _row_slice(query_a, 0, int(query_a.shape[0]), device),
+                    _row_slice(kv_a, 0, int(kv_a.shape[0]), device),
+                )
                 input_weights.append(
                     _combine_projection_parts(
-                        (
-                            (
-                                query_a.to(device)
-                                if isinstance(query_a, BlockFP8Weight)
-                                else query_a.to(device).contiguous()
-                            ),
-                            (
-                                kv_a.to(device)
-                                if isinstance(kv_a, BlockFP8Weight)
-                                else kv_a.to(device).contiguous()
-                            ),
+                        replicated
+                        + (
                             _row_slice(
                                 gate,
                                 rank * local_gate_width,
@@ -4252,6 +4313,8 @@ class TensorParallelMLA:
                                 device,
                             ),
                         )
+                        if gate is not None
+                        else replicated
                     )
                 )
                 query_norms.append(query_norm.to(device).contiguous())
@@ -4365,7 +4428,11 @@ class TensorParallelMLA:
         split = (
             spec.q_lora_rank,
             spec.kv_lora_rank + spec.qk_rope_head_dim,
-            self.local_heads * spec.v_head_dim,
+            *(
+                (self.local_heads * spec.v_head_dim,)
+                if spec.output_gate
+                else ()
+            ),
         )
         scale_denominator = float(q_width**0.5)
         for state in self.layers.values():
@@ -4407,11 +4474,15 @@ class TensorParallelMLA:
                         raise RuntimeError(
                             "TP MLA input dispatch was rejected"
                         )
-                    query_source, compressed, output_gate = _linear(
+                    projected = _linear(
                         state.local_inputs[rank],
                         state.input_projection[rank],
                         torch.bfloat16,
                     ).split(split, dim=-1)
+                    query_source, compressed = projected[:2]
+                    output_gate = (
+                        projected[2] if spec.output_gate else None
+                    )
                     query_source = rmsnorm(
                         query_source,
                         state.query_norm[rank],
@@ -4501,7 +4572,8 @@ class TensorParallelMLA:
                         context,
                         state.value_absorb[rank].transpose(1, 2),
                     ).reshape(1, -1)
-                    output.mul_(output_gate.sigmoid())
+                    if output_gate is not None:
+                        output.mul_(output_gate.sigmoid())
                     return _linear(
                         output,
                         state.output_projection[rank],
@@ -4559,6 +4631,305 @@ class TensorParallelMLA:
                 events,
                 source_event,
             )
+
+    def prefill_rank(
+        self,
+        layer: int,
+        rank: int,
+        value: torch.Tensor,
+        position: int,
+        paged_prefill: bool,
+        *,
+        projected_input: torch.Tensor | None = None,
+        rotary: Callable[
+            [torch.Tensor, torch.Tensor, int],
+            tuple[torch.Tensor, torch.Tensor],
+        ] | None = None,
+        stat_add: Callable[[str, int], None] | None = None,
+    ) -> torch.Tensor:
+        """Run the shared batched latent-attention implementation."""
+        from .api import attention_step, rmsnorm
+
+        if rank < 0 or rank >= len(self.devices):
+            raise ValueError("TP MLA rank is out of range")
+        state = self.layers[layer]
+        spec = self.spec
+        device = self.devices[rank]
+        rows = int(value.shape[0])
+        if projected_input is None and value.device != device:
+            raise ValueError("TP MLA prefill input is on the wrong rank")
+        if rows <= 0 or position < 0 or position + rows > self._cache_capacity:
+            raise ValueError("TP MLA prefill range exceeds cache capacity")
+
+        local_heads = self.local_heads
+        q_width = spec.qk_nope_head_dim + spec.qk_rope_head_dim
+        projected = projected_input
+        if projected is None:
+            projected = _linear_batch(
+                value,
+                state.input_projection[rank],
+                torch.bfloat16,
+            ).to(torch.bfloat16)
+        elif spec.output_gate:
+            raise ValueError(
+                "shared MLA input projection requires an ungated topology"
+            )
+        split = (
+            spec.q_lora_rank,
+            spec.kv_lora_rank + spec.qk_rope_head_dim,
+            *((local_heads * spec.v_head_dim,) if spec.output_gate else ()),
+        )
+        parts = projected.split(split, dim=-1)
+        query_source, compressed = parts[:2]
+        output_gate = parts[2] if spec.output_gate else None
+        query_source = rmsnorm(
+            query_source.contiguous(),
+            state.query_norm[rank],
+            spec.rms_eps,
+        )
+        if query_source is None:
+            raise RuntimeError("TP MLA query RMSNorm unavailable")
+        query = _linear_batch(
+            query_source,
+            state.query_projection[rank],
+            torch.bfloat16,
+        ).to(torch.bfloat16).view(rows, local_heads, q_width)
+        query_nope, query_rope = query.split(
+            (spec.qk_nope_head_dim, spec.qk_rope_head_dim),
+            dim=-1,
+        )
+        latent, key_rope = compressed.split(
+            (spec.kv_lora_rank, spec.qk_rope_head_dim),
+            dim=-1,
+        )
+        latent = rmsnorm(
+            latent.contiguous(),
+            state.kv_norm[rank],
+            spec.rms_eps,
+        )
+        if latent is None:
+            raise RuntimeError("TP MLA KV RMSNorm unavailable")
+        if rotary is not None:
+            query_rope, key_rope = rotary(
+                query_rope,
+                key_rope,
+                int(position),
+            )
+            query_rope = query_rope.to(latent.dtype)
+            key_rope = key_rope.to(state.rope_cache[rank].dtype)
+
+        positions = torch.arange(
+            position,
+            position + rows,
+            dtype=torch.long,
+            device=device,
+        )
+        state.latent_cache[rank].index_copy_(0, positions, latent)
+        state.rope_cache[rank].index_copy_(
+            0, positions, key_rope.contiguous()
+        )
+        # Heads are the BMM batch dimension; never materialize token×head
+        # broadcast expansions for long context.
+        absorbed = torch.bmm(
+            query_nope.transpose(0, 1).contiguous(),
+            state.key_absorb[rank],
+        ).transpose(0, 1)
+        contexts = torch.empty(
+            rows,
+            local_heads,
+            spec.kv_lora_rank,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        requested_backend = os.environ.get(
+            "CCCP_PREFILL_MLA_BACKEND", "auto"
+        ).strip().lower()
+        if requested_backend not in {"auto", "flashinfer", "cccp-paged"}:
+            raise ValueError(
+                "CCCP_PREFILL_MLA_BACKEND must be auto, flashinfer or "
+                f"cccp-paged, got {requested_backend!r}"
+            )
+        runners = self._paged_runners
+        from .mla_backend import select_cuda_mla_backend
+
+        if requested_backend == "auto":
+            backend = select_cuda_mla_backend(
+                flashinfer_ready=(
+                    paged_prefill and runners is not None
+                ),
+            )
+        else:
+            backend = requested_backend
+        context = None
+        if (
+            backend == "flashinfer"
+            and paged_prefill
+            and runners is not None
+        ):
+            runner = runners[rank]
+            page_size = int(runner.page_size)
+            context = attention_step(
+                "paged_latent_prefill",
+                "cuda",
+                runner=runner,
+                query_nope=absorbed,
+                query_rope=query_rope,
+                latent_cache=state.latent_cache[rank].view(
+                    self._cache_capacity // page_size,
+                    page_size,
+                    spec.kv_lora_rank,
+                ),
+                rope_cache=state.rope_cache[rank].view(
+                    self._cache_capacity // page_size,
+                    page_size,
+                    spec.qk_rope_head_dim,
+                ),
+                output=contexts,
+            )
+            if context is not None and stat_add is not None:
+                stat_add("mla_paged_calls", 1)
+                stat_add("mla_paged_tokens", rows)
+        if backend == "flashinfer" and context is None:
+            raise RuntimeError(
+                "TP MLA FlashInfer prefill was selected but is unavailable"
+            )
+        if backend == "cccp-paged":
+            context = attention_step(
+                "cccp_paged_latent_prefill",
+                "cuda",
+                query_nope=absorbed,
+                query_rope=query_rope,
+                latent_cache=state.latent_cache[rank],
+                rope_cache=state.rope_cache[rank],
+                query_start=position,
+                scale_denominator=float(q_width**0.5),
+                output=contexts,
+            )
+            if context is not None and stat_add is not None:
+                stat_add("mla_cccp_paged_calls", 1)
+                stat_add("mla_cccp_paged_tokens", rows)
+        if context is None:
+            raise RuntimeError(
+                f"TP MLA optimized CUDA prefill backend {backend!r} "
+                "is unavailable; ordinary BF16 attention is forbidden"
+            )
+
+        output = torch.bmm(
+            context.transpose(0, 1).contiguous(),
+            state.value_absorb[rank].transpose(1, 2),
+        ).transpose(0, 1).reshape(rows, -1)
+        if self.spec.output_gate:
+            output.mul_(output_gate.sigmoid())
+        return _linear_batch(
+            output,
+            state.output_projection[rank],
+        ).float()
+
+    def prefill_primary(
+        self,
+        layer: int,
+        value: torch.Tensor,
+        position: int,
+        *,
+        rotary: Callable[
+            [torch.Tensor, torch.Tensor, int, int],
+            tuple[torch.Tensor, torch.Tensor],
+        ] | None = None,
+        stat_add: Callable[[str, int], None] | None = None,
+    ) -> torch.Tensor:
+        """Shard one batched MLA block and return the owner-rank result."""
+        from ..fusedext import tp_all_rank_reduce_from_events_fused
+
+        state = self.layers[layer]
+        owner = int(state.owner)
+        owner_device = self.devices[owner]
+        if value.device != owner_device:
+            raise ValueError("TP MLA primary input is not on its owner rank")
+        rows = int(value.shape[0])
+        paged = self.prepare_paged_prefill(position, rows)
+        projected_primary = (
+            _linear_batch(
+                value,
+                state.input_projection[owner],
+                torch.bfloat16,
+            ).to(torch.bfloat16)
+            if not self.spec.output_gate
+            else None
+        )
+        partials: list[torch.Tensor] = []
+        for rank, device in enumerate(self.devices):
+            with torch.cuda.device(device):
+                local = (
+                    value
+                    if rank == owner or projected_primary is not None
+                    else value.to(device, non_blocking=True)
+                )
+                projected_input = (
+                    None
+                    if projected_primary is None
+                    else projected_primary
+                    if rank == owner
+                    else projected_primary.to(device, non_blocking=True)
+                )
+                rank_rotary = (
+                    None
+                    if rotary is None
+                    else lambda query, key, offset, rank=rank: rotary(
+                        query, key, offset, rank
+                    )
+                )
+                partials.append(
+                    self.prefill_rank(
+                        layer,
+                        rank,
+                        local,
+                        position,
+                        paged,
+                        projected_input=projected_input,
+                        rotary=rank_rotary,
+                        stat_add=stat_add,
+                    )
+                )
+        if self._prefill_input_events is None:
+            self._prefill_input_events = []
+            self._prefill_output_events = []
+            for device in self.devices:
+                with torch.cuda.device(device):
+                    self._prefill_input_events.append(torch.cuda.Event())
+                    event = torch.cuda.Event()
+                    event.record(torch.cuda.current_stream(device))
+                    self._prefill_output_events.append(event)
+        for rank, device in enumerate(self.devices):
+            with torch.cuda.device(device):
+                self._prefill_input_events[rank].record(
+                    torch.cuda.current_stream(device)
+                )
+        with torch.cuda.device(owner_device):
+            output = torch.empty(
+                rows,
+                self.spec.hidden_size,
+                dtype=torch.bfloat16,
+                device=owner_device,
+            )
+        reduced = tp_all_rank_reduce_from_events_fused(
+            partials,
+            self._prefill_input_events,
+            [output],
+            [self._prefill_output_events[owner]],
+        )
+        if reduced is None:
+            for device in self.devices:
+                torch.cuda.synchronize(device)
+            total = partials[0]
+            for partial in partials[1:]:
+                total = total + partial.to(owner_device)
+            output.copy_(total.to(torch.bfloat16))
+            return output
+        with torch.cuda.device(owner_device):
+            torch.cuda.current_stream(owner_device).wait_event(
+                self._prefill_output_events[owner]
+            )
+        return output
 
     def run(
         self,

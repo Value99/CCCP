@@ -903,7 +903,7 @@ class Qwen35DenseVQModel:
             self.device.type == "cuda"
             and torch.version.hip is None
             and self._gpu_image in {"bf16", "fp8", "int4"}
-            and os.environ.get("CCCP_QWEN35_TOKEN_GRAPH", "1") != "0"
+            and os.environ.get("CCCP_TOKEN_GRAPH", "1") != "0"
         )
 
     def _forward_token_graph(
@@ -1142,7 +1142,7 @@ class Qwen35DenseVQModel:
             return self.forward_hidden(token_ids)
         enabled = bool(
             self._token_graph_enabled()
-            and os.environ.get("CCCP_QWEN35_VERIFY_GRAPH", "1") != "0"
+            and os.environ.get("CCCP_VERIFY_GRAPH", "1") != "0"
         )
         if not enabled:
             return self._forward_hidden_verify_eager(ids, batch)

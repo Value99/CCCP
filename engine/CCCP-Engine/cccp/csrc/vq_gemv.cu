@@ -34,8 +34,12 @@
 
 #include <torch/extension.h>
 #include <mma.h>
+#include <ATen/ops/_scaled_grouped_mm.h>
+#include <ATen/ops/index_select.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Exceptions.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -2256,8 +2260,9 @@ void tp_peer_copy(
     TORCH_CHECK(
         source.scalar_type() == at::kFloat ||
         source.scalar_type() == at::kLong ||
+        source.scalar_type() == at::kInt ||
         source.scalar_type() == at::kBFloat16,
-        "TP peer copy currently supports float32, bfloat16 and int64");
+        "TP peer copy currently supports float32, bfloat16, int32 and int64");
     const int source_device = source.get_device();
     const int target_device = destination.get_device();
     int current = -1;
@@ -2282,6 +2287,11 @@ void tp_peer_copy(
         tp_peer_copy_kernel<<<blocks, 256, 0, stream>>>(
             source.data_ptr<int64_t>(),
             destination.data_ptr<int64_t>(),
+            count);
+    } else if (source.scalar_type() == at::kInt) {
+        tp_peer_copy_kernel<<<blocks, 256, 0, stream>>>(
+            source.data_ptr<int32_t>(),
+            destination.data_ptr<int32_t>(),
             count);
     } else {
         tp_peer_copy_kernel<<<blocks, 256, 0, stream>>>(
@@ -7215,9 +7225,21 @@ torch::Tensor packed_moe_topk_grouped(
         (output_rows + warps - 1) / warps,
         max_group_tiles,
         groups);
+    const size_t gate_shared_bytes =
+        static_cast<size_t>(tokens) * input_cols * sizeof(__nv_bfloat16);
+    if (gate_shared_bytes >= 48 * 1024) {
+        const auto status = cccp_gpu_func_set_attribute(
+            vq_projection_gate_up_grouped_kernel<warps, tokens>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(gate_shared_bytes));
+        TORCH_CHECK(
+            status == cudaSuccess,
+            "failed to configure grouped gate/up shared memory (",
+            gate_shared_bytes, " bytes): ", cudaGetErrorString(status));
+    }
     vq_projection_gate_up_grouped_kernel<warps, tokens><<<
         gate_grid, block,
-        static_cast<size_t>(tokens) * input_cols * sizeof(__nv_bfloat16),
+        gate_shared_bytes,
         stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(input.data_ptr<at::BFloat16>()),
             token_ids.data_ptr<int64_t>(), group_experts.data_ptr<int64_t>(),
@@ -7232,9 +7254,21 @@ torch::Tensor packed_moe_topk_grouped(
         (input_cols + warps - 1) / warps,
         max_group_tiles,
         groups);
+    const size_t down_shared_bytes =
+        static_cast<size_t>(tokens) * output_rows * sizeof(__nv_bfloat16);
+    if (down_shared_bytes >= 48 * 1024) {
+        const auto status = cccp_gpu_func_set_attribute(
+            vq_projection_down_grouped_kernel<warps, tokens>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(down_shared_bytes));
+        TORCH_CHECK(
+            status == cudaSuccess,
+            "failed to configure grouped down shared memory (",
+            down_shared_bytes, " bytes): ", cudaGetErrorString(status));
+    }
     vq_projection_down_grouped_kernel<warps, tokens><<<
         down_grid, block,
-        static_cast<size_t>(tokens) * output_rows * sizeof(__nv_bfloat16),
+        down_shared_bytes,
         stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(hidden_workspace.data_ptr<at::BFloat16>()),
             token_ids.data_ptr<int64_t>(), group_experts.data_ptr<int64_t>(),
@@ -11618,6 +11652,139 @@ __global__ void latent_mla_attention_value_kernel(
         __float2bfloat16_rn(value);
 }
 
+// Public causal MLA Prefill for the native Windows/CUDA package.  One block
+// owns one (query, head) pair.  Its warps cooperatively evaluate the visible
+// latent-KV rows, then the whole block performs the online-normalization
+// phases.  The bounded score workspace is reused in row chunks by the host
+// wrapper below; no [heads, full-query, full-history] tensor is materialised.
+__global__ void latent_mla_attention_prefill_scores_kernel(
+    const __nv_bfloat16* __restrict__ qa,
+    const __nv_bfloat16* __restrict__ qrot,
+    const __nv_bfloat16* __restrict__ ckv,
+    const __nv_bfloat16* __restrict__ krot,
+    float* __restrict__ scores,
+    const int query_start,
+    const int rows,
+    const int heads,
+    const int latent,
+    const int rope,
+    const int capacity,
+    const float scale)
+{
+    const int query_head = blockIdx.x;
+    const int row = query_head / heads;
+    const int head = query_head - row * heads;
+    if (row >= rows) return;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int nwarps = blockDim.x >> 5;
+    const int length = min(query_start + row + 1, capacity);
+    const __nv_bfloat16* qah =
+        qa + (static_cast<long>(row) * heads + head) * latent;
+    const __nv_bfloat16* qrh =
+        qrot + (static_cast<long>(row) * heads + head) * rope;
+    float* row_scores =
+        scores + (static_cast<long>(row) * heads + head) * capacity;
+    __shared__ float reduced[8];
+    __shared__ float score_max;
+    __shared__ float denominator;
+
+    float warp_max = -INFINITY;
+    for (int token = warp; token < length; token += nwarps) {
+        const __nv_bfloat16* ck =
+            ckv + static_cast<long>(token) * latent;
+        const __nv_bfloat16* kr =
+            krot + static_cast<long>(token) * rope;
+        float nope_score = 0.0f;
+        float rope_score = 0.0f;
+        for (int dim = lane; dim < latent; dim += 32) {
+            nope_score = fmaf(
+                __bfloat162float(qah[dim]),
+                __bfloat162float(ck[dim]),
+                nope_score);
+        }
+        for (int dim = lane; dim < rope; dim += 32) {
+            rope_score = fmaf(
+                __bfloat162float(qrh[dim]),
+                __bfloat162float(kr[dim]),
+                rope_score);
+        }
+        nope_score = warp_sum_f32(nope_score);
+        rope_score = warp_sum_f32(rope_score);
+        if (lane == 0) {
+            nope_score = __bfloat162float(
+                __float2bfloat16_rn(nope_score));
+            rope_score = __bfloat162float(
+                __float2bfloat16_rn(rope_score));
+            const float merged = __bfloat162float(
+                __float2bfloat16_rn(nope_score + rope_score));
+            const float score = __bfloat162float(
+                __float2bfloat16_rn(merged / scale));
+            row_scores[token] = score;
+            warp_max = fmaxf(warp_max, score);
+        }
+    }
+    if (lane == 0) reduced[warp] = warp_max;
+    __syncthreads();
+    if (warp == 0) {
+        float value = lane < nwarps ? reduced[lane] : -INFINITY;
+        value = warp_max_f32(value);
+        if (lane == 0) score_max = value;
+    }
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int token = tid; token < length; token += blockDim.x) {
+        const float value = expf(row_scores[token] - score_max);
+        row_scores[token] = value;
+        local_sum += value;
+    }
+    local_sum = warp_sum_f32(local_sum);
+    if (lane == 0) reduced[warp] = local_sum;
+    __syncthreads();
+    if (warp == 0) {
+        float value = lane < nwarps ? reduced[lane] : 0.0f;
+        value = warp_sum_f32(value);
+        if (lane == 0) denominator = value;
+    }
+    __syncthreads();
+    for (int token = tid; token < length; token += blockDim.x) {
+        row_scores[token] = __bfloat162float(
+            __float2bfloat16_rn(row_scores[token] / denominator));
+    }
+}
+
+__global__ void latent_mla_attention_prefill_value_kernel(
+    const float* __restrict__ scores,
+    const __nv_bfloat16* __restrict__ ckv,
+    __nv_bfloat16* __restrict__ output,
+    const int query_start,
+    const int rows,
+    const int heads,
+    const int latent,
+    const int capacity)
+{
+    const int query_head = blockIdx.x;
+    const int row = query_head / heads;
+    const int head = query_head - row * heads;
+    const int dim = blockIdx.y * blockDim.x + threadIdx.x;
+    if (row >= rows || dim >= latent) return;
+    const int length = min(query_start + row + 1, capacity);
+    const float* weights =
+        scores + (static_cast<long>(row) * heads + head) * capacity;
+    float value = 0.0f;
+    for (int token = 0; token < length; ++token) {
+        value = fmaf(
+            weights[token],
+            __bfloat162float(
+                ckv[static_cast<long>(token) * latent + dim]),
+            value);
+    }
+    output[(static_cast<long>(row) * heads + head) * latent + dim] =
+        __float2bfloat16_rn(value);
+}
+
 torch::Tensor latent_mla_attention_decode(
     torch::Tensor qa,
     torch::Tensor qrot,
@@ -11715,6 +11882,117 @@ torch::Tensor latent_mla_attention_decode(
             heads,
             latent,
             capacity);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+torch::Tensor latent_mla_attention_prefill(
+    torch::Tensor qa,
+    torch::Tensor qrot,
+    torch::Tensor ckv,
+    torch::Tensor krot,
+    int64_t query_start,
+    double scale,
+    torch::Tensor score_workspace,
+    c10::optional<torch::Tensor> output_buffer)
+{
+    TORCH_CHECK(
+        qa.is_cuda() && qrot.is_cuda() && ckv.is_cuda() &&
+        krot.is_cuda() && score_workspace.is_cuda(),
+        "latent MLA prefill tensors must be CUDA");
+    TORCH_CHECK(
+        qa.scalar_type() == at::kBFloat16 &&
+        qrot.scalar_type() == at::kBFloat16 &&
+        ckv.scalar_type() == at::kBFloat16 &&
+        krot.scalar_type() == at::kBFloat16 &&
+        score_workspace.scalar_type() == at::kFloat,
+        "latent MLA prefill requires BF16 state and FP32 scores");
+    TORCH_CHECK(
+        qa.is_contiguous() && qrot.is_contiguous() &&
+        ckv.is_contiguous() && krot.is_contiguous() &&
+        score_workspace.is_contiguous(),
+        "latent MLA prefill tensors must be contiguous");
+    TORCH_CHECK(
+        qa.dim() == 3 && qrot.dim() == 3 &&
+        qa.size(0) == qrot.size(0) &&
+        qa.size(1) == qrot.size(1) &&
+        ckv.dim() == 2 && krot.dim() == 2 &&
+        ckv.size(0) == krot.size(0) &&
+        ckv.size(1) == qa.size(2) &&
+        krot.size(1) == qrot.size(2) &&
+        score_workspace.dim() == 3 &&
+        score_workspace.size(1) == qa.size(1) &&
+        score_workspace.size(2) == ckv.size(0) &&
+        score_workspace.size(0) > 0 && query_start >= 0 &&
+        query_start + qa.size(0) <= ckv.size(0) && scale > 0.0,
+        "latent MLA prefill shapes do not match");
+    const int device = qa.get_device();
+    TORCH_CHECK(
+        qrot.get_device() == device && ckv.get_device() == device &&
+        krot.get_device() == device &&
+        score_workspace.get_device() == device,
+        "latent MLA prefill tensors must share one device");
+    auto output = output_buffer.has_value()
+        ? output_buffer.value()
+        : torch::empty_like(qa);
+    TORCH_CHECK(
+        output.is_cuda() && output.scalar_type() == at::kBFloat16 &&
+        output.is_contiguous() && output.sizes() == qa.sizes() &&
+        output.get_device() == device,
+        "latent MLA prefill output must be contiguous BF16 and match Q-A");
+
+    const int rows = static_cast<int>(qa.size(0));
+    const int heads = static_cast<int>(qa.size(1));
+    const int latent = static_cast<int>(qa.size(2));
+    const int rope = static_cast<int>(qrot.size(2));
+    const int capacity = static_cast<int>(ckv.size(0));
+    const int workspace_rows = static_cast<int>(score_workspace.size(0));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    for (int start = 0; start < rows; start += workspace_rows) {
+        const int chunk_rows = min(workspace_rows, rows - start);
+        const auto qa_offset = static_cast<long>(start) * heads * latent;
+        const auto qrot_offset = static_cast<long>(start) * heads * rope;
+        const auto output_offset = static_cast<long>(start) * heads * latent;
+        latent_mla_attention_prefill_scores_kernel<<<
+            chunk_rows * heads,
+            256,
+            0,
+            stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(
+                    qa.data_ptr<at::BFloat16>()) + qa_offset,
+                reinterpret_cast<const __nv_bfloat16*>(
+                    qrot.data_ptr<at::BFloat16>()) + qrot_offset,
+                reinterpret_cast<const __nv_bfloat16*>(
+                    ckv.data_ptr<at::BFloat16>()),
+                reinterpret_cast<const __nv_bfloat16*>(
+                    krot.data_ptr<at::BFloat16>()),
+                score_workspace.data_ptr<float>(),
+                static_cast<int>(query_start) + start,
+                chunk_rows,
+                heads,
+                latent,
+                rope,
+                capacity,
+                static_cast<float>(scale));
+        const dim3 value_grid(
+            chunk_rows * heads,
+            (latent + 255) / 256);
+        latent_mla_attention_prefill_value_kernel<<<
+            value_grid,
+            256,
+            0,
+            stream>>>(
+                score_workspace.data_ptr<float>(),
+                reinterpret_cast<const __nv_bfloat16*>(
+                    ckv.data_ptr<at::BFloat16>()),
+                reinterpret_cast<__nv_bfloat16*>(
+                    output.data_ptr<at::BFloat16>()) + output_offset,
+                static_cast<int>(query_start) + start,
+                chunk_rows,
+                heads,
+                latent,
+                capacity);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
@@ -19301,6 +19579,327 @@ void launch_tp_all_rank_reduce_one(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+torch::Tensor tp_native8_grouped_moe_all_rank(
+    std::vector<torch::Tensor> source_inputs,
+    torch::Tensor source_token_ids,
+    torch::Tensor source_group_experts,
+    torch::Tensor source_group_offsets,
+    torch::Tensor source_route_weights,
+    std::vector<torch::Tensor> metadata_by_rank,
+    std::vector<torch::Tensor> scales_by_rank,
+    std::vector<std::vector<torch::Tensor>> workspaces_by_rank,
+    std::vector<torch::Tensor> outputs,
+    std::vector<int64_t> devices,
+    std::vector<int64_t> streams,
+    std::vector<int64_t> done_events,
+    std::vector<int64_t> source_events,
+    std::vector<int64_t> output_events,
+    int64_t activation,
+    double beta,
+    double linear_beta,
+    double limit)
+{
+    const size_t ranks = devices.size();
+    TORCH_CHECK(
+        ranks > 0 && ranks <= 16 && streams.size() == ranks &&
+        done_events.size() == ranks && metadata_by_rank.size() == ranks &&
+        scales_by_rank.size() == ranks && workspaces_by_rank.size() == ranks &&
+        (source_inputs.size() == 1 || source_inputs.size() == ranks) &&
+        (outputs.size() == 1 || outputs.size() == ranks) &&
+        source_events.size() == source_inputs.size() &&
+        output_events.size() == outputs.size(),
+        "native8 all-rank Prefill requires matching rank resources");
+    const auto& primary_input = source_inputs[0];
+    const auto& primary_output = outputs[0];
+    TORCH_CHECK(
+        primary_input.is_cuda() && primary_input.is_contiguous() &&
+        primary_input.scalar_type() == at::kBFloat16 &&
+        primary_input.dim() == 2 && source_token_ids.is_cuda() &&
+        source_token_ids.is_contiguous() &&
+        source_token_ids.scalar_type() == at::kLong &&
+        source_group_experts.is_cuda() &&
+        source_group_experts.is_contiguous() &&
+        source_group_experts.scalar_type() == at::kLong &&
+        source_group_offsets.is_cuda() &&
+        source_group_offsets.is_contiguous() &&
+        source_group_offsets.scalar_type() == at::kInt &&
+        source_route_weights.is_cuda() &&
+        source_route_weights.is_contiguous() &&
+        source_route_weights.scalar_type() == at::kFloat &&
+        source_token_ids.numel() == source_route_weights.numel() &&
+        source_group_offsets.numel() == source_group_experts.numel() + 1,
+        "native8 all-rank Prefill source tensors are invalid");
+    const int primary = static_cast<int>(devices[0]);
+    TORCH_CHECK(
+        primary_input.get_device() == primary &&
+        source_token_ids.get_device() == primary &&
+        source_group_experts.get_device() == primary &&
+        source_group_offsets.get_device() == primary &&
+        source_route_weights.get_device() == primary &&
+        primary_output.is_cuda() && primary_output.get_device() == primary &&
+        primary_output.is_contiguous() &&
+        primary_output.scalar_type() == at::kFloat &&
+        primary_output.dim() == 2 &&
+        primary_output.sizes() == primary_input.sizes(),
+        "native8 all-rank Prefill must begin on its primary CUDA rank");
+    int original_device = -1;
+    C10_CUDA_CHECK(cudaGetDevice(&original_device));
+    TORCH_CHECK(
+        original_device == primary,
+        "native8 all-rank Prefill called under the wrong CUDA device");
+    const auto primary_stream = at::cuda::getCurrentCUDAStream(primary);
+    for (size_t index = 0; index < source_inputs.size(); ++index) {
+        const int source_device = source_inputs.size() == 1
+            ? primary
+            : static_cast<int>(devices[index]);
+        const auto& input = source_inputs[index];
+        TORCH_CHECK(
+            input.is_cuda() && input.is_contiguous() &&
+            input.scalar_type() == at::kBFloat16 &&
+            input.sizes() == primary_input.sizes() &&
+            input.get_device() == source_device &&
+            source_events[index] != 0,
+            "native8 all-rank rank-local input is invalid");
+        C10_CUDA_CHECK(cudaSetDevice(source_device));
+        const auto producer = at::cuda::getCurrentCUDAStream(source_device);
+        C10_CUDA_CHECK(cudaEventRecord(
+            reinterpret_cast<cudaEvent_t>(
+                static_cast<uintptr_t>(source_events[index])),
+            producer));
+    }
+    for (size_t index = 0; index < outputs.size(); ++index) {
+        const int output_device = outputs.size() == 1
+            ? primary
+            : static_cast<int>(devices[index]);
+        TORCH_CHECK(
+            outputs[index].is_cuda() && outputs[index].is_contiguous() &&
+            outputs[index].scalar_type() == at::kFloat &&
+            outputs[index].sizes() == primary_output.sizes() &&
+            outputs[index].get_device() == output_device &&
+            output_events[index] != 0,
+            "native8 all-rank rank-local output is invalid");
+    }
+    C10_CUDA_CHECK(cudaSetDevice(primary));
+    const auto route_ready = reinterpret_cast<cudaEvent_t>(
+        static_cast<uintptr_t>(source_events[0]));
+
+    auto copy_field = [](
+        const torch::Tensor& source,
+        const torch::Tensor& destination,
+        int target,
+        cudaStream_t stream) {
+        TORCH_CHECK(
+            source.is_cuda() && destination.is_cuda() &&
+            source.is_contiguous() && destination.is_contiguous() &&
+            source.scalar_type() == destination.scalar_type() &&
+            source.numel() == destination.numel() &&
+            destination.get_device() == target,
+            "native8 all-rank publication tensors must match");
+        const size_t bytes = static_cast<size_t>(source.numel()) *
+            static_cast<size_t>(source.element_size());
+        if (source.get_device() == target) {
+            C10_CUDA_CHECK(cudaMemcpyAsync(
+                destination.data_ptr(), source.data_ptr(), bytes,
+                cudaMemcpyDeviceToDevice, stream));
+        } else {
+            ensure_peer_access(
+                target,
+                source.get_device(),
+                "native8 all-rank Prefill publication");
+            C10_CUDA_CHECK(cudaMemcpyPeerAsync(
+                destination.data_ptr(), target,
+                source.data_ptr(), source.get_device(), bytes, stream));
+        }
+    };
+
+    std::vector<torch::Tensor> contributions;
+    contributions.reserve(ranks);
+    for (size_t rank = 0; rank < ranks; ++rank) {
+        const int target = static_cast<int>(devices[rank]);
+        auto& workspace = workspaces_by_rank[rank];
+        TORCH_CHECK(
+            workspace.size() == 16,
+            "native8 all-rank Prefill workspace must contain 16 tensors");
+        const auto external = c10::cuda::getStreamFromExternal(
+            reinterpret_cast<cudaStream_t>(
+                static_cast<uintptr_t>(streams[rank])),
+            static_cast<c10::DeviceIndex>(target));
+        c10::cuda::CUDAStreamGuard stream_guard(external);
+        const auto rank_stream = external.stream();
+        const auto input_ready = reinterpret_cast<cudaEvent_t>(
+            static_cast<uintptr_t>(
+                source_events[source_inputs.size() == 1 ? 0 : rank]));
+        C10_CUDA_CHECK(cudaStreamWaitEvent(rank_stream, input_ready, 0));
+        if (rank != 0) {
+            C10_CUDA_CHECK(cudaStreamWaitEvent(rank_stream, route_ready, 0));
+        }
+        if (outputs.size() == ranks) {
+            // Every destination reduction reads every rank contribution.
+            // A rank-local producer therefore cannot reuse its result
+            // workspace until *all* destination consumers have completed.
+            // Waiting only for the same-rank output races at long Prefill
+            // batches and eventually overwrites a remote reduction input.
+            for (
+                size_t output_rank = 0;
+                output_rank < outputs.size();
+                ++output_rank
+            ) {
+                C10_CUDA_CHECK(cudaStreamWaitEvent(
+                    rank_stream,
+                    reinterpret_cast<cudaEvent_t>(
+                        static_cast<uintptr_t>(
+                            output_events[output_rank])),
+                    0));
+            }
+        }
+
+        torch::Tensor local_inputs = source_inputs.size() == 1
+            ? source_inputs[0]
+            : source_inputs[rank];
+        torch::Tensor local_token_ids = source_token_ids;
+        torch::Tensor local_group_experts = source_group_experts;
+        torch::Tensor local_group_offsets = source_group_offsets;
+        torch::Tensor local_route_weights = source_route_weights;
+        if (rank != 0) {
+            if (source_inputs.size() == 1) {
+                copy_field(
+                    source_inputs[0], workspace[0], target, rank_stream);
+                local_inputs = workspace[0];
+            }
+            copy_field(source_token_ids, workspace[1], target, rank_stream);
+            copy_field(
+                source_group_experts, workspace[2], target, rank_stream);
+            copy_field(
+                source_group_offsets, workspace[3], target, rank_stream);
+            copy_field(
+                source_route_weights, workspace[4], target, rank_stream);
+            local_token_ids = workspace[1];
+            local_group_experts = workspace[2];
+            local_group_offsets = workspace[3];
+            local_route_weights = workspace[4];
+        }
+
+        auto selected_metadata = workspace[5];
+        auto selected_scales = workspace[6];
+        auto gate_up_weights = workspace[7];
+        auto down_weights = workspace[8];
+        auto native_input = workspace[9];
+        auto input_scales = workspace[10];
+        auto gate_up_scales = workspace[11];
+        auto down_scales = workspace[12];
+        auto activated = workspace[13];
+        auto activated_scales = workspace[14];
+        auto result = workspace[15];
+        TORCH_CHECK(
+            metadata_by_rank[rank].get_device() == target &&
+            scales_by_rank[rank].get_device() == target &&
+            result.get_device() == target && result.scalar_type() == at::kFloat &&
+            result.sizes() == primary_output.sizes(),
+            "native8 all-rank rank tensors are invalid");
+
+        at::index_select_out(
+            selected_metadata,
+            metadata_by_rank[rank],
+            1,
+            local_group_experts);
+        at::index_select_out(
+            selected_scales,
+            scales_by_rank[rank],
+            0,
+            local_group_experts);
+        vq_projection_expand_native8(
+            selected_metadata,
+            gate_up_weights,
+            down_weights);
+
+        auto grouped_input = at::index_select(
+            local_inputs,
+            0,
+            local_token_ids);
+        dense_fp8_quantize_rows(
+            grouped_input,
+            native_input,
+            input_scales);
+        const int64_t intermediate = down_weights.size(2);
+        gate_up_scales.slice(1, 0, intermediate).copy_(
+            selected_scales.slice(1, 0, 1));
+        gate_up_scales.slice(1, intermediate).copy_(
+            selected_scales.slice(1, 1, 2));
+        down_scales.copy_(selected_scales.slice(1, 2, 3));
+        auto offsets = local_group_offsets.slice(0, 1);
+        auto gate_up = at::_scaled_grouped_mm(
+            native_input,
+            gate_up_weights.transpose(1, 2),
+            input_scales.view({-1}),
+            gate_up_scales,
+            offsets,
+            std::nullopt,
+            std::nullopt,
+            at::kBFloat16,
+            true);
+        gated_activation_fp8_quantize_rows(
+            gate_up,
+            activated,
+            activated_scales,
+            activation,
+            beta,
+            linear_beta,
+            limit);
+        auto routed = at::_scaled_grouped_mm(
+            activated,
+            down_weights.transpose(1, 2),
+            activated_scales.view({-1}),
+            down_scales,
+            offsets,
+            std::nullopt,
+            std::nullopt,
+            at::kBFloat16,
+            true);
+        result.zero_();
+        result.index_add_(
+            0,
+            local_token_ids,
+            routed.to(at::kFloat).mul(
+                local_route_weights.unsqueeze(1)));
+        C10_CUDA_CHECK(cudaEventRecord(
+            reinterpret_cast<cudaEvent_t>(
+                static_cast<uintptr_t>(done_events[rank])),
+            rank_stream));
+        contributions.push_back(result);
+    }
+
+    for (size_t output_rank = 0; output_rank < outputs.size(); ++output_rank) {
+        const int target = outputs.size() == 1
+            ? primary
+            : static_cast<int>(devices[output_rank]);
+        C10_CUDA_CHECK(cudaSetDevice(target));
+        const auto target_stream = at::cuda::getCurrentCUDAStream(target);
+        for (size_t rank = 0; rank < ranks; ++rank) {
+            C10_CUDA_CHECK(cudaStreamWaitEvent(
+                target_stream,
+                reinterpret_cast<cudaEvent_t>(
+                    static_cast<uintptr_t>(done_events[rank])),
+                0));
+            if (contributions[rank].get_device() != target) {
+                ensure_peer_access(
+                    target,
+                    contributions[rank].get_device(),
+                    "native8 all-rank Prefill reduction");
+            }
+        }
+        launch_tp_all_rank_reduce_one(
+            contributions,
+            outputs[output_rank],
+            target_stream);
+        C10_CUDA_CHECK(cudaEventRecord(
+            reinterpret_cast<cudaEvent_t>(
+                static_cast<uintptr_t>(output_events[output_rank])),
+            target_stream));
+    }
+    C10_CUDA_CHECK(cudaSetDevice(original_device));
+    return outputs[0];
+}
+
 void launch_tp_moe_finalize_one(
     const std::vector<torch::Tensor>& routed_contributions,
     const std::vector<torch::Tensor>& shared_contributions,
@@ -20744,6 +21343,146 @@ public:
             source_event_,
             std::move(contributions),
             residual);
+    }
+
+    torch::Tensor launch_reduce_output(
+        std::vector<torch::Tensor> contributions,
+        torch::Tensor output,
+        int64_t output_event) const
+    {
+        TORCH_CHECK(
+            contributions.size() == devices_.size() &&
+            output.is_cuda() && output.is_contiguous() &&
+            output.get_device() == static_cast<int>(devices_[0]) &&
+            output_event != 0,
+            "TP graph direct reduction requires one contribution per rank, "
+            "a primary-device output and a valid output event");
+        launch_cuda_graphs(
+            devices_,
+            graph_execs_,
+            streams_,
+            done_events_,
+            source_event_);
+        int current_device = -1;
+        C10_CUDA_CHECK(cudaGetDevice(&current_device));
+        TORCH_CHECK(
+            current_device == static_cast<int>(devices_[0]),
+            "TP graph direct reduction must begin on the primary rank");
+        const auto stream = at::cuda::getCurrentCUDAStream(current_device);
+        for (const auto raw_event : done_events_) {
+            C10_CUDA_CHECK(cudaStreamWaitEvent(
+                stream,
+                reinterpret_cast<cudaEvent_t>(
+                    static_cast<uintptr_t>(raw_event)),
+                0));
+        }
+        launch_tp_all_rank_reduce_one(contributions, output, stream);
+        C10_CUDA_CHECK(cudaEventRecord(
+            reinterpret_cast<cudaEvent_t>(
+                static_cast<uintptr_t>(output_event)),
+            stream));
+        return output;
+    }
+
+    torch::Tensor publish_launch_reduce_output(
+        std::vector<torch::Tensor> sources,
+        std::vector<std::vector<torch::Tensor>> destinations,
+        std::vector<torch::Tensor> contributions,
+        torch::Tensor output,
+        int64_t output_event) const
+    {
+        TORCH_CHECK(
+            !sources.empty() && destinations.size() == devices_.size() &&
+            contributions.size() == devices_.size() &&
+            output.is_cuda() && output.is_contiguous() &&
+            output.get_device() == static_cast<int>(devices_[0]) &&
+            output_event != 0,
+            "TP graph publication requires fixed sources, one destination "
+            "set and contribution per rank, and a primary output");
+        int original_device = -1;
+        C10_CUDA_CHECK(cudaGetDevice(&original_device));
+        TORCH_CHECK(
+            original_device == static_cast<int>(devices_[0]),
+            "TP graph publication must begin on the primary rank");
+        const auto ready = reinterpret_cast<cudaEvent_t>(
+            static_cast<uintptr_t>(source_event_));
+        C10_CUDA_CHECK(cudaEventRecord(
+            ready,
+            at::cuda::getCurrentCUDAStream(original_device)));
+
+        for (size_t rank = 0; rank < devices_.size(); ++rank) {
+            TORCH_CHECK(
+                destinations[rank].size() == sources.size(),
+                "TP graph destination fields must match source fields");
+            const int target = static_cast<int>(devices_[rank]);
+            C10_CUDA_CHECK(cudaSetDevice(target));
+            const auto stream = reinterpret_cast<cudaStream_t>(
+                static_cast<uintptr_t>(streams_[rank]));
+            C10_CUDA_CHECK(cudaStreamWaitEvent(stream, ready, 0));
+            for (size_t field = 0; field < sources.size(); ++field) {
+                const auto& source = sources[field];
+                const auto& destination = destinations[rank][field];
+                TORCH_CHECK(
+                    source.is_cuda() && destination.is_cuda() &&
+                    source.is_contiguous() && destination.is_contiguous() &&
+                    source.scalar_type() == destination.scalar_type() &&
+                    source.numel() == destination.numel() &&
+                    destination.get_device() == target,
+                    "TP graph publication tensors must be matching "
+                    "contiguous CUDA buffers on the target rank");
+                const int source_device = source.get_device();
+                const size_t bytes = static_cast<size_t>(source.numel()) *
+                    static_cast<size_t>(source.element_size());
+                if (source_device == target) {
+                    C10_CUDA_CHECK(cudaMemcpyAsync(
+                        destination.data_ptr(),
+                        source.data_ptr(),
+                        bytes,
+                        cudaMemcpyDeviceToDevice,
+                        stream));
+                } else {
+                    ensure_peer_access(
+                        target,
+                        source_device,
+                        "TP graph publication");
+                    C10_CUDA_CHECK(cudaMemcpyPeerAsync(
+                        destination.data_ptr(),
+                        target,
+                        source.data_ptr(),
+                        source_device,
+                        bytes,
+                        stream));
+                }
+            }
+            C10_CUDA_CHECK(cudaGraphLaunch(
+                reinterpret_cast<cudaGraphExec_t>(
+                    static_cast<uintptr_t>(graph_execs_[rank])),
+                stream));
+            C10_CUDA_CHECK(cudaEventRecord(
+                reinterpret_cast<cudaEvent_t>(
+                    static_cast<uintptr_t>(done_events_[rank])),
+                stream));
+        }
+
+        C10_CUDA_CHECK(cudaSetDevice(original_device));
+        const auto primary_stream = at::cuda::getCurrentCUDAStream(
+            original_device);
+        for (const auto raw_event : done_events_) {
+            C10_CUDA_CHECK(cudaStreamWaitEvent(
+                primary_stream,
+                reinterpret_cast<cudaEvent_t>(
+                    static_cast<uintptr_t>(raw_event)),
+                0));
+        }
+        launch_tp_all_rank_reduce_one(
+            contributions,
+            output,
+            primary_stream);
+        C10_CUDA_CHECK(cudaEventRecord(
+            reinterpret_cast<cudaEvent_t>(
+                static_cast<uintptr_t>(output_event)),
+            primary_stream));
+        return output;
     }
 
     std::vector<torch::Tensor> launch_reduce_many(
@@ -23185,6 +23924,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "latent_mla_attention_decode",
         &latent_mla_attention_decode,
         "Dynamic-length BF16 latent MLA decode");
+    m.def("latent_mla_attention_prefill", &latent_mla_attention_prefill,
+        "Bounded-workspace causal BF16 latent MLA prefill");
     m.def(
         "latent_mla_attention_scores",
         &latent_mla_attention_scores,
@@ -23327,6 +24068,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &launch_cuda_graphs_reduce,
           "Launch TP graphs, wait ranks and reduce in one host call");
     m.def(
+          "tp_native8_grouped_moe_all_rank",
+          &tp_native8_grouped_moe_all_rank,
+          "Run Native8 grouped MoE on every TP rank in one host call");
+    m.def(
           "launch_cuda_graphs_reduce_norm_router",
           &launch_cuda_graphs_reduce_norm_router,
           "Launch TP Attention graphs then reduce, normalize and route");
@@ -23353,6 +24098,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("launch_tp1", &TPGraphLaunchBatch::launch_tp1)
         .def("raw_graphs", &TPGraphLaunchBatch::raw_graphs)
         .def("launch_reduce", &TPGraphLaunchBatch::launch_reduce)
+        .def(
+            "launch_reduce_output",
+            &TPGraphLaunchBatch::launch_reduce_output)
+        .def(
+            "publish_launch_reduce_output",
+            &TPGraphLaunchBatch::publish_launch_reduce_output)
         .def(
             "launch_reduce_many",
             &TPGraphLaunchBatch::launch_reduce_many)
