@@ -274,6 +274,7 @@ class DenseVQLinear(nn.Module):
             persistent=False,
         )
         self._cpu_executor = None
+        self.codebook_scale = 1.0
 
     def compile_cpu_prefill_bf16(self) -> bool:
         """Build a persistent BF16 GEMM image without changing Decode Q4."""
@@ -328,24 +329,21 @@ class DenseVQLinear(nn.Module):
         self.layout = "q4_0"
         return True
 
-    def compile_gpu_int4(self) -> bool:
-        if self.payload.device.type != "cuda" or self.layout == "int4_g64":
-            return self.layout == "int4_g64"
-        from .fusedext import dense_vq_compile_int4_g64_fused
+    def compile_gpu_compact_q8(self) -> bool:
+        """Keep packed VQ indices and compile only the shared codebook to Q8."""
+        if self.payload.device.type != "cuda":
+            return False
+        if self.layout == "vq_q8_codebook":
+            return True
+        from .ops.codebook import quantize_q8_codebook
 
-        packed, scales = dense_vq_compile_int4_g64_fused(
-            self.payload,
-            self.codebook,
-            self.rows,
-            self.blocks,
-            self.bits,
+        codebook, scale = quantize_q8_codebook(self.codebook)
+        self.codebook = codebook
+        self.codebook_scale = float(scale)
+        self.gpu_scales = torch.empty(
+            0, dtype=torch.float16, device=self.payload.device
         )
-        self.payload = packed
-        self.gpu_scales = scales
-        self.codebook = torch.empty(
-            0, dtype=torch.float32, device=self.payload.device
-        )
-        self.layout = "int4_g64"
+        self.layout = "vq_q8_codebook"
         return True
 
     def compile_gpu_bf16(self) -> bool:
@@ -554,283 +552,18 @@ class DenseVQLinear(nn.Module):
             return F.linear(rows.to(torch.bfloat16), self.payload)
         if self.layout == "fp8_tensor":
             return self._gpu_fp8(rows)
-        if self.layout == "int4_g64":
-            from .fusedext import int4_gemv_fused
-            from .kernels import Int4Weight
+        if self.layout == "vq_q8_codebook":
+            from .fusedext import dense_vq_gemv_packed_q8_codebook_fused
 
-            if rows.shape[0] == 1:
-                import os
-                if os.environ.get("CCCP_INT4_GEMV_V21", "0") == "1":
-                    from .fusedext import (
-                        int4_gemv_v21_fused,
-                        int4_repack_v21_fused,
-                    )
-                    repacked = getattr(self, "_v21_payload", None)
-                    if repacked is None:
-                        repacked = int4_repack_v21_fused(
-                            self.payload, self.cols
-                        )
-                        self._v21_payload = repacked
-                    result = int4_gemv_v21_fused(
-                        rows.float(),
-                        repacked,
-                        self.gpu_scales,
-                        self.cols,
-                        64,
-                        group_vector=True,
-                    )
-                    if result is not None:
-                        return result
-                if os.environ.get("CCCP_INT4_GEMV_V17", "0") == "1":
-                    from .fusedext import (
-                        int4_gemv_v17_fused,
-                        int4_repack_marlin_fused,
-                    )
-                    repacked = getattr(self, "_marlin_payload", None)
-                    if repacked is None:
-                        repacked = int4_repack_marlin_fused(
-                            self.payload, self.cols
-                        )
-                        self._marlin_payload = repacked
-                    result = int4_gemv_v17_fused(
-                        rows.float(),
-                        repacked,
-                        self.gpu_scales,
-                        self.cols,
-                        64,
-                        group_vector=True,
-                    )
-                    if result is not None:
-                        return result
-                if os.environ.get("CCCP_INT4_GEMV_MARLIN", "0") == "1":
-                    from .fusedext import (
-                        int4_gemv_marlin_fused,
-                        int4_repack_marlin_fused,
-                    )
-                    repacked = getattr(self, "_marlin_payload", None)
-                    if repacked is None:
-                        repacked = int4_repack_marlin_fused(
-                            self.payload, self.cols
-                        )
-                        self._marlin_payload = repacked
-                    result = int4_gemv_marlin_fused(
-                        rows.float(),
-                        repacked,
-                        self.gpu_scales,
-                        self.cols,
-                        64,
-                        group_vector=True,
-                    )
-                    if result is not None:
-                        return result
-                if os.environ.get("CCCP_INT4_GEMV_V4S", "0") == "1":
-                    from .fusedext import int4_gemv_v4s_fused
-                    result = int4_gemv_v4s_fused(
-                        rows.contiguous(),
-                        self.payload,
-                        self.gpu_scales,
-                        self.cols,
-                        64,
-                        group_vector=True,
-                    )
-                    if result is not None:
-                        return result
-                if os.environ.get("CCCP_INT4_GEMV_V2", "0") == "1":
-                    from .fusedext import int4_gemv_v2_fused
-                    result = int4_gemv_v2_fused(
-                        rows.contiguous(),
-                        self.payload,
-                        self.gpu_scales,
-                        self.cols,
-                        64,
-                        group_vector=True,
-                    )
-                    if result is not None:
-                        return result
-                result = int4_gemv_fused(
-                    rows.contiguous(),
-                    self.payload,
-                    self.gpu_scales,
-                    self.cols,
-                    64,
-                    group_vector=True,
-                )
-                if result is None:
-                    raise RuntimeError(
-                        f"CUDA Dense VQ INT4 GEMV unavailable for {self.name}"
-                    )
-                return result
-            batch = int(rows.shape[0])
-            import os  # local: env switch for v21b batch path
-            if (
-                2 <= batch <= 6
-                and rows.is_cuda
-                and os.environ.get("CCCP_INT4_GEMV_VERIFY", "v1b") == "q8"
-            ):
-                from .fusedext import int4_gemv_v30_fused
-
-                result = int4_gemv_v30_fused(
-                    rows,
-                    self.payload,
-                    self.gpu_scales,
-                    self.cols,
-                    64,
-                    group_vector=True,
-                )
-                if result is not None:
-                    return result
-            if (
-                rows.is_cuda
-                and _scaled_mm_available(rows.device)
-                and (
-                    (batch > 6 and os.environ.get(
-                        "CCCP_INT4_PREFILL_FP8", "1"
-                    ) != "0")
-                    or (
-                        2 <= batch <= 6
-                        and os.environ.get(
-                            "CCCP_INT4_GEMV_VERIFY", "v1b"
-                        ) == "fp8"
-                    )
-                )
-            ):
-                # FP8 移植(组路径同款):lm_head 等非分组矩阵的 verify 批
-                # 路径走张量核 scaled_mm。
-                from .fusedext import dense_fp8_quantize_rows_fused
-                from .kernels import dequant_int4
-
-                fp8_w = getattr(self, "_fp8_w", None)
-                if fp8_w is None:
-                    dense = dequant_int4(
-                        self.payload, self.gpu_scales, 64
-                    )
-                    amax = dense.abs().amax().clamp_min(1e-12)
-                    fp8_w = (
-                        (dense * (448.0 / amax)).clamp(-448.0, 448.0)
-                    ).to(torch.float8_e4m3fn)
-                    self._fp8_w = fp8_w.contiguous()
-                    self._fp8_scale = (
-                        (amax / 448.0).reshape(1, 1).contiguous()
-                    )
-                source = rows.to(torch.bfloat16).contiguous()
-                quantized = torch.empty_like(
-                    source, dtype=torch.float8_e4m3fn
-                )
-                scales = torch.empty(
-                    (1, 1), dtype=torch.float32, device=source.device
-                )
-                fused = dense_fp8_quantize_rows_fused(
-                    source, quantized, scales
-                )
-                if fused is not None:
-                    result = torch._scaled_mm(
-                        fused,
-                        self._fp8_w.t(),
-                        scale_a=scales,
-                        scale_b=self._fp8_scale,
-                        out_dtype=torch.bfloat16,
-                        use_fast_accum=True,
-                    ).float()
-                    if (
-                        batch > 6
-                        and os.environ.get(
-                            "CCCP_INT4_PREFILL_FP8", "1"
-                        ) != "persist"
-                    ):
-                        self._fp8_w = None
-                        self._fp8_scale = None
-                    return result
-            if 2 <= batch <= 6 and rows.is_cuda and os.environ.get(
-                "CCCP_INT4_GEMV_V21B", "1"
-            ) != "0":
-                # MTP verify: one batched weight stream instead of per-token
-                # GEMV loops (v21b), keeping memory-bound traffic at 1x.
-                # v1b: bit-identical to per-token v1 (keeps MTP greedy
-                # acceptance) while streaming the weight rows once for B.
-                # VERIFY=v21b(+V21=1): superstep-interleave 批扫,更快但
-                # 需 draft 侧同为 v21 数值。
-                if (
-                    os.environ.get("CCCP_INT4_GEMV_VERIFY", "v1b") == "v21b"
-                    and os.environ.get("CCCP_INT4_GEMV_V21", "0") == "1"
-                ):
-                    from .fusedext import (
-                        int4_gemv_v21b_fused,
-                        int4_repack_v21_fused,
-                    )
-
-                    repacked = getattr(self, "_v21b_payload", None)
-                    if repacked is None:
-                        repacked = int4_repack_v21_fused(
-                            self.payload, self.cols
-                        )
-                        self._v21b_payload = repacked
-                    result = int4_gemv_v21b_fused(
-                        rows.float(),
-                        repacked,
-                        self.gpu_scales,
-                        self.cols,
-                        64,
-                        group_vector=True,
-                    )
-                    if result is not None:
-                        return result
-                from .fusedext import int4_gemv_v1b_fused
-
-                result = int4_gemv_v1b_fused(
-                    rows.float(),
-                    self.payload,
-                    self.gpu_scales,
-                    self.cols,
-                    64,
-                    group_vector=True,
-                )
-                if result is not None:
-                    return result
-            if 2 <= batch <= 16 and rows.is_cuda:
-                # Small-batch verify/prefill: run the fused batch-1 GEMV per
-                # token instead of dequantizing the whole INT4 matrix into a
-                # transient FP16 GEMM operand (which streams 4x the weight
-                # bytes through HBM on every call and dominated MTP verify).
-                from .fusedext import int4_gemv_fused as _gemv1
-
-                _use21 = os.environ.get("CCCP_INT4_GEMV_V21", "0") == "1"
-                if _use21:
-                    from .fusedext import int4_gemv_v21_fused
-                    from .fusedext import int4_repack_marlin_fused
-                    repacked = getattr(self, "_v21_payload", None)
-                    if repacked is None:
-                        repacked = int4_repack_marlin_fused(self.payload, self.cols)
-                        self._v21_payload = repacked
-                    cols21 = [
-                        int4_gemv_v21_fused(
-                            rows[i : i + 1].float().contiguous(),
-                            repacked,
-                            self.gpu_scales,
-                            self.cols, 64, group_vector=True)
-                        for i in range(batch)
-                    ]
-                    if all(c is not None for c in cols21):
-                        return torch.stack(cols21, dim=0)
-                columns = [
-                    _gemv1(
-                        rows[i : i + 1].float().contiguous(),
-                        self.payload,
-                        self.gpu_scales,
-                        self.cols,
-                        64,
-                        group_vector=True,
-                    )
-                    for i in range(batch)
-                ]
-                if all(item is not None for item in columns):
-                    return torch.stack(columns, dim=0)
-            return Int4Weight(
+            return dense_vq_gemv_packed_q8_codebook_fused(
+                rows,
                 self.payload,
-                self.gpu_scales,
-                self.cols,
-                64,
-                half=True,
-            ).matmul_T(rows)
+                self.codebook,
+                self.codebook_scale,
+                self.rows,
+                self.blocks,
+                self.bits,
+            )
         from .ops import dense_vq_dequant_packed, dense_vq_gemv_packed
         if rows.shape[0] == 1:
             result = dense_vq_gemv_packed(
@@ -918,7 +651,7 @@ class DenseVQLinearGroup(nn.Module):
         supported = (
             {"q4_0"}
             if device_type == "cpu"
-            else {"bf16", "int4_g64", "fp8_tensor"}
+            else {"bf16", "fp8_tensor", "vq_q8_codebook"}
         )
         if first.layout not in supported:
             raise ValueError(
@@ -934,6 +667,7 @@ class DenseVQLinearGroup(nn.Module):
         self.rows = sum(self.row_counts)
         self._cpu_executor = None
         self.cpu_members = nn.ModuleList()
+        self.gpu_members = nn.ModuleList()
         if device_type == "cpu":
             from .cpuext import make_resident_projection_cpu
             from .kernels import BlockFP8Weight
@@ -975,6 +709,16 @@ class DenseVQLinearGroup(nn.Module):
                     "native CPU Dense VQ projection grouping is unavailable"
                 )
             common_scale = None
+        elif self.layout == "vq_q8_codebook":
+            # Compact projections can use different codebooks and packing
+            # widths. Keep their immutable public executors under one owner;
+            # views still coalesce the shared-input call at the architecture
+            # boundary without inventing a model-specific weight image.
+            self.gpu_members.extend(linears)
+            common_scale = None
+            combined_payload = torch.empty(
+                0, dtype=torch.uint8, device=first.payload.device
+            )
         elif self.layout == "fp8_tensor":
             # Native tensor-scaled GEMM accepts one scale for the combined B
             # matrix. Normalize each already-compiled projection to the
@@ -1006,15 +750,7 @@ class DenseVQLinearGroup(nn.Module):
             torch.empty(0, dtype=torch.bfloat16),
             persistent=False,
         )
-        if self.layout == "int4_g64":
-            self.register_buffer(
-                "gpu_scales",
-                torch.cat(
-                    tuple(item.gpu_scales for item in linears), dim=0
-                ).contiguous(),
-                persistent=False,
-            )
-        elif self.layout == "fp8_tensor":
+        if self.layout == "fp8_tensor":
             self.register_buffer(
                 "gpu_scales", common_scale.contiguous(), persistent=False
             )
@@ -1164,178 +900,15 @@ class DenseVQLinearGroup(nn.Module):
                 out_dtype=torch.bfloat16,
                 use_fast_accum=True,
             )
+        elif self.layout == "vq_q8_codebook":
+            combined = torch.cat(
+                tuple(member._gpu(rows) for member in self.gpu_members),
+                dim=-1,
+            )
         else:
-            from .fusedext import int4_gemv_fused
-            from .kernels import Int4Weight
-
-            if rows.shape[0] == 1:
-                combined = int4_gemv_fused(
-                    rows.contiguous(),
-                    self.payload,
-                    self.gpu_scales,
-                    self.cols,
-                    64,
-                    group_vector=True,
-                )
-                if combined is None:
-                    raise RuntimeError("grouped Dense VQ INT4 GEMV unavailable")
-            elif (
-                2 <= rows.shape[0] <= 6
-                and rows.is_cuda
-                and os.environ.get("CCCP_INT4_GEMV_VERIFY", "v1b") == "q8"
-            ):
-                # v30(第二十五轮):llama.cpp MMVQ 移植——Q8 激活×int4
-                # 权重 dp4a,原生布局零拷贝,显存保持 int4 档。
-                from .fusedext import int4_gemv_v30_fused
-
-                combined = int4_gemv_v30_fused(
-                    rows,
-                    self.payload,
-                    self.gpu_scales,
-                    self.cols,
-                    64,
-                    group_vector=True,
-                )
-                if combined is None:
-                    combined = Int4Weight(
-                        self.payload,
-                        self.gpu_scales,
-                        self.cols,
-                        64,
-                        half=True,
-                    ).matmul_T(rows)
-            elif (
-                rows.is_cuda
-                and _scaled_mm_available(rows.device)
-                and (
-                    (
-                        rows.shape[0] > 6
-                        and os.environ.get(
-                            "CCCP_INT4_PREFILL_FP8", "1"
-                        ) != "0"
-                    )
-                    or (
-                        2 <= rows.shape[0] <= 6
-                        and os.environ.get(
-                            "CCCP_INT4_GEMV_VERIFY", "v1b"
-                        ) == "fp8"
-                    )
-                )
-            ):
-                # FP8 移植(第二十四轮):verify 批路径走张量核 scaled_mm
-                # ——FP8 档实测有效带宽 ~1.8TB/s,是 CUDA-core int4 GEMV
-                # (892GB/s)的 2 倍。惰性一次性把 int4 组转 E4M3+全张量
-                # scale(镜像 fp8_image 的 [1,1] 张量 scale 路径),显存
-                # +1B/权重。draft 侧保持 int4 数值,接受率由实测裁定。
-                from .fusedext import dense_fp8_quantize_rows_fused
-                from .kernels import dequant_int4
-
-                fp8_w = getattr(self, "_fp8_w", None)
-                if fp8_w is None:
-                    dense = dequant_int4(
-                        self.payload, self.gpu_scales, 64
-                    )
-                    amax = dense.abs().amax().clamp_min(1e-12)
-                    fp8_w = (
-                        (dense * (448.0 / amax)).clamp(-448.0, 448.0)
-                    ).to(torch.float8_e4m3fn)
-                    self._fp8_w = fp8_w.contiguous()
-                    self._fp8_scale = (
-                        (amax / 448.0).reshape(1, 1).contiguous()
-                    )
-                source = rows.to(torch.bfloat16).contiguous()
-                quantized = torch.empty_like(
-                    source, dtype=torch.float8_e4m3fn
-                )
-                scales = torch.empty(
-                    (1, 1), dtype=torch.float32, device=source.device
-                )
-                fused = dense_fp8_quantize_rows_fused(
-                    source, quantized, scales
-                )
-                if fused is None:
-                    raise RuntimeError(
-                        "int4->fp8 verify activation quantizer unavailable"
-                    )
-                combined = torch._scaled_mm(
-                    fused,
-                    self._fp8_w.t(),
-                    scale_a=scales,
-                    scale_b=self._fp8_scale,
-                    out_dtype=torch.bfloat16,
-                    use_fast_accum=True,
-                ).float()
-                if (
-                    rows.shape[0] > 6
-                    and os.environ.get(
-                        "CCCP_INT4_PREFILL_FP8", "1"
-                    ) != "persist"
-                ):
-                    # prefill 瞬态映像:用毕释放,常驻显存保持 int4 档
-                    # (重建成本 ~200ms/次 prefill);=persist 则常驻
-                    # (+13.5GiB)换取连续 prefill 免重建。
-                    self._fp8_w = None
-                    self._fp8_scale = None
-            elif (
-                2 <= rows.shape[0] <= 6
-                and rows.is_cuda
-                and os.environ.get("CCCP_INT4_GEMV_V21B", "1") != "0"
-            ):
-                # MTP verify 批路径:int4 权重单次流扫,替代整矩阵 LUT
-                # 反量化+GEMM(每次调用物化 4× 权重字节,verify 280ms/轮
-                # 主因)。默认 v1b(bit 一致于逐 token v1);VERIFY=v21b 时
-                # 走 superstep-interleave 批扫(需 V21=1 使 draft 同源,
-                # k 分组树与 v21 逐位对齐,repack 缓存 +1 份权重)。
-                if (
-                    os.environ.get("CCCP_INT4_GEMV_VERIFY", "v1b") == "v21b"
-                    and os.environ.get("CCCP_INT4_GEMV_V21", "0") == "1"
-                ):
-                    from .fusedext import (
-                        int4_gemv_v21b_fused,
-                        int4_repack_v21_fused,
-                    )
-
-                    repacked = getattr(self, "_v21b_payload", None)
-                    if repacked is None:
-                        repacked = int4_repack_v21_fused(
-                            self.payload, self.cols
-                        )
-                        self._v21b_payload = repacked
-                    combined = int4_gemv_v21b_fused(
-                        rows.float(),
-                        repacked,
-                        self.gpu_scales,
-                        self.cols,
-                        64,
-                        group_vector=True,
-                    )
-                else:
-                    from .fusedext import int4_gemv_v1b_fused
-
-                    combined = int4_gemv_v1b_fused(
-                        rows.float(),
-                        self.payload,
-                        self.gpu_scales,
-                        self.cols,
-                        64,
-                        group_vector=True,
-                    )
-                if combined is None:
-                    combined = Int4Weight(
-                        self.payload,
-                        self.gpu_scales,
-                        self.cols,
-                        64,
-                        half=True,
-                    ).matmul_T(rows)
-            else:
-                combined = Int4Weight(
-                    self.payload,
-                    self.gpu_scales,
-                    self.cols,
-                    64,
-                    half=True,
-                ).matmul_T(rows)
+            raise RuntimeError(
+                f"unsupported Dense VQ group layout: {self.layout}"
+            )
         return combined.reshape(*shape[:-1], self.rows).to(value.dtype)
 
     def project(self, index: int, value: torch.Tensor) -> torch.Tensor:

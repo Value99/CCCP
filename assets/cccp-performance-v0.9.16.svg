@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="662" viewBox="0 0 1200 662" role="img" aria-labelledby="title desc">
+  <title id="title">CCCP Launcher 0.9.16 H20-3e inference performance</title>
+  <desc id="desc">4096-token Prefill and Decode from a 4096-token context using the bundled CUDA 13 runtime. Values are tokens per second.</desc>
+  <defs>
+    <linearGradient id="paper" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f7e8c8"/><stop offset="1" stop-color="#e8c88f"/>
+    </linearGradient>
+    <linearGradient id="red" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#7b1716"/><stop offset="1" stop-color="#c13b26"/>
+    </linearGradient>
+    <linearGradient id="dark" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4d3930"/><stop offset="1" stop-color="#7a5a48"/>
+    </linearGradient>
+    <filter id="grain" x="-10%" y="-10%" width="120%" height="120%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.8" numOctaves="2" seed="13" result="noise"/>
+      <feColorMatrix in="noise" type="saturate" values="0" result="mono"/>
+      <feComponentTransfer in="mono"><feFuncA type="table" tableValues="0 0.045"/></feComponentTransfer>
+    </filter>
+    <style>
+      text { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; fill: #4d3930; }
+      .eyebrow { font-size: 18px; font-weight: 700; letter-spacing: 2px; fill: #8e2b20; }
+      .headline { font-size: 35px; font-weight: 800; }
+      .subhead { font-size: 17px; fill: #725b4d; }
+      .column { font-size: 15px; font-weight: 700; letter-spacing: 1px; fill: #7b1716; }
+      .model { font-size: 18px; font-weight: 700; }
+      .meta { font-size: 13px; fill: #816b5c; }
+      .value { font-size: 15px; font-weight: 800; fill: #5a201b; }
+      .value-light { font-size: 14px; font-weight: 800; fill: #fff5dd; }
+      .track { fill: #d7ba84; opacity: 0.55; }
+      .bar-red { fill: url(#red); }
+      .bar-dark { fill: url(#dark); }
+      .foot { font-size: 14px; fill: #725b4d; }
+    </style>
+  </defs>
+  <rect width="1200" height="662" rx="18" fill="url(#paper)"/>
+  <rect x="22" y="22" width="1156" height="618" rx="13" fill="none" stroke="#9b6d42" stroke-width="1.5" opacity="0.75"/>
+  <rect width="1200" height="662" rx="18" filter="url(#grain)" opacity="0.42"/>
+  <text x="56" y="55" class="eyebrow">CCCP · VERIFIED PERFORMANCE</text>
+  <text x="56" y="94" class="headline">H20-3e 实模推理性能</text>
+  <text x="56" y="123" class="subhead">随包 CUDA 13 · 4096-token Prefill · 4096 上下文 Decode · token/s</text>
+  <text x="390" y="142" class="column">PREFILL</text>
+  <text x="890" y="142" class="column">DECODE</text>
+  <g class="benchmark-row">
+    <text x="56" y="177" class="model">Qwen3.8 27B CCCP-L</text>
+    <text x="56" y="199" class="meta">TP1</text>
+    <rect x="390" y="160" width="390" height="30" rx="4" class="track"/>
+    <rect x="390" y="160" width="344.63" height="30" rx="4" class="bar-red"/>
+    <text x="798" y="182" class="value">2462.68</text>
+    <rect x="890" y="160" width="238" height="30" rx="4" class="track"/>
+    <rect x="890" y="160" width="238.00" height="30" rx="4" class="bar-dark"/>
+    <text x="1128" y="182" text-anchor="end" class="value-light">56.94</text>
+  </g>
+  <g class="benchmark-row">
+    <text x="56" y="249" class="model">DeepSeek V4 CCCP-S</text>
+    <text x="56" y="271" class="meta">TP1</text>
+    <rect x="390" y="232" width="390" height="30" rx="4" class="track"/>
+    <rect x="390" y="232" width="390.00" height="30" rx="4" class="bar-red"/>
+    <text x="798" y="254" class="value">2786.87</text>
+    <rect x="890" y="232" width="238" height="30" rx="4" class="track"/>
+    <rect x="890" y="232" width="193.22" height="30" rx="4" class="bar-dark"/>
+    <text x="1128" y="254" text-anchor="end" class="value-light">46.23</text>
+  </g>
+  <g class="benchmark-row">
+    <text x="56" y="321" class="model">GLM-5.2 CCCP</text>
+    <text x="56" y="343" class="meta">TP4</text>
+    <rect x="390" y="304" width="390" height="30" rx="4" class="track"/>
+    <rect x="390" y="304" width="130.48" height="30" rx="4" class="bar-red"/>
+    <text x="798" y="326" class="value">932.36</text>
+    <rect x="890" y="304" width="238" height="30" rx="4" class="track"/>
+    <rect x="890" y="304" width="106.49" height="30" rx="4" class="bar-dark"/>
+    <text x="1128" y="326" text-anchor="end" class="value-light">25.48</text>
+  </g>
+  <g class="benchmark-row">
+    <text x="56" y="393" class="model">GLM-5.3-Flash CCCP-S</text>
+    <text x="56" y="415" class="meta">TP1</text>
+    <rect x="390" y="376" width="390" height="30" rx="4" class="track"/>
+    <rect x="390" y="376" width="210.57" height="30" rx="4" class="bar-red"/>
+    <text x="798" y="398" class="value">1504.67</text>
+    <rect x="890" y="376" width="238" height="30" rx="4" class="track"/>
+    <rect x="890" y="376" width="125.45" height="30" rx="4" class="bar-dark"/>
+    <text x="1128" y="398" text-anchor="end" class="value-light">30.02</text>
+  </g>
+  <g class="benchmark-row">
+    <text x="56" y="465" class="model">GLM-5.3-Flash CCCP-M</text>
+    <text x="56" y="487" class="meta">TP2</text>
+    <rect x="390" y="448" width="390" height="30" rx="4" class="track"/>
+    <rect x="390" y="448" width="179.47" height="30" rx="4" class="bar-red"/>
+    <text x="798" y="470" class="value">1282.44</text>
+    <rect x="890" y="448" width="238" height="30" rx="4" class="track"/>
+    <rect x="890" y="448" width="84.51" height="30" rx="4" class="bar-dark"/>
+    <text x="1128" y="470" text-anchor="end" class="value-light">20.22</text>
+  </g>
+  <g class="benchmark-row">
+    <text x="56" y="537" class="model">Kimi K3 CCCP-470</text>
+    <text x="56" y="559" class="meta">TP4</text>
+    <rect x="390" y="520" width="390" height="30" rx="4" class="track"/>
+    <rect x="390" y="520" width="94.05" height="30" rx="4" class="bar-red"/>
+    <text x="798" y="542" class="value">672.04</text>
+    <rect x="890" y="520" width="238" height="30" rx="4" class="track"/>
+    <rect x="890" y="520" width="65.56" height="30" rx="4" class="bar-dark"/>
+    <text x="1128" y="542" text-anchor="end" class="value-light">15.69</text>
+  </g>
+  <line x1="56" y1="602" x2="1144" y2="602" stroke="#a57a50" opacity="0.55"/>
+  <text x="56" y="630" class="foot">同一发布协议；数值来自有限值与性能门禁通过的正式回归记录。不同 TP 代表该模型的发布配置。</text>
+</svg>

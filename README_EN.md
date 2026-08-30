@@ -8,23 +8,23 @@
   <a href="README.md">简体中文</a> · <strong>English</strong> · <a href="README_RU.md">Русский</a>
 </p>
 
-## ⬇️ Download the complete Windows offline package (v0.9.15)
+## ⬇️ Download the complete Windows offline package (v0.9.16)
 
 > [!IMPORTANT]
 > **First-time users must download the complete offline package, not only `CCCP-Launcher.exe`.** Python, Miniconda, CPU/CUDA/AMD runtimes, common prebuilt NVIDIA operators, and dependencies are bundled.
 
-### [👉 Open the GitHub Release download page](https://github.com/Value99/CCCP/releases/tag/v0.9.15)
+### [👉 Open the GitHub Release download page](https://github.com/Value99/CCCP/releases/tag/v0.9.16)
 
 Download these **6 files** into the same folder:
 
-1. `CCCP-Launcher-0.9.15-Offline-Setup.exe`
-2. `CCCP-Launcher-v0.9.15-offline.parts.json`
-3. `CCCP-Launcher-v0.9.15-win-x64-offline.zip.001`
-4. `CCCP-Launcher-v0.9.15-win-x64-offline.zip.002`
-5. `CCCP-Launcher-v0.9.15-win-x64-offline.zip.003`
-6. `CCCP-Launcher-v0.9.15-win-x64-offline.zip.004`
+1. `CCCP-Launcher-0.9.16-Offline-Setup.exe`
+2. `CCCP-Launcher-v0.9.16-offline.parts.json`
+3. `CCCP-Launcher-v0.9.16-win-x64-offline.zip.001`
+4. `CCCP-Launcher-v0.9.16-win-x64-offline.zip.002`
+5. `CCCP-Launcher-v0.9.16-win-x64-offline.zip.003`
+6. `CCCP-Launcher-v0.9.16-win-x64-offline.zip.004`
 
-Run `CCCP-Launcher-0.9.15-Offline-Setup.exe`. It verifies, joins, extracts, and starts the launcher. Model weights are distributed separately.
+Run `CCCP-Launcher-0.9.16-Offline-Setup.exe`. It verifies, joins, extracts, and starts the launcher. Model weights are distributed separately.
 
 <!-- CCCP_AI_MAINTENANCE_START -->
 ## AI maintenance prompt (copyable)
@@ -32,11 +32,20 @@ Run `CCCP-Launcher-0.9.15-Offline-Setup.exe`. It verifies, joins, extracts, and 
 > Thank you to every tester and contributor, and sorry that model/configuration differences can still expose compatibility issues. Give the following block to a coding AI together with your logs:
 
 ```text
-Maintain CCCP Launcher 0.9.15. First read the bundled user-facing manuals docs/中文使用手册.md and docs/依赖与离线环境说明.md, then inspect the launcher terminal log and engine/CCCP-Engine. Reproduce with the bundled CPU/CUDA/AMD runtime and portable compiler only; do not use host Python, host CUDA, model-name branches, silent slow fallbacks, or the private quantization framework. Treat model configuration differences as data from cccp.json. Repair or simplify the public VQ, tensor-parallel, MLA, MoE, memory-planning, or launcher layer that owns the fault. Require finite logits, actual generation, clean process shutdown, and no regression against these H20-3e / bundled CUDA 13 baselines (Prefill/Decode): Qwen3.8 27B CCCP-L TP1 2462.68/56.94 token/s, DeepSeek V4 CCCP-S TP1 2786.87/46.23 token/s, GLM-5.2 CCCP TP4 932.36/25.48 token/s, GLM-5.3-Flash CCCP-S TP1 1504.67/30.02 token/s, GLM-5.3-Flash CCCP-M TP2 1282.44/20.22 token/s, Kimi K3 CCCP-470 TP4 672.04/15.69 token/s. H20 is only an approximate RTX 3090-class compute reference; VRAM capacity and memory bandwidth are not equivalent. Preserve CPU and existing Qwen, DeepSeek V4, GLM-5.2, GLM-5.3-Flash, and Kimi paths. Prefer deleting the broken duplicate branch after the shared path passes tests. Report exact commands, logs, finite-value checks, throughput, changed files, and package verification.
+Maintain CCCP Launcher 0.9.16. First read the bundled user-facing manuals docs/中文使用手册.md and docs/依赖与离线环境说明.md, then inspect the launcher terminal log and engine/CCCP-Engine. Reproduce with the bundled CPU/CUDA/AMD runtime and portable compiler only; do not use host Python, host CUDA, model-name branches, silent slow fallbacks, or the private quantization framework. Treat model configuration differences as data from cccp.json. Repair or simplify the public VQ, tensor-parallel, MLA, MoE, memory-planning, or launcher layer that owns the fault. Require finite logits, actual generation, clean process shutdown, and no regression against these H20-3e / bundled CUDA 13 baselines (Prefill/Decode): Qwen3.8 27B CCCP-L TP1 2462.68/56.94 token/s, DeepSeek V4 CCCP-S TP1 2786.87/46.23 token/s, GLM-5.2 CCCP TP4 932.36/25.48 token/s, GLM-5.3-Flash CCCP-S TP1 1504.67/30.02 token/s, GLM-5.3-Flash CCCP-M TP2 1282.44/20.22 token/s, Kimi K3 CCCP-470 TP4 672.04/15.69 token/s. H20 is only an approximate RTX 3090-class compute reference; VRAM capacity and memory bandwidth are not equivalent. Preserve CPU and existing Qwen, DeepSeek V4, GLM-5.2, GLM-5.3-Flash, and Kimi paths. Prefer deleting the broken duplicate branch after the shared path passes tests. Report exact commands, logs, finite-value checks, throughput, changed files, and package verification.
 ```
 <!-- CCCP_AI_MAINTENANCE_END -->
 
-### Highlights in 0.9.15
+### Highlights in 0.9.16
+
+- All codebook models share one compact CUDA Decode algorithm: packed indices + Q8 codebooks + fused DP4A. Prefill selects the shared packed-VQ or E4M3/FP8 grouped path by capability.
+- Linux/CUDA prefers FlashInfer MLA; native Windows/CUDA explicitly uses the bundled CCCP paged latent CUDA operator and never silently falls back to ordinary BF16 Attention.
+- DSV4, Qwen, GLM, and Kimi declare structure through manifests and reuse the same codebook math, residency planning, and caching without pruning experts.
+- Removes the single-token E4M3 MoE Decode and other legacy branches, and fixes Kimi/MTP workspace lifetime and CUDA builds from non-ASCII install paths.
+- Prebuilds the shared NVIDIA fused operator for SM75, SM80, SM86, SM89, SM90, SM100, and SM120; unmatched future architectures still compile with the bundled CUDA 13 portable toolchain.
+- Measured on H20-3e with the bundled CUDA 13 runtime (Prefill/Decode, token/s): Qwen 2462.68/56.94 (TP1, 4096-token Prefill)、DSV4 2786.87/46.23 (TP1, 4096-token Prefill)、GLM-5.2 932.36/25.48 (TP4, 4096-token Prefill)、GLM Flash S 1504.67/30.02 (TP1, 4096-token Prefill)、GLM Flash M 1282.44/20.22 (TP2, 4096-token Prefill)、Kimi 672.04/15.69 (TP4, 4096-token Prefill). Every model passes its performance and finite-logits gates.
+
+### Highlights in 0.9.16
 
 - All codebook models share one compact CUDA Decode algorithm: packed indices + Q8 codebooks + fused DP4A. Prefill selects the shared packed-VQ or E4M3/FP8 grouped path by capability.
 - Linux/CUDA prefers FlashInfer MLA; native Windows/CUDA explicitly uses the bundled CCCP paged latent CUDA operator and never silently falls back to ordinary BF16 Attention.
@@ -49,7 +58,7 @@ Maintain CCCP Launcher 0.9.15. First read the bundled user-facing manuals docs/�
 
 These release-gated measurements use H20-3e and the bundled CUDA 13 runtime: 4096-token Prefill and Decode from a 4096-token context.
 
-![CCCP 0.9.15 H20-3e performance](assets/cccp-performance-v0.9.15.svg)
+![CCCP 0.9.16 H20-3e performance](assets/cccp-performance-v0.9.16.svg)
 
 | Full model name | Parallelism | Prefill token/s | Decode token/s |
 |---|---:|---:|---:|
@@ -153,7 +162,7 @@ Sources:
 
 ## Quick start
 
-1. Download the Offline Setup, parts manifest, and all four parts from [GitHub Release v0.9.15](https://github.com/Value99/CCCP/releases/tag/v0.9.15).
+1. Download the Offline Setup, parts manifest, and all four parts from [GitHub Release v0.9.16](https://github.com/Value99/CCCP/releases/tag/v0.9.16).
 2. Run the Offline Setup from a writable directory and wait for verification and extraction.
 3. Put a compatible model containing `cccp.json` in the `models` directory next to the application.
 4. Double-click `CCCP-Launcher.exe`.
@@ -238,8 +247,8 @@ Vision input is scheduled for a later release and will open after image preproce
 | Windows 11 x64 · Core i9-13900H · 31.59 GiB RAM | Launcher, EXE, CPU inference, OpenAI API, profile scanning, real generation, full automated suite, and package smoke test | **CPU functionality passed end to end**; huge-model CPU speed is memory-bandwidth dependent and is not mixed with H20 scores |
 | Windows 11 · NVIDIA RTX 3090 (20 GiB process limit) · CUDA 13 | DeepSeek-V4 constrained-VRAM CUDA/RAM, direct pinned transfer, strict LRU, fused decode, and multi-turn generation | **0.9.2 hardware passed** |
 | NVIDIA RTX 5090 | Real CUDA/RAM runs with DeepSeek-V4 and GLM-5.2 | **Engine tested** |
-| Linux · NVIDIA H20-3e · TP1 | Bundled CUDA 13; 4096-token Prefill / Decode from 4096-token context | **Qwen 2462.68/56.94, DSV4 2786.87/46.23 token/s**; both pass the 0.9.15 performance and finite-logits gates |
-| NVIDIA H20-3e · release protocols | GLM-5.2 TP4, GLM Flash S TP1, GLM Flash M TP2, Kimi TP4 (GPU 2/3/4/5); 4096-token Prefill / Decode from 4096-token context | **GLM-5.2 932.36/25.48, GLM S 1504.67/30.02, GLM M 1282.44/20.22, Kimi 672.04/15.69 token/s**; all pass the 0.9.15 performance and finite-logits gates |
+| Linux · NVIDIA H20-3e · TP1 | Bundled CUDA 13; 4096-token Prefill / Decode from 4096-token context | **Qwen 2462.68/56.94, DSV4 2786.87/46.23 token/s**; both pass the 0.9.16 performance and finite-logits gates |
+| NVIDIA H20-3e · release protocols | GLM-5.2 TP4, GLM Flash S TP1, GLM Flash M TP2, Kimi TP4 (GPU 2/3/4/5); 4096-token Prefill / Decode from 4096-token context | **GLM-5.2 932.36/25.48, GLM S 1504.67/30.02, GLM M 1282.44/20.22, Kimi 672.04/15.69 token/s**; all pass the 0.9.16 performance and finite-logits gates |
 | Dual-socket CPU server (96 physical cores) | Qwen3.5 27B Dense VQ, Q4 NUMA shards, and 64-token Decode | **Historical 0.9.4 result: 9.77 token/s**; not a current-run result and no 30 token/s promise |
 | Windows CUDA 13.0 / `sm_120` | Full NVCC compilation, linking, and module loading | **Toolchain passed**; validation scope ends at module loading |
 | Windows ROCm 7.2.1 / `gfx1151` | HIPIFY, device-code generation, linking, and module loading on a build machine without an AMD GPU | **Toolchain passed**; AMD hardware end-to-end validation is still pending |
@@ -283,7 +292,7 @@ Thanks to GitHub users [tmzncty](https://github.com/tmzncty) and [Zenon-Chen](ht
 
 ## Links
 
-- Download: [GitHub Release v0.9.15](https://github.com/Value99/CCCP/releases/tag/v0.9.15)
+- Download: [GitHub Release v0.9.16](https://github.com/Value99/CCCP/releases/tag/v0.9.16)
 - Community: [Discord](https://discord.gg/eNnwmAUY4M)
 - Models: [ModelScope · ValueFX](https://www.modelscope.cn/profile/ValueFX)
 - Project page: [GitHub · Value99/CCCP](https://github.com/Value99/CCCP)

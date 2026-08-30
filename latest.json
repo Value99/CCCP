@@ -1,13 +1,13 @@
 {
   "schema": "cccp-launcher-update-v1",
   "channel": "stable",
-  "version": "0.9.15",
-  "released_at": "2026-08-28T15:41:27+08:00",
-  "title": "CCCP 启动器 0.9.15",
+  "version": "0.9.16",
+  "released_at": "2026-08-30T14:54:54+08:00",
+  "title": "CCCP 启动器 0.9.16",
   "summary": "冻结兼顾兼容性、主机带宽与生成速度的公共 VQ 推理双路线，并完成 DSV4、Qwen、GLM、Kimi 实模回归。",
   "download": {
     "provider": "GitHub Releases",
-    "url": "https://github.com/Value99/CCCP/releases/tag/v0.9.15",
+    "url": "https://github.com/Value99/CCCP/releases/tag/v0.9.16",
     "extraction_code": ""
   },
   "github": {
@@ -16,8 +16,8 @@
   },
   "launcher": {
     "filename": "CCCP-Launcher.exe",
-    "size_bytes": 40781295,
-    "sha256": "3506BC17934DFBC8953133D682571A4EBCB2B614F79710955FEB37490BAF7BAA"
+    "size_bytes": 40781866,
+    "sha256": "829F2CC1C5B0D66A5254E493458DAEC589B596D8483D0C4A953C312CF5A49A1A"
   },
   "runtime": {
     "python_required": false,
@@ -30,7 +30,7 @@
     "Linux/CUDA 优先使用 FlashInfer MLA；原生 Windows/CUDA 明确使用 CCCP paged latent 公共 CUDA 算子，不会静默退回普通 BF16 Attention。",
     "DSV4、Qwen、GLM、Kimi 通过模型清单声明结构并接入同一套码本算法、显存规划和缓存层，不按模型类型或目录名维护私有数学实现，也不减少专家。",
     "删除单 token E4M3 MoE Decode、实验性 resident-tile 与失效探针；修复 Kimi/MTP Prefill 工作区生命周期和中文安装路径下的 NVIDIA 算子编译。",
-    "完整离线包内置 CPU、CUDA 13、AMD/HIP、Miniconda、便携工具链和全部 Python 依赖；NVIDIA 预编译算子覆盖 SM75、SM86、SM89、SM90、SM120。",
+    "完整离线包内置 CPU、CUDA 13、AMD/HIP、Miniconda、便携工具链和全部 Python 依赖；NVIDIA 预编译算子覆盖 SM75、SM80、SM86、SM89、SM90、SM100、SM120。",
     "H20-3e / bundled CUDA 13 实测：Qwen 2462.68/56.94 (TP1, 4096-token Prefill)、DSV4 2786.87/46.23 (TP1, 4096-token Prefill)、GLM-5.2 932.36/25.48 (TP4, 4096-token Prefill)、GLM Flash S 1504.67/30.02 (TP1, 4096-token Prefill)、GLM Flash M 1282.44/20.22 (TP2, 4096-token Prefill)、Kimi 672.04/15.69 (TP4, 4096-token Prefill)；所有模型均通过对应性能红线和有限值门禁。",
     "离线成品已通过自动化、实模 GPU/CPU、GUI/API 冒烟和逐文件 SHA-256 校验；用户包仅保留使用所需文档。"
   ]

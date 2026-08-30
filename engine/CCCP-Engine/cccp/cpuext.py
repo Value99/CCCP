@@ -294,6 +294,44 @@ def _ensure_ninja_on_path() -> None:
         os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
 
 
+def _ensure_nvcc_visual_studio_contract(msvc_tools_root) -> bool:
+    """Materialize the Visual Studio directory markers required by NVCC.
+
+    The portable toolset intentionally contains only the compiler payload.
+    NVCC nevertheless walks upward from ``cl.exe`` and rejects the host as an
+    unsupported OS when ``VC/Auxiliary/Build/vcvars*.bat`` is absent.  The
+    environment itself is configured below, so these scripts only preserve
+    the directory contract of a regular Visual Studio installation.
+    """
+    vc_root = os.path.realpath(os.path.join(os.fspath(msvc_tools_root), "..", ".."))
+    build_root = os.path.join(vc_root, "Auxiliary", "Build")
+    scripts = {
+        "vcvarsall.bat": (
+            "@echo off\r\n"
+            "rem CCCP portable toolchain environment is configured by cpuext.\r\n"
+            "exit /b 0\r\n"
+        ),
+        "vcvars64.bat": "@echo off\r\ncall \"%~dp0vcvarsall.bat\" x64\r\n",
+    }
+    try:
+        os.makedirs(build_root, exist_ok=True)
+        for name, content in scripts.items():
+            target = os.path.join(build_root, name)
+            if os.path.isfile(target):
+                continue
+            try:
+                with open(target, "x", encoding="ascii", newline="") as stream:
+                    stream.write(content)
+            except FileExistsError:
+                pass
+        return all(
+            os.path.isfile(os.path.join(build_root, name))
+            for name in scripts
+        )
+    except OSError:
+        return False
+
+
 def _configure_bundled_windows_toolchain(*, force: bool = False) -> bool:
     """Expose the portable MSVC/Windows SDK bundled with the launcher.
 
@@ -345,6 +383,8 @@ def _configure_bundled_windows_toolchain(*, force: bool = False) -> bool:
     compiler_bin = os.path.join(msvc_root, "bin", "Hostx64", "x64")
     sdk_bin = os.path.join(sdk_root, "bin", sdk_version, "x64")
     if not os.path.isfile(os.path.join(compiler_bin, "cl.exe")):
+        return False
+    if not _ensure_nvcc_visual_studio_contract(msvc_tools_root):
         return False
 
     def prepend_env(name: str, paths: list[str]) -> None:

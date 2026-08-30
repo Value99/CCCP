@@ -83,7 +83,9 @@ def _install_qwen35_projection_groups(
             if (
                 all(isinstance(item, DenseVQLinear) for item in linears)
                 and all(
-                    item.layout in {"q4_0", "bf16", "int4_g64", "fp8_tensor"}
+                    item.layout in {
+                        "q4_0", "bf16", "fp8_tensor", "vq_q8_codebook"
+                    }
                     for item in linears
                 )
             ):
@@ -496,7 +498,7 @@ class Qwen35DenseVQModel:
         if self.device.type == "cuda":
             linear_bf16_bytes = 0
             linear_fp8_bytes = 0
-            linear_int4_bytes = 0
+            linear_compact_bytes = 0
             packed_embedding_bytes = 0
             embedding_bf16_bytes = 0
             for name, spec in self.archive.specs.items():
@@ -507,10 +509,14 @@ class Qwen35DenseVQModel:
                 if isinstance(original, torch.nn.Linear):
                     linear_bf16_bytes += spec.rows * spec.cols * 2
                     linear_fp8_bytes += spec.rows * spec.cols + 4
-                    linear_int4_bytes += (
-                        (spec.rows * spec.cols) // 2
-                        + spec.rows * ((spec.cols + 63) // 64) * 2
+                    layout = self.archive.layouts[spec.layout_name]
+                    code_dim = int(layout["dim"])
+                    codebook_size = int(
+                        layout.get("size") or layout.get("codebook_size") or 0
                     )
+                    linear_compact_bytes += (
+                        spec.rows * (spec.cols // code_dim) * spec.bits
+                    ) // 8 + codebook_size * code_dim
                 elif isinstance(original, torch.nn.Embedding):
                     code_dim = int(
                         self.archive.layouts[spec.layout_name]["dim"]
@@ -531,28 +537,29 @@ class Qwen35DenseVQModel:
                 packed_embedding_bytes=packed_embedding_bytes,
                 fixed_file_bytes=self.archive.dense_file_bytes,
                 max_ctx=self.max_ctx,
+                initial_ctx=min(self.max_ctx, 4096),
                 config=config,
                 linear_fp8_bytes=linear_fp8_bytes,
-                linear_int4_bytes=linear_int4_bytes,
+                linear_compact_bytes=linear_compact_bytes,
                 embedding_bf16_bytes=embedding_bf16_bytes,
                 fp8_supported=native_fp8_gemm_available(self.device),
             )
             if (
-                gpu_image == "int4"
-                and int(free_bytes) < int(gpu_plan["int4_planned"])
+                gpu_image == "compact"
+                and int(free_bytes) < int(gpu_plan["compact_planned"])
             ):
                 raise RuntimeError(
-                    "Dense VQ INT4 image exceeds planned free VRAM; choose "
+                    "Dense VQ compact image exceeds planned free VRAM; choose "
                     "CPU or a device with more VRAM"
                 )
             image_probe = os.environ.get(
                 "CCCP_DENSE_VQ_GPU_IMAGE", "auto"
             ).strip().lower()
-            if image_probe not in {"", "auto", "fp8", "bf16", "int4"}:
+            if image_probe not in {"", "auto", "fp8", "bf16", "compact"}:
                 raise ValueError(
-                    "CCCP_DENSE_VQ_GPU_IMAGE must be auto, fp8, bf16 or int4"
+                    "CCCP_DENSE_VQ_GPU_IMAGE must be auto, fp8, bf16 or compact"
                 )
-            if image_probe in {"fp8", "bf16", "int4"}:
+            if image_probe in {"fp8", "bf16", "compact"}:
                 required_key = f"{image_probe}_planned"
                 if int(free_bytes) < int(gpu_plan[required_key]):
                     raise RuntimeError(
@@ -575,7 +582,7 @@ class Qwen35DenseVQModel:
                 f"free={gpu_plan['free'] / _GIB:.2f}GiB; "
                 f"bf16_linear={gpu_plan['linear_bf16'] / _GIB:.2f}GiB; "
                 f"fp8_linear={gpu_plan['linear_fp8'] / _GIB:.2f}GiB; "
-                f"int4_linear={gpu_plan['linear_int4'] / _GIB:.2f}GiB; "
+                f"compact_linear={gpu_plan['linear_compact'] / _GIB:.2f}GiB; "
                 f"packed_embedding={gpu_plan['packed_embedding'] / _GIB:.2f}GiB; "
                 f"bf16_embedding={gpu_plan['embedding_bf16'] / _GIB:.2f}GiB; "
                 f"fixed_upper={gpu_plan['fixed'] / _GIB:.2f}GiB; "
@@ -623,9 +630,12 @@ class Qwen35DenseVQModel:
                             raise RuntimeError(
                                 "GPU Dense VQ BF16 expansion failed: " + name
                             )
-                    elif gpu_image == "int4" and not replacement.compile_gpu_int4():
+                    elif (
+                        gpu_image == "compact"
+                        and not replacement.compile_gpu_compact_q8()
+                    ):
                         raise RuntimeError(
-                            f"GPU Dense VQ INT4 compilation failed: {name}"
+                            f"GPU Dense VQ compact Q8 compilation failed: {name}"
                         )
                     compiled += 1
             else:
@@ -802,12 +812,18 @@ class Qwen35DenseVQModel:
                     f"VQ 只在加载期展开",
                     flush=True,
                 )
-            elif gpu_image == "int4":
-                image_bytes = self.archive.packed_bytes
-                self.packed_operator_name = "dense_vq.int4-g64.compact"
+            elif gpu_image == "compact":
+                image_bytes = (
+                    gpu_plan["linear_compact"]
+                    + gpu_plan["packed_embedding"]
+                )
+                self.packed_operator_name = (
+                    "dense_vq.compact-q8-codebook.direct-dp4a"
+                )
                 print(
-                    f"[cccp-dense-vq] GPU INT4-G64 执行映像完成："
-                    f"{compiled} 个 Linear；运行期不再解包 VQ 码本",
+                    f"[cccp-dense-vq] GPU 紧凑 VQ 执行映像完成："
+                    f"{compiled} 个 Linear；packed 索引保持原格式；"
+                    "仅 Q8 小码本常驻；Decode 使用直接 DP4A",
                     flush=True,
                 )
             print(
@@ -843,7 +859,7 @@ class Qwen35DenseVQModel:
         if (
             self.device.type == "cuda"
             and torch.version.hip is None
-            and self._gpu_image in {"bf16", "fp8", "int4"}
+            and self._gpu_image in {"bf16", "fp8"}
         ):
             from transformers.cache_utils import StaticCache
 
@@ -902,7 +918,7 @@ class Qwen35DenseVQModel:
         return bool(
             self.device.type == "cuda"
             and torch.version.hip is None
-            and self._gpu_image in {"bf16", "fp8", "int4"}
+            and self._gpu_image in {"bf16", "fp8"}
             and os.environ.get("CCCP_TOKEN_GRAPH", "1") != "0"
         )
 

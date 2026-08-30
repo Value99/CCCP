@@ -357,26 +357,39 @@ def _glm_startup_kv_gb(max_ctx: int, *, latent: bool) -> float:
 
 
 def _dsv4_prefill_workspace_reserve_gb(max_ctx: int) -> float:
-    """Reserve the full-token-batch Attention workspace before expert VRAM.
+    """Return the initial DSV4 admission reserve, not the logical KV ceiling.
 
-    DSV4 Prefill keeps the public 4096-token block intact.  Its sliding-window
-    gather and Attention intermediates peak before the layer's expert matrices
-    are expanded, so this is a mutually reusable scratch reservation rather
-    than permanent model residency.  Without it, a 16 GiB card could spend the
-    last 1--2 GiB on hot expert slots and OOM before expert chunking begins.
+    The 4096-token Prefill executor allocates its current layer workspace from
+    live free VRAM and temporarily shrinks/reuses the expert arena.  Treating
+    that transient peak as permanent startup residency double-counted the same
+    memory and rejected 20-GiB GPUs before Prefill could run.  KV and larger
+    batches still expand dynamically after admission.
     """
 
-    block = min(4096, max(1, int(max_ctx)))
-    # H20 hard-capped at 16 GiB shows that later DSV4 layers hold about 3.7 GiB
-    # of persistent Prefill state and request another ~3.9 GiB sliding-window
-    # tensor.  Reserve that measured full-batch peak before assigning the
-    # remainder to the expert slab; the expert executor can split experts
-    # without splitting the token block.  Consequently 16 GiB is rejected for
-    # a 4K full-speed batch, while shorter contexts still receive a scaled
-    # reserve and remain usable.
-    # Include the ~1.5 GiB CUDA-context/private-pool overhead that is counted
-    # by a process memory fraction but not by torch.cuda.memory_allocated().
+    block = min(512, max(1, int(max_ctx)))
     return max(0.25, 8.75 * block / 4096.0)
+
+
+def _gpu_startup_admission_margin_gb(
+    *,
+    architecture: str,
+    reserve_gb: float,
+    working_set_margin_gb: float,
+    extreme_mode: bool,
+) -> float:
+    """Return the one fixed margin used by CUDA startup admission.
+
+    Dynamic-workspace architectures grow KV and reuse their transient Prefill
+    buffers after startup, so their hard admission floor is the configured
+    physical reserve rather than a second copy of the working-set estimate.
+    Extreme mode keeps its existing capacity policy.
+    """
+
+    if extreme_mode:
+        return max(0.0, float(working_set_margin_gb))
+    if architecture in {"dsv4", "qwen3_5_dense", "glm5_next"}:
+        return max(0.0, float(reserve_gb))
+    return max(float(reserve_gb), float(working_set_margin_gb), 0.0)
 
 
 def _safe_expert_budget(*, limit_bytes: int, allocated_bytes: int,
@@ -928,6 +941,12 @@ class Engine:
                 )
                 self._vram_safety_reserve_gb = reserve_gb
                 self._vram_runtime_headroom_gb = runtime_headroom_gb
+                admission_margin_gb = _gpu_startup_admission_margin_gb(
+                    architecture=arch_hint,
+                    reserve_gb=reserve_gb,
+                    working_set_margin_gb=margin,
+                    extreme_mode=self.extreme_mode,
+                )
                 if not quiet:
                     print(
                         "[cccp-vram-plan] phase=runtime-headroom "
@@ -940,7 +959,7 @@ class Engine:
                 dense_gpu_need = (
                     0.0 if dense_residency == "ram" else dense_need
                 )
-                if planning_free_v < dense_gpu_need + margin:
+                if planning_free_v < dense_gpu_need + admission_margin_gb:
                     if dense_residency == "gpu":
                         requirement = (
                             "GPU Dense 与完整高速 Prefill"
@@ -950,9 +969,9 @@ class Engine:
                         raise RuntimeError(
                             f"{requirement} 要求 GPU 常驻，但空闲显存 "
                             f"{planning_free_v:.1f}GB < 需要 "
-                            f"{dense_gpu_need + margin:.1f}GB"
+                            f"{dense_gpu_need + admission_margin_gb:.1f}GB"
                         )
-                    print(f"[cccp] 显存不足（空闲 {planning_free_v:.1f}GB < 需要 {dense_gpu_need + margin:.1f}GB），"
+                    print(f"[cccp] 显存不足（空闲 {planning_free_v:.1f}GB < 需要 {dense_gpu_need + admission_margin_gb:.1f}GB），"
                           f"回退 CPU 模式", flush=True)
                     dev = "cpu"
                 elif vram_cache_gb is None:
@@ -964,7 +983,7 @@ class Engine:
                         architecture=arch_hint,
                         planning_free_gb=planning_free_v,
                         dense_estimate_gb=dense_gpu_need,
-                        runtime_margin_gb=margin,
+                        runtime_margin_gb=admission_margin_gb,
                         extreme=self.extreme_mode,
                     )
         if cache_gb is None:

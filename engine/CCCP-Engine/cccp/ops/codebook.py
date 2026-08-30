@@ -236,9 +236,10 @@ def plan_dense_vq_gpu_image(
     max_ctx: int,
     config,
     linear_fp8_bytes: int = 0,
-    linear_int4_bytes: int = 0,
+    linear_compact_bytes: int = 0,
     embedding_bf16_bytes: int = 0,
     fp8_supported: bool = False,
+    initial_ctx: int | None = None,
 ) -> tuple[str, dict[str, int]]:
     """Choose a Dense-VQ execution image from shapes and device capacity.
 
@@ -256,8 +257,12 @@ def plan_dense_vq_gpu_image(
         )
     kv_heads = int(getattr(config, "num_key_value_heads", 0) or 0)
     head_dim = int(getattr(config, "head_dim", 0) or 0)
+    kv_context = min(
+        int(max_ctx),
+        max(1, int(initial_ctx if initial_ctx is not None else max_ctx)),
+    )
     kv_bytes = (
-        int(max_ctx)
+        kv_context
         * full_attention_layers
         * kv_heads
         * head_dim
@@ -278,8 +283,8 @@ def plan_dense_vq_gpu_image(
         + int(fixed_file_bytes)
         + int(runtime_bytes)
     )
-    int4_planned_bytes = (
-        int(linear_int4_bytes)
+    compact_planned_bytes = (
+        int(linear_compact_bytes)
         + int(packed_embedding_bytes)
         + int(fixed_file_bytes)
         + int(runtime_bytes)
@@ -295,22 +300,23 @@ def plan_dense_vq_gpu_image(
         image = "bf16"
         planned_bytes = bf16_planned_bytes
     else:
-        image = "int4"
-        planned_bytes = int4_planned_bytes
+        image = "compact"
+        planned_bytes = compact_planned_bytes
     details = {
         "free": int(free_bytes),
         "linear_bf16": int(linear_bf16_bytes),
         "packed_embedding": int(packed_embedding_bytes),
         "embedding_bf16": embedding_bytes,
         "linear_fp8": int(linear_fp8_bytes),
-        "linear_int4": int(linear_int4_bytes),
+        "linear_compact": int(linear_compact_bytes),
         "fixed": int(fixed_file_bytes),
+        "kv_context": int(kv_context),
         "kv": int(kv_bytes),
         "runtime": int(runtime_bytes),
         "planned": int(planned_bytes),
         "bf16_planned": int(bf16_planned_bytes),
         "fp8_planned": int(fp8_planned_bytes),
-        "int4_planned": int(int4_planned_bytes),
+        "compact_planned": int(compact_planned_bytes),
     }
     return image, details
 

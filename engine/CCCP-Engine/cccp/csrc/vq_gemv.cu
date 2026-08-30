@@ -3564,6 +3564,14 @@ __device__ __forceinline__ int vq_block_dot_routed_q8_codebook_i32_t(
     const int8_t* __restrict__ codebook,
     const int8_t* __restrict__ input)
 {
+    if constexpr (VECTOR == 2) {
+        const unsigned short code = __ldg(
+            reinterpret_cast<const unsigned short*>(codebook));
+        const unsigned short value = *reinterpret_cast<const unsigned short*>(
+            input);
+        return __dp4a(
+            static_cast<int>(code), static_cast<int>(value), 0);
+    }
     if constexpr (VECTOR == 16) {
         const uint4 code = __ldg(
             reinterpret_cast<const uint4*>(codebook));
@@ -3600,6 +3608,8 @@ __device__ __forceinline__ int vq_block_dot_routed_q8_codebook_i32(
         return vq_block_dot_routed_q8_codebook_i32_t<16>(codebook, input);
     if (vector == 8)
         return vq_block_dot_routed_q8_codebook_i32_t<8>(codebook, input);
+    if (vector == 2)
+        return vq_block_dot_routed_q8_codebook_i32_t<2>(codebook, input);
     return vq_block_dot_routed_q8_codebook_i32_t<4>(codebook, input);
 }
 
@@ -3678,6 +3688,7 @@ __global__ void dense_vq_gemv_packed_q8_codebook_kernel(
     const int dtype_tag,
     const float codebook_scale)
 {
+    const int batch = static_cast<int>(blockIdx.y);
     const int linear_thread = threadIdx.y * 32 + threadIdx.x;
     const int row =
         blockIdx.x * CCCP_DENSE_VQ_ROWS_PER_BLOCK + threadIdx.y;
@@ -3689,7 +3700,8 @@ __global__ void dense_vq_gemv_packed_q8_codebook_kernel(
 
     for (int block = linear_thread; block < blocks;
          block += 32 * CCCP_DENSE_VQ_ROWS_PER_BLOCK) {
-        const __nv_bfloat16* source = input + block * vector;
+        const __nv_bfloat16* source =
+            input + static_cast<long>(batch) * columns + block * vector;
         float absolute_max = 0.0f;
         #pragma unroll
         for (int component = 0; component < 16; ++component) {
@@ -3730,7 +3742,8 @@ __global__ void dense_vq_gemv_packed_q8_codebook_kernel(
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
         sum += __shfl_down_sync(0xffffffffu, sum, offset, 32);
-    if (threadIdx.x == 0) output[row] = sum;
+    if (threadIdx.x == 0)
+        output[static_cast<long>(batch) * rows + row] = sum;
 }
 
 torch::Tensor dense_vq_gemv_packed_q8_codebook(
@@ -3748,12 +3761,12 @@ torch::Tensor dense_vq_gemv_packed_q8_codebook(
     TORCH_CHECK(
         input.is_cuda() && packed.is_cuda() && codebook.is_cuda() &&
         input.scalar_type() == at::kBFloat16 && input.dim() == 2 &&
-        input.size(0) == 1 && input.is_contiguous() &&
+        input.size(0) > 0 && input.size(0) <= 65535 && input.is_contiguous() &&
         packed.scalar_type() == at::kByte && packed.dim() == 1 &&
         packed.is_contiguous() &&
         codebook.scalar_type() == at::kChar && codebook.dim() == 2 &&
         codebook.is_contiguous(),
-        "compact Q8 codebook GEMV requires CUDA BF16 [1,C], packed "
+        "compact Q8 codebook GEMV requires CUDA BF16 [N,C], packed "
         "uint8, and INT8 [K,D]");
     const int tag = dense_vq_dtype_tag(static_cast<int>(bits));
     const int vector = static_cast<int>(codebook.size(1));
@@ -3761,7 +3774,7 @@ torch::Tensor dense_vq_gemv_packed_q8_codebook(
     const int64_t expected_bits = rows * blocks * bits;
     TORCH_CHECK(
         tag >= 0 && rows > 0 && blocks > 0 &&
-        (vector == 4 || vector == 8 || vector == 16) &&
+        (vector == 2 || vector == 4 || vector == 8 || vector == 16) &&
         expected_bits % 8 == 0 &&
         packed.numel() == expected_bits / 8 &&
         input.size(1) == columns && codebook.size(0) > 0 &&
@@ -3780,11 +3793,13 @@ torch::Tensor dense_vq_gemv_packed_q8_codebook(
         shared_bytes <= 48 * 1024,
         "compact Q8 codebook GEMV input exceeds shared-memory contract");
     auto output = torch::empty(
-        {1, rows}, input.options().dtype(at::kFloat));
+        {input.size(0), rows}, input.options().dtype(at::kFloat));
     const dim3 block(32, CCCP_DENSE_VQ_ROWS_PER_BLOCK);
-    const dim3 grid(static_cast<unsigned>(
-        (rows + CCCP_DENSE_VQ_ROWS_PER_BLOCK - 1) /
-            CCCP_DENSE_VQ_ROWS_PER_BLOCK));
+    const dim3 grid(
+        static_cast<unsigned>(
+            (rows + CCCP_DENSE_VQ_ROWS_PER_BLOCK - 1) /
+                CCCP_DENSE_VQ_ROWS_PER_BLOCK),
+        static_cast<unsigned>(input.size(0)));
     dense_vq_gemv_packed_q8_codebook_kernel<<<
         grid,
         block,
