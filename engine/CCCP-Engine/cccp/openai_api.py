@@ -996,7 +996,7 @@ _MODEL_CAPABILITIES: dict[str, dict[str, Any]] = {
         "tool_use": False,
         "efforts": (),
         "default_effort": None,
-        "image": False,
+        "image": True,
         "video": False,
     },
     "qwen3_5_dense": {

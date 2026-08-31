@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..media import media_references_digest
 from .base import (
     AssistantOutput,
     ChatMessage,
@@ -22,12 +23,31 @@ def _strip_think(content: str) -> str:
     return content
 
 
-def _render_prompt(
+def _message_text_and_media(message: ChatMessage) -> tuple[str, list[dict[str, str]]]:
+    if not message.content_parts:
+        return message.content, []
+    chunks: list[str] = []
+    slots: list[dict[str, str]] = []
+    for part in message.content_parts:
+        if part.type == "text":
+            chunks.append(part.text or "")
+        elif part.type in {"image_url", "input_image"}:
+            chunks.append("<|begin_of_image|><|image|><|end_of_image|>")
+            slots.append({"kind": "image", "source": part.url or ""})
+        elif part.type in {"video_url", "input_video"}:
+            raise UnsupportedChatCapability("glm", "video input (image prototype only)")
+        else:
+            raise UnsupportedChatCapability("glm", f"{part.type} input")
+    return "".join(chunks), slots
+
+
+def _render_prompt_with_media(
     messages: tuple[ChatMessage, ...],
     options: ChatOptions,
-) -> str:
-    """Render supported messages using the unchanged terminal serialization."""
+) -> tuple[str, tuple[dict[str, str], ...]]:
+    """Render text plus official GLM image placeholders."""
     parts = ["[gMASK]<sop>"]
+    slots: list[dict[str, str]] = []
     if options.thinking_mode == "thinking":
         parts.append("<|system|>Reasoning Effort: Max")
 
@@ -35,7 +55,9 @@ def _render_prompt(
         if message.role in {"system", "developer"}:
             parts.append(f"<|system|>{message.content}")
         elif message.role == "user":
-            parts.append(f"<|user|>{message.content}\n")
+            text, message_slots = _message_text_and_media(message)
+            parts.append(f"<|user|>{text}\n")
+            slots.extend(message_slots)
         elif message.role == "assistant":
             parts.append(
                 f"<|assistant|>\n<think></think>{_strip_think(message.content)}"
@@ -47,7 +69,18 @@ def _render_prompt(
     parts.append(
         "<think>" if options.thinking_mode == "thinking" else "<think></think>"
     )
-    return "".join(parts)
+    return "".join(parts), tuple(slots)
+
+
+def _render_prompt(
+    messages: tuple[ChatMessage, ...],
+    options: ChatOptions,
+) -> str:
+    """Compatibility wrapper for text-only route scanning."""
+    rendered, slots = _render_prompt_with_media(messages, options)
+    if slots:
+        raise UnsupportedChatCapability("glm", "media in route scan")
+    return rendered
 
 
 def _reject_tools(messages: tuple[ChatMessage, ...], options: ChatOptions) -> None:
@@ -167,8 +200,10 @@ class GLMChatAdapter:
     ) -> PromptPlan:
         normalized = tuple(messages)
         _reject_tools(normalized, options)
+        has_media = any(message.content_parts for message in normalized)
         if (
-            isinstance(hot_ledger, GLMTokenLedger)
+            not has_media
+            and isinstance(hot_ledger, GLMTokenLedger)
             and options.thinking_mode == "chat"
             and hot_ledger.thinking_mode == options.thinking_mode
             and hot_ledger.completed_ids is not None
@@ -194,14 +229,37 @@ class GLMChatAdapter:
                 canonical_prefix_ids=list(input_ids),
                 adapter_state={"thinking_mode": options.thinking_mode},
             )
-        rendered = _render_prompt(normalized, options)
+        rendered, slots = _render_prompt_with_media(normalized, options)
         input_ids = list(engine.encode(rendered))
+        if slots:
+            if len(slots) != sum(1 for token in input_ids if token == engine.model._outer_config.image_token_id):
+                raise ValueError("GLM image placeholder count does not match image inputs")
+            from ..glm5_next_multimodal import expand_image_token_ids, prepare_image_sources
+            pixel_values, image_grid_thw, token_counts = prepare_image_sources(
+                [slot["source"] for slot in slots]
+            )
+            input_ids = expand_image_token_ids(
+                input_ids,
+                image_token_id=engine.model._outer_config.image_token_id,
+                token_counts=token_counts,
+            )
+            media_state = {
+                "pixel_values": pixel_values,
+                "image_grid_thw": image_grid_thw,
+            }
+        else:
+            media_state = None
         return PromptPlan(
             input_ids=input_ids,
             kv_baseline_len=len(input_ids),
             normalized_messages=normalized,
             canonical_prefix_ids=list(input_ids),
-            adapter_state={"thinking_mode": options.thinking_mode},
+            adapter_state={
+                "thinking_mode": options.thinking_mode,
+                "media_digest": media_references_digest(slots),
+                "media_slots": tuple(slots),
+                "media_state": media_state,
+            },
         )
 
     def parse_complete(
@@ -269,4 +327,5 @@ __all__ = [
     "GLMChatAdapter",
     "GLMTokenLedger",
     "UnsupportedChatCapability",
+    "_render_prompt_with_media",
 ]

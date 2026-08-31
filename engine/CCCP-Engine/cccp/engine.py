@@ -53,6 +53,9 @@ class KVPrefillStats:
     processed_tokens: int
     prefill_ms: float
     snapshot_bytes: int
+    vision_load_ms: float | None = None
+    vision_forward_ms: float | None = None
+    language_prefill_ms: float | None = None
 
 
 @dataclass
@@ -1176,6 +1179,13 @@ class Engine:
                     flush=True,
                 )
         self.tok = prepared_tokenizer
+        if self.arch == "glm5_next" and os.environ.get("CCCP_PRELOAD_VISION", "0") == "1":
+            seconds = self.model.preload_vision()
+            if not quiet:
+                print(
+                    f"[cccp-glm5-next] 视觉塔按配置预载完成：{seconds:.3f}s",
+                    flush=True,
+                )
         gc = os.path.join(model_dir, "generation_config.json")
         self.eos = DEFAULT_EOS
         if os.path.exists(gc):
@@ -1438,8 +1448,67 @@ class Engine:
 
         return DecodeStream(skip_special_tokens=skip_special_tokens)
 
+    @torch.no_grad()
+    def warmup_multimodal(self) -> dict[str, float]:
+        """Explicitly warm GLM-5.3 image and resident Prefill fast paths.
+
+        The method is never called by default. It uses an in-memory synthetic
+        image, then clears every request/KV identity before serving traffic.
+        """
+        if self.arch != "glm5_next":
+            raise RuntimeError("multimodal warmup is only available for glm5_next")
+        from PIL import Image
+        from .glm5_next_multimodal import (
+            expand_image_token_ids,
+            prepare_image,
+        )
+
+        prepared = prepare_image(Image.new("RGB", (1664, 933), (127, 127, 127)))
+        prompt = (
+            "[gMASK]<sop><|user|>"
+            "<|begin_of_image|><|image|><|end_of_image|>"
+            "请描述图片。\n<|assistant|><think></think>"
+        )
+        ids = expand_image_token_ids(
+            self.encode(prompt),
+            image_token_id=int(self.model._outer_config.image_token_id),
+            token_counts=(prepared.token_count,),
+        )
+        self.reset()
+        started = time.perf_counter()
+        self.model.forward_multimodal_prefill(
+            ids,
+            pixel_values=prepared.pixel_values,
+            image_grid_thw=torch.tensor(
+                [prepared.grid_thw],
+                dtype=torch.long,
+            ),
+        )
+        if self.model.device.type == "cuda":
+            torch.cuda.synchronize(self.model.device)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        timings = dict(getattr(self.model, "last_multimodal_timings", None) or {})
+        timings["warmup_total_ms"] = elapsed_ms
+        timings["warmup_tokens"] = float(len(ids))
+        self.reset()
+        if not self.quiet:
+            print(
+                "[cccp-glm5-next] 多模态热身完成："
+                f"tokens={len(ids)} total={elapsed_ms:.1f}ms "
+                f"vision={timings.get('vision_forward_ms', 0.0):.1f}ms "
+                f"language={timings.get('language_prefill_ms', 0.0):.1f}ms",
+                flush=True,
+            )
+        return timings
+
     def reset(self) -> None:
-        self.model.reset_kv()
+        if self.arch == "glm5_next":
+            # GLM owns an additional request-local media state. Its full reset
+            # clears that state and restores the fixed text TokenGraph after an
+            # image turn or multimodal startup warmup.
+            self.model.reset()
+        else:
+            self.model.reset_kv()
         self._cache_ids = None
         self._cache_media_digest = None
         self._cache_media_slots = ()
@@ -1480,6 +1549,16 @@ class Engine:
                 media_slots=media_slots,
             )
             return self.model.logits_of(hidden[-1:]).squeeze(0)
+        if media_state is not None and getattr(self, "arch", "glm") == "glm5_next":
+            if skip != 0:
+                # The matching image KV is already live; only replay the new
+                # text suffix. Do not run the visual tower a second time.
+                return self.model.forward(suffix)
+            return self.model.forward_multimodal_prefill(
+                ids,
+                pixel_values=media_state["pixel_values"],
+                image_grid_thw=media_state["image_grid_thw"],
+            )
         return self.model.forward(suffix)
 
     def _media_cache_matches(
@@ -1488,11 +1567,20 @@ class Engine:
         media_slots: object,
         media_state: object = None,
     ) -> bool:
-        return (
-            media_digest == getattr(self, "_cache_media_digest", None)
-            and tuple(media_slots or ()) == getattr(self, "_cache_media_slots", ())
-            and media_state is None
+        # A newly prepared GLM request naturally carries a fresh media_state.
+        # GLM image KV reuse is keyed by stable ordered media identity/layout,
+        # not Python object identity of decoded tensors. Kimi's media cache
+        # still requires the historical no-fresh-state contract: its suffix
+        # path uses full-prompt media slots and cannot replay them on suffix IDs.
+        cached_digest = getattr(self, "_cache_media_digest", None)
+        cached_slots = getattr(self, "_cache_media_slots", ())
+        identity_matches = (
+            media_digest == cached_digest
+            and tuple(media_slots or ()) == tuple(cached_slots or ())
         )
+        if getattr(self, "arch", "glm") == "glm5_next":
+            return identity_matches
+        return identity_matches and media_state is None
 
     def _prepare_glm_prompt(
         self,
@@ -1581,6 +1669,11 @@ class Engine:
                 media_state=media_state,
                 media_slots=media_slots,
             )
+        multimodal_timings = (
+            getattr(self.model, "last_multimodal_timings", None)
+            if media_state is not None and skip == 0
+            else None
+        ) or {}
         stats = KVPrefillStats(
             mode=mode,
             reason=reason,
@@ -1592,6 +1685,9 @@ class Engine:
             processed_tokens=len(ids) - skip,
             prefill_ms=(time.perf_counter() - started) * 1000.0,
             snapshot_bytes=0,
+            vision_load_ms=multimodal_timings.get("vision_load_ms"),
+            vision_forward_ms=multimodal_timings.get("vision_forward_ms"),
+            language_prefill_ms=multimodal_timings.get("language_prefill_ms"),
         )
         self.last_kv_stats = stats
         if not getattr(self, "quiet", False):
@@ -2702,6 +2798,23 @@ class Engine:
                 temp=0.0,
                 callback=callback,
                 should_stop=should_stop,
+                media_digest=media_digest,
+                media_slots=media_slots,
+                media_state=media_state,
+            )
+        if media_state is not None:
+            print(
+                "[cccp-mtp] GLM 多模态 prompt 使用标准主模型解码，"
+                "当前 MTP 不重放视觉 prefill",
+                flush=True,
+            )
+            return self.generate(
+                ids,
+                max_new=max_new,
+                temp=0.0,
+                callback=callback,
+                should_stop=should_stop,
+                kv_baseline_len=kv_baseline_len,
                 media_digest=media_digest,
                 media_slots=media_slots,
                 media_state=media_state,

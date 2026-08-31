@@ -280,6 +280,12 @@ def chat_loop(
         )
         ids = plan.input_ids
         kv_baseline_len = plan.kv_baseline_len
+        adapter_state = plan.adapter_state if isinstance(plan.adapter_state, dict) else {}
+        media_common = {
+            "media_digest": adapter_state.get("media_digest"),
+            "media_slots": adapter_state.get("media_slots", ()),
+            "media_state": adapter_state.get("media_state"),
+        }
         print(f"{name}: ", end="", flush=True)
         t0 = time.time()
         stream = _TerminalStream(eng, adapter, options)
@@ -293,13 +299,14 @@ def chat_loop(
                     callback=stream.on_token,
                     should_stop=should_stop,
                     kv_baseline_len=kv_baseline_len,
+                    **media_common,
                 )
             else:
                 out = eng.generate(ids, max_new=max_new, temp=temp, top_p=top_p,
                                    rep_penalty=rep_penalty,
                                    no_repeat_ngram=no_repeat_ngram,
                                    callback=stream.on_token, should_stop=should_stop,
-                                   kv_baseline_len=kv_baseline_len)
+                                   kv_baseline_len=kv_baseline_len, **media_common)
         except ContextCapacityError as exc:
             stream.finish()
             print(
