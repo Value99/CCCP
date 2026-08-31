@@ -53,6 +53,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=[],
     )
     parser.add_argument("--metrics-jsonl")
+    parser.add_argument(
+        "--preload-vision",
+        action="store_true",
+        help="显式预载 GLM-5.3 视觉塔；默认关闭，不影响纯文本启动",
+    )
+    parser.add_argument(
+        "--warmup-vision",
+        action="store_true",
+        help="启动后运行一次合成图片热身；隐含 --preload-vision",
+    )
     args = parser.parse_args(argv)
     if args.max_queue <= 0:
         parser.error("--max-queue must be positive")
@@ -99,6 +109,8 @@ def build_service(args: argparse.Namespace) -> tuple[Any, Any]:
         ) from exc
     from .engine import Engine
 
+    if args.preload_vision or args.warmup_vision:
+        os.environ["CCCP_PRELOAD_VISION"] = "1"
     engine = Engine(
         args.model,
         cache_gb=args.cache_gb,
@@ -109,6 +121,8 @@ def build_service(args: argparse.Namespace) -> tuple[Any, Any]:
         dense_residency=args.dense_residency,
         extreme_mode=args.extreme,
     )
+    if args.warmup_vision:
+        engine.warmup_multimodal()
     adapter = adapter_for_arch(engine.arch)
     service = ChatService(
         engine,

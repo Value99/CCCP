@@ -799,6 +799,11 @@ class GLM5NextCCCPModel:
         self._model: nn.Module | None = None
         self._lm_head: CCCPLinear | None = None
         self._past_key_values = None
+        # Vision is strictly opt-in: text preload never constructs this field.
+        self._vision_model: nn.Module | None = None
+        self._outer_config = None
+        self._multimodal_active = False
+        self.last_multimodal_timings: dict[str, float] | None = None
         self._text_config = None
         self._fixed_token_graph = None
         self._fixed_token_graph_cache = None
@@ -999,6 +1004,7 @@ class GLM5NextCCCPModel:
             self.root,
             local_files_only=True,
         )
+        self._outer_config = outer
         config = outer.get_text_config()
         config._attn_implementation = "sdpa"
         with torch.device("meta"):
@@ -1023,6 +1029,100 @@ class GLM5NextCCCPModel:
             "视觉塔未载入",
             flush=True,
         )
+
+    @staticmethod
+    def _vision_parent_leaf(module: nn.Module, name: str) -> tuple[nn.Module, str]:
+        return _parent_and_leaf(module, name)
+
+    @torch.inference_mode()
+    def forward_multimodal_prefill(
+        self,
+        ids: list[int],
+        *,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run one image prompt through the official GLM visual injection path.
+
+        This is deliberately separate from ``forward``: normal text requests
+        retain the existing fixed-address TokenGraph and never import or load
+        the vision tower.
+        """
+        if not ids:
+            raise ValueError("GLM multimodal prefill requires prompt tokens")
+        if self._model is None or self._lm_head is None:
+            raise RuntimeError("GLM-5.3 model has not been preloaded")
+        from .glm5_next_multimodal import load_vision_model
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        load_started = time.perf_counter()
+        vision = load_vision_model(self)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        load_seconds = time.perf_counter() - load_started
+        vision_dtype = next(vision.parameters()).dtype
+        pixel_values = pixel_values.to(device=self.device, dtype=vision_dtype)
+        image_grid_thw = image_grid_thw.to(self.device)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        vision_started = time.perf_counter()
+        image_output = vision(pixel_values, grid_thw=image_grid_thw)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        vision_seconds = time.perf_counter() - vision_started
+        image_embeds = image_output.pooler_output
+        if isinstance(image_embeds, (tuple, list)):
+            image_embeds = torch.cat(list(image_embeds), dim=0)
+        image_embeds = image_embeds.to(self.device, dtype=self._model.embed_tokens.weight.dtype)
+        input_ids = torch.tensor(ids, dtype=torch.long, device=self.device).unsqueeze(0)
+        inputs_embeds = self._model.embed_tokens(input_ids)
+        image_mask = (input_ids == int(self._outer_config.image_token_id)).unsqueeze(-1)
+        expected = int(image_mask.sum().item())
+        if expected != int(image_embeds.shape[0]):
+            raise ValueError(
+                f"GLM image placeholder/features mismatch: tokens={expected}, features={image_embeds.shape[0]}"
+            )
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        self._multimodal_active = True
+        self._fixed_token_graph = None
+        self._fixed_token_graph_cache = None
+        self._fixed_token_graph_capacity = 0
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        language_started = time.perf_counter()
+        with _glm5_next_pool_phase(self.routed_vq, rows=len(ids)):
+            output = self._model(
+                input_ids=None,
+                inputs_embeds=inputs_embeds,
+                past_key_values=None,
+                use_cache=True,
+                return_dict=True,
+            )
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        language_seconds = time.perf_counter() - language_started
+        self.last_multimodal_timings = {
+            "vision_load_ms": load_seconds * 1000.0,
+            "vision_forward_ms": vision_seconds * 1000.0,
+            "language_prefill_ms": language_seconds * 1000.0,
+        }
+        self._past_key_values = output.past_key_values
+        self.pos = len(ids)
+        self._token_history = list(ids)
+        return self._lm_head(output.last_hidden_state[:, -1]).float().squeeze(0)
+
+    @torch.inference_mode()
+    def preload_vision(self) -> float:
+        """Opt in to loading the image tower without changing text startup."""
+        from .glm5_next_multimodal import load_vision_model
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        started = time.perf_counter()
+        load_vision_model(self)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        return time.perf_counter() - started
 
     def preload(self) -> None:
         started = time.perf_counter()
@@ -1248,6 +1348,13 @@ class GLM5NextCCCPModel:
 
     def reset(self) -> None:
         self.reset_kv()
+        # A media turn is request-local. Rebuild the normal text graph lazily
+        # only if a later text request needs it; vision weights remain loaded
+        # but are never touched by the text-only forward path.
+        if self._multimodal_active:
+            self._multimodal_active = False
+            if self._fixed_token_graph_enabled():
+                self._capture_fixed_token_graph()
 
     @torch.inference_mode()
     def truncate_kv(self, keep: int) -> None:
@@ -1280,6 +1387,21 @@ class GLM5NextCCCPModel:
 
     @torch.inference_mode()
     def forward_hidden(self, ids: list[int]) -> torch.Tensor:
+        if self._multimodal_active:
+            if not ids:
+                raise ValueError("GLM-5.3 forward requires at least one token")
+            input_ids = torch.tensor(ids, dtype=torch.long, device=self.device).unsqueeze(0)
+            with _glm5_next_pool_phase(self.routed_vq, rows=len(ids)):
+                output = self._model(
+                    input_ids=input_ids,
+                    past_key_values=self._past_key_values,
+                    use_cache=True,
+                    return_dict=True,
+                )
+            self._past_key_values = output.past_key_values
+            self.pos += len(ids)
+            self._token_history.extend(int(item) for item in ids)
+            return output.last_hidden_state.squeeze(0)
         if not ids:
             raise ValueError("GLM-5.3 forward requires at least one token")
         if self._model is None or self._lm_head is None:

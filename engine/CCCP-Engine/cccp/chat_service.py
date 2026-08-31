@@ -39,6 +39,9 @@ class GenerationMetrics:
     kv_mode: str
     kv_reason: str
     prefill_ms: float | None
+    vision_load_ms: float | None
+    vision_forward_ms: float | None
+    language_prefill_ms: float | None
     ttft_ms: float | None
     generation_ms: float
     finish_reason: str
@@ -513,6 +516,9 @@ class ChatService:
                 kv_mode="not-started",
                 kv_reason="cancelled-in-queue",
                 prefill_ms=None,
+                vision_load_ms=None,
+                vision_forward_ms=None,
+                language_prefill_ms=None,
                 ttft_ms=None,
                 generation_ms=0.0,
                 finish_reason="stop",
@@ -708,6 +714,9 @@ class ChatService:
                 kv_mode=str(_metric_value(kv_stats, "mode", "unknown")),
                 kv_reason=str(_metric_value(kv_stats, "reason", "unknown")),
                 prefill_ms=_metric_value(kv_stats, "prefill_ms", None),
+                vision_load_ms=_metric_value(kv_stats, "vision_load_ms", None),
+                vision_forward_ms=_metric_value(kv_stats, "vision_forward_ms", None),
+                language_prefill_ms=_metric_value(kv_stats, "language_prefill_ms", None),
                 ttft_ms=(
                     None
                     if first_token_at is None
@@ -731,6 +740,9 @@ class ChatService:
                 f"request={request_id} prompt={len(plan.input_ids)} "
                 f"completion={completion_count} "
                 f"prefill_ms={prefill_ms if prefill_ms is not None else 'reuse'} "
+                f"vision_load_ms={_metric_value(kv_stats, 'vision_load_ms', None)} "
+                f"vision_forward_ms={_metric_value(kv_stats, 'vision_forward_ms', None)} "
+                f"language_prefill_ms={_metric_value(kv_stats, 'language_prefill_ms', None)} "
                 f"ttft_ms={ttft_ms if ttft_ms is not None else 'none'} "
                 f"decode_tok_s={token_rate:.3f}",
                 flush=True,
