@@ -2,9 +2,9 @@
   "schema": "cccp-launcher-update-v1",
   "channel": "stable",
   "version": "0.9.16",
-  "released_at": "2026-08-30T14:54:54+08:00",
+  "released_at": "2026-08-31T12:46:54+08:00",
   "title": "CCCP 启动器 0.9.16",
-  "summary": "冻结兼顾兼容性、主机带宽与生成速度的公共 VQ 推理双路线，并完成 DSV4、Qwen、GLM、Kimi 实模回归。",
+  "summary": "让普通电脑也能运行超大模型：64GB 内存可运行 DeepSeek V4 Flash，并可按角色扮演、代码等任务加载特调专家。",
   "download": {
     "provider": "GitHub Releases",
     "url": "https://github.com/Value99/CCCP/releases/tag/v0.9.16",

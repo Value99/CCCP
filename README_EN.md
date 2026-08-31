@@ -8,6 +8,14 @@
   <a href="README.md">简体中文</a> · <strong>English</strong> · <a href="README_RU.md">Русский</a>
 </p>
 
+## What does it do?
+
+**Run models that normally need a server on an everyday PC.**
+
+For example, DeepSeek V4 Flash can run with 64 GB of system RAM instead of an expensive multi-GPU server. CCCP spends limited memory on the experts that matter for the current task: use a role-play-tuned expert profile for role-play, or a code profile for coding. That lowers the hardware barrier and makes the model better suited to what you are doing.
+
+CPU-only works too. When VRAM is short CCCP uses system RAM, and it falls back to disk only when RAM is also insufficient. Python, inference runtimes, and accelerated operators are included in the full offline package—download it and double-click to run.
+
 ## ⬇️ Download the complete Windows offline package (v0.9.16)
 
 > [!IMPORTANT]
@@ -43,14 +51,6 @@ Maintain CCCP Launcher 0.9.16. First read the bundled user-facing manuals docs/�
 - DSV4, Qwen, GLM, and Kimi declare structure through manifests and reuse the same codebook math, residency planning, and caching without pruning experts.
 - Removes the single-token E4M3 MoE Decode and other legacy branches, and fixes Kimi/MTP workspace lifetime and CUDA builds from non-ASCII install paths.
 - Prebuilds the shared NVIDIA fused operator for SM75, SM80, SM86, SM89, SM90, SM100, and SM120; unmatched future architectures still compile with the bundled CUDA 13 portable toolchain.
-- Measured on H20-3e with the bundled CUDA 13 runtime (Prefill/Decode, token/s): Qwen 2462.68/56.94 (TP1, 4096-token Prefill)、DSV4 2786.87/46.23 (TP1, 4096-token Prefill)、GLM-5.2 932.36/25.48 (TP4, 4096-token Prefill)、GLM Flash S 1504.67/30.02 (TP1, 4096-token Prefill)、GLM Flash M 1282.44/20.22 (TP2, 4096-token Prefill)、Kimi 672.04/15.69 (TP4, 4096-token Prefill). Every model passes its performance and finite-logits gates.
-
-### Highlights in 0.9.16
-
-- All codebook models share one compact CUDA Decode algorithm: packed indices + Q8 codebooks + fused DP4A. Prefill selects the shared packed-VQ or E4M3/FP8 grouped path by capability.
-- Linux/CUDA prefers FlashInfer MLA; native Windows/CUDA explicitly uses the bundled CCCP paged latent CUDA operator and never silently falls back to ordinary BF16 Attention.
-- DSV4, Qwen, GLM, and Kimi declare structure through manifests and reuse the same codebook math, residency planning, and caching without pruning experts.
-- Removes the single-token E4M3 MoE Decode and other legacy branches, and fixes Kimi/MTP workspace lifetime and CUDA builds from non-ASCII install paths.
 - Measured on H20-3e with the bundled CUDA 13 runtime (Prefill/Decode, token/s): Qwen 2462.68/56.94 (TP1, 4096-token Prefill)、DSV4 2786.87/46.23 (TP1, 4096-token Prefill)、GLM-5.2 932.36/25.48 (TP4, 4096-token Prefill)、GLM Flash S 1504.67/30.02 (TP1, 4096-token Prefill)、GLM Flash M 1282.44/20.22 (TP2, 4096-token Prefill)、Kimi 672.04/15.69 (TP4, 4096-token Prefill). Every model passes its performance and finite-logits gates.
 
 <!-- CCCP_PERFORMANCE_START -->

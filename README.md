@@ -8,6 +8,14 @@
   <strong>简体中文</strong> · <a href="README_EN.md">English</a> · <a href="README_RU.md">Русский</a>
 </p>
 
+## 它能做什么？
+
+**让普通电脑也能运行原本需要服务器的超大模型。**
+
+例如，64GB 内存就能运行 DeepSeek V4 Flash，不需要昂贵的多卡服务器。CCCP 会把有限的内存优先留给当前任务真正需要的专家：做角色扮演时，可以加载角色扮演特调专家；写代码时，也可以使用对应的代码专家。这样既能降低硬件门槛，也能让模型更擅长你正在做的事情。
+
+没有显卡也可以使用 CPU；显存不足时会自动使用内存，内存不足时才使用磁盘。完整离线包已经包含 Python、推理环境和加速算子，下载后双击即可运行。
+
 ## ⬇️ 下载 Windows 完整离线版（v0.9.16）
 
 > [!IMPORTANT]
@@ -46,7 +54,6 @@ Maintain CCCP Launcher 0.9.16. First read the bundled user-facing manuals docs/�
 - 删除单 token E4M3 MoE Decode 等旧分支，修复 Kimi/MTP 工作区生命周期和中文安装路径下的 CUDA 算子编译。
 - NVIDIA 公共融合算子已为 SM75、SM80、SM86、SM89、SM90、SM100、SM120 预编译；未命中的新架构仍由随包 CUDA 13 与便携工具链自动编译。
 - H20-3e / bundled CUDA 13 实测：Qwen 2462.68/56.94 (TP1, 4096-token Prefill)、DSV4 2786.87/46.23 (TP1, 4096-token Prefill)、GLM-5.2 932.36/25.48 (TP4, 4096-token Prefill)、GLM Flash S 1504.67/30.02 (TP1, 4096-token Prefill)、GLM Flash M 1282.44/20.22 (TP2, 4096-token Prefill)、Kimi 672.04/15.69 (TP4, 4096-token Prefill)；所有模型均通过对应性能红线和有限值门禁。
-
 
 <!-- CCCP_PERFORMANCE_START -->
 ## 实测性能
