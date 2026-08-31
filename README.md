@@ -47,13 +47,6 @@ Maintain CCCP Launcher 0.9.16. First read the bundled user-facing manuals docs/�
 - NVIDIA 公共融合算子已为 SM75、SM80、SM86、SM89、SM90、SM100、SM120 预编译；未命中的新架构仍由随包 CUDA 13 与便携工具链自动编译。
 - H20-3e / bundled CUDA 13 实测：Qwen 2462.68/56.94 (TP1, 4096-token Prefill)、DSV4 2786.87/46.23 (TP1, 4096-token Prefill)、GLM-5.2 932.36/25.48 (TP4, 4096-token Prefill)、GLM Flash S 1504.67/30.02 (TP1, 4096-token Prefill)、GLM Flash M 1282.44/20.22 (TP2, 4096-token Prefill)、Kimi 672.04/15.69 (TP4, 4096-token Prefill)；所有模型均通过对应性能红线和有限值门禁。
 
-### 0.9.16 重点更新
-
-- 所有码本模型的紧凑 CUDA Decode 统一使用 packed-index + Q8 码本 + DP4A 公共执行器；Prefill 自动选择公共 packed VQ 或 E4M3/FP8 分组矩阵乘。
-- Linux/CUDA 优先使用 FlashInfer MLA；原生 Windows/CUDA 明确使用 CCCP paged latent 公共 CUDA 算子，不会静默退回普通 BF16 Attention。
-- DSV4、Qwen、GLM、Kimi 只通过模型清单声明结构，复用同一套码本算法、显存规划与缓存层，不减少专家。
-- 删除单 token E4M3 MoE Decode 等旧分支，修复 Kimi/MTP 工作区生命周期和中文安装路径下的 CUDA 算子编译。
-- H20-3e / bundled CUDA 13 实测：Qwen 2462.68/56.94 (TP1, 4096-token Prefill)、DSV4 2786.87/46.23 (TP1, 4096-token Prefill)、GLM-5.2 932.36/25.48 (TP4, 4096-token Prefill)、GLM Flash S 1504.67/30.02 (TP1, 4096-token Prefill)、GLM Flash M 1282.44/20.22 (TP2, 4096-token Prefill)、Kimi 672.04/15.69 (TP4, 4096-token Prefill)；所有模型均通过对应性能红线和有限值门禁。
 
 <!-- CCCP_PERFORMANCE_START -->
 ## 实测性能
