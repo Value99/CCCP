@@ -23738,6 +23738,31 @@ bool packed_h2d_batch(
     attributes.flags = cudaMemcpyFlagPreferOverlapWithCompute;
     size_t attributes_index = 0;
     auto stream = at::cuda::getCurrentCUDAStream(device);
+    const auto enqueue_async_loop = [&]() {
+        for (size_t index = 0; index < sizes.size(); ++index) {
+            const cudaError_t copy_status = cudaMemcpyAsync(
+                dst_ptrs[index],
+                src_ptrs[index],
+                sizes[index],
+                cudaMemcpyHostToDevice,
+                stream);
+            TORCH_CHECK(
+                copy_status == cudaSuccess,
+                "compiled packed H2D fallback failed at copy ",
+                index,
+                ": ",
+                cudaGetErrorString(copy_status));
+        }
+        return true;
+    };
+    // A 12.8+ runtime may be paired with an older installed driver which
+    // exports the batch-copy symbol but rejects the API at runtime. Remember
+    // only cudaErrorCallRequiresNewerDriver; supported drivers stay on the
+    // native batch path and all unrelated CUDA errors remain fatal below.
+    static std::atomic<bool> batch_copy_unsupported{false};
+    if (batch_copy_unsupported.load(std::memory_order_relaxed)) {
+        return enqueue_async_loop();
+    }
 #if CUDART_VERSION >= 13000
     // CUDA 13 removed the failIdx output and made source pointers const.
     // Keep one public operator source compatible with both Blackwell's CUDA
@@ -23751,10 +23776,6 @@ bool packed_h2d_batch(
         &attributes_index,
         1,
         stream);
-    TORCH_CHECK(
-        status == cudaSuccess,
-        "cudaMemcpyBatchAsync failed: ",
-        cudaGetErrorString(status));
 #else
     size_t failed_index = SIZE_MAX;
     const cudaError_t status = cudaMemcpyBatchAsync(
@@ -23767,6 +23788,19 @@ bool packed_h2d_batch(
         1,
         &failed_index,
         stream);
+#endif
+    if (status == cudaErrorCallRequiresNewerDriver) {
+        (void)cudaGetLastError();
+        const bool submitted = enqueue_async_loop();
+        batch_copy_unsupported.store(true, std::memory_order_relaxed);
+        return submitted;
+    }
+#if CUDART_VERSION >= 13000
+    TORCH_CHECK(
+        status == cudaSuccess,
+        "cudaMemcpyBatchAsync failed: ",
+        cudaGetErrorString(status));
+#else
     TORCH_CHECK(
         status == cudaSuccess,
         "cudaMemcpyBatchAsync failed at copy ",
