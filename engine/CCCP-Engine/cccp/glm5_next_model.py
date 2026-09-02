@@ -276,6 +276,143 @@ def _glm5_next_hc_post(
     )
 
 
+class GLM5NextLatentSparseAttention(nn.Module):
+    """GLM-5.3 DSA over the normalized 512-wide latent KV cache.
+
+    The official topology expands every latent into per-head K/V before caching.
+    This runtime keeps the mathematically equivalent absorbed form instead:
+    ``q_nope @ Wuk`` attends to normalized ``c_kv`` through FlashMLA, then the
+    selected latent context is projected by ``Wuv``.  A one-element K/V marker
+    advances the upstream cache layer length; it never participates in
+    attention and costs only four bytes per token and sparse layer.
+    """
+
+    def __init__(self, attention: nn.Module, *, max_ctx: int) -> None:
+        super().__init__()
+        if int(attention.qk_rope_head_dim) != 0:
+            raise ValueError("GLM5Next latent DSA currently requires NoPE")
+        self.attention = attention
+        self.max_ctx = int(max_ctx)
+        self.layer_idx = int(attention.layer_idx)
+        self.num_heads = int(attention.num_heads)
+        self.kv_lora_rank = int(attention.kv_lora_rank)
+        self.qk_nope_head_dim = int(attention.qk_nope_head_dim)
+        self.v_head_dim = int(attention.v_head_dim)
+        weight = attention.kv_b_proj.weight
+        if not isinstance(weight, torch.Tensor):
+            raise TypeError("GLM5Next kv_b_proj must be a resident tensor")
+        split = weight.view(
+            self.num_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+            self.kv_lora_rank,
+        )
+        self.register_buffer("wuk", split[:, : self.qk_nope_head_dim].contiguous())
+        self.register_buffer("wuv", split[:, self.qk_nope_head_dim :].contiguous())
+        self.register_buffer(
+            "latent_cache",
+            torch.empty(
+                self.max_ctx,
+                1,
+                self.kv_lora_rank,
+                dtype=weight.dtype,
+                device=weight.device,
+            ),
+        )
+        self.length = 0
+        from .flashmla_sparse import FlashMLASparseRunner
+
+        self.runner = FlashMLASparseRunner.create()
+
+    def reset(self) -> None:
+        self.length = 0
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        past_key_values=None,
+        prev_topk_indices: torch.Tensor | None = None,
+        **_kwargs,
+    ) -> tuple[torch.Tensor, None, torch.Tensor | None]:
+        batch_size, seq_length = hidden_states.shape[:2]
+        if batch_size != 1:
+            raise ValueError("GLM5Next latent DSA requires batch=1")
+        start = int(self.length)
+        end = start + int(seq_length)
+        if end > self.max_ctx:
+            raise RuntimeError(f"latent KV context exceeded ({end} > {self.max_ctx})")
+
+        q_resid = self.attention.q_a_layernorm(
+            self.attention.q_a_proj(hidden_states)
+        )
+        query = self.attention.q_b_proj(q_resid).view(
+            batch_size,
+            seq_length,
+            self.num_heads,
+            self.qk_nope_head_dim,
+        )
+        compressed = self.attention.kv_a_proj_with_mqa(hidden_states)
+        latent = self.attention.kv_a_layernorm(compressed)[0].to(
+            self.latent_cache.dtype
+        )
+        self.latent_cache[start:end, 0].copy_(latent)
+
+        if past_key_values is not None:
+            marker = torch.zeros(
+                batch_size,
+                1,
+                seq_length,
+                1,
+                dtype=latent.dtype,
+                device=latent.device,
+            )
+            past_key_values.update(
+                marker,
+                marker,
+                self.layer_idx,
+            )
+        if self.attention.indexer is not None:
+            if attention_mask is None:
+                attention_mask = torch.ones(
+                    batch_size,
+                    seq_length,
+                    dtype=torch.bool,
+                    device=hidden_states.device,
+                )
+            topk_indices = self.attention.indexer(
+                hidden_states=hidden_states,
+                q_resid=q_resid,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+            )
+        else:
+            if prev_topk_indices is None:
+                raise ValueError("shared latent DSA layer requires prior indices")
+            topk_indices = prev_topk_indices
+
+        absorbed_query = torch.einsum(
+            "bthn,hnr->thr",
+            query.to(self.wuk.dtype),
+            self.wuk,
+        ).contiguous()
+        latent_context = self.runner.prefill(
+            query=absorbed_query,
+            key_cache=self.latent_cache[:end],
+            indices=topk_indices[0].unsqueeze(1).contiguous(),
+            sink=None,
+            scale=float(self.attention.scaling),
+        )
+        expanded = torch.einsum(
+            "thr,hvr->thv",
+            latent_context,
+            self.wuv,
+        ).reshape(batch_size, seq_length, -1)
+        output = self.attention.o_proj(expanded)
+        self.length = end
+        shared = topk_indices if self.attention.next_skip_topk else None
+        return output, None, shared
+
+
 class GLM5NextDecoderLayerRuntime(nn.Module):
     """Topology-only adapter using public H/C, Attention and routed-VQ math."""
 
@@ -808,6 +945,11 @@ class GLM5NextCCCPModel:
         self._fixed_token_graph = None
         self._fixed_token_graph_cache = None
         self._fixed_token_graph_capacity = 0
+        self._chunked_prefill_active = False
+        self._latent_dsa_enabled = (
+            self.device.type == "cuda"
+            and os.environ.get("CCCP_GLM_LATENT_DSA", "0") == "1"
+        )
         self._device_token_history: torch.Tensor | None = None
         self._token_history: list[int] = []
         self.pos = 0
@@ -928,6 +1070,26 @@ class GLM5NextCCCPModel:
                 decode_graph_pool=decode_graph_pool,
             )
 
+    def _install_latent_sparse_attention(self, model: nn.Module) -> int:
+        if not self._latent_dsa_enabled:
+            return 0
+        replaced = 0
+        for decoder in model.layers:
+            if getattr(decoder, "block_type", None) != "deepseek_sparse_attention":
+                continue
+            decoder.self_attn = GLM5NextLatentSparseAttention(
+                decoder.self_attn,
+                max_ctx=self.max_ctx,
+            )
+            replaced += 1
+        print(
+            "[cccp-glm5-next] latent DSA enabled: "
+            f"layers={replaced} cache=BF16[{self.max_ctx},512] "
+            "attention=flashmla.sparse-prefill",
+            flush=True,
+        )
+        return replaced
+
     @staticmethod
     def _install_static_sparse_index_pools(model: nn.Module) -> None:
         for decoder in model.layers:
@@ -1014,6 +1176,7 @@ class GLM5NextCCCPModel:
         state = self._assign_remaining_state(model)
         routers = self._replace_sparse_routers(model)
         self._install_static_sparse_index_pools(model)
+        latent_layers = self._install_latent_sparse_attention(model)
         self._install_public_decoder_layers(model)
         lm_head = self._place_weight(
             self.store.get_dense("lm_head.weight"),
@@ -1025,7 +1188,7 @@ class GLM5NextCCCPModel:
         print(
             "[cccp-glm5-next] 官方文本拓扑绑定完成："
             f"公共 Linear={linears}，公共 Router={routers}，"
-            f"非线性状态={state}；"
+            f"latent DSA={latent_layers}，非线性状态={state}；"
             "视觉塔未载入",
             flush=True,
         )
@@ -1162,6 +1325,7 @@ class GLM5NextCCCPModel:
             self.device.type == "cuda"
             and self.tp_size == 1
             and self.routed_vq.full_resident
+            and not self._latent_dsa_enabled
             and os.environ.get("CCCP_FIXED_TOKEN_GRAPH", "1") != "0"
         )
 
@@ -1329,6 +1493,102 @@ class GLM5NextCCCPModel:
             ].copy_(input_ids[0])
         return output.last_hidden_state.squeeze(0)
 
+    def _prefill_chunk_size(self) -> int:
+        """Return the bounded GLM Prefill block size (0 disables chunking)."""
+        raw = os.environ.get("CCCP_GLM_PREFILL_CHUNK_SIZE", "4096").strip()
+        try:
+            size = int(raw)
+        except ValueError as error:
+            raise ValueError(
+                "CCCP_GLM_PREFILL_CHUNK_SIZE must be an integer"
+            ) from error
+        if size <= 0:
+            return 0
+        return max(256, min(size, 8192))
+
+    @torch.inference_mode()
+    def _prefill_chunked_last(self, ids: list[int], chunk_size: int) -> torch.Tensor:
+        """Prefill a long prompt with bounded activations and return last hidden.
+
+        The official GLM cache owns recurrent KDA and sparse-attention state.
+        Passing every block back through the same cache preserves exact token
+        order while intermediate hidden tensors can be released immediately.
+        """
+        if self._model is None:
+            raise RuntimeError("GLM-5.3 model has not been preloaded")
+        if self.pos != 0:
+            raise RuntimeError("chunked GLM Prefill requires an empty cache")
+        from transformers import DynamicCache
+
+        # A large StaticCache reserves expanded BF16 K/V up to its bucket before
+        # the first block runs.  Long Prefill must grow a DynamicCache block by
+        # block; reset() restores the short-context fixed Decode graph later.
+        self._fixed_token_graph = None
+        self._fixed_token_graph_cache = None
+        self._fixed_token_graph_capacity = 0
+        offload = (
+            not self._latent_dsa_enabled
+            and os.environ.get("CCCP_GLM_KV_OFFLOAD", "0") == "1"
+        )
+        self._past_key_values = DynamicCache(
+            config=self._text_config,
+            offloading=offload,
+            offload_only_non_sliding=False,
+        )
+        if offload:
+            cache = self._past_key_values
+
+            def update_indexer_with_offload(
+                cache_self,
+                indexer_key_states: torch.Tensor,
+                layer_idx: int,
+            ) -> torch.Tensor:
+                layer = cache_self.layers[layer_idx]
+                if not hasattr(layer, "update_indexer"):
+                    raise ValueError(
+                        f"GLM cache layer {layer_idx} has no indexer state"
+                    )
+                old = getattr(layer, "indexer_keys", None)
+                if (
+                    isinstance(old, torch.Tensor)
+                    and old.device != indexer_key_states.device
+                ):
+                    layer.indexer_keys = old.to(
+                        indexer_key_states.device,
+                        non_blocking=False,
+                    )
+                result = layer.update_indexer(indexer_key_states)
+                # Cache.update(K,V) offloads before GLM updates its DSA indexer.
+                # Keep the returned tensor live on CUDA for this attention call,
+                # but retain the long-lived cache copy on CPU between layers.
+                layer.indexer_keys = result.to("cpu", non_blocking=False)
+                return result
+
+            cache.update_indexer = MethodType(
+                update_indexer_with_offload,
+                cache,
+            )
+        self._chunked_prefill_active = True
+        last_hidden = None
+        total = len(ids)
+        for start in range(0, total, chunk_size):
+            stop = min(total, start + chunk_size)
+            chunk = ids[start:stop]
+            hidden = self._forward_eager_hidden(chunk)
+            self.pos = stop
+            self._token_history.extend(int(item) for item in chunk)
+            last_hidden = hidden[-1:]
+            del hidden
+        if last_hidden is None:
+            raise ValueError("chunked GLM Prefill requires at least one token")
+        print(
+            "[cccp-glm5-next] 分块 Prefill 完成："
+            f"tokens={total} chunk={chunk_size} blocks="
+            f"{(total + chunk_size - 1) // chunk_size}",
+            flush=True,
+        )
+        return last_hidden
+
     @torch.inference_mode()
     def reset_kv(self) -> None:
         if (
@@ -1343,16 +1603,30 @@ class GLM5NextCCCPModel:
                     reset_graph = getattr(decoder, "reset_decode_graph", None)
                     if callable(reset_graph):
                         reset_graph()
+                    reset_attention = getattr(
+                        getattr(decoder, "self_attn", None),
+                        "reset",
+                        None,
+                    )
+                    if callable(reset_attention):
+                        reset_attention()
         self._token_history.clear()
         self.pos = 0
 
     def reset(self) -> None:
+        restore_fixed_graph = bool(
+            self._multimodal_active or self._chunked_prefill_active
+        )
         self.reset_kv()
-        # A media turn is request-local. Rebuild the normal text graph lazily
-        # only if a later text request needs it; vision weights remain loaded
-        # but are never touched by the text-only forward path.
-        if self._multimodal_active:
+        # Media and long-Prefill turns temporarily replace the short-context
+        # StaticCache.  Release their request-local state before rebuilding the
+        # fixed one-token Decode graph for ordinary traffic.
+        if restore_fixed_graph:
             self._multimodal_active = False
+            self._chunked_prefill_active = False
+            gc.collect()
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
             if self._fixed_token_graph_enabled():
                 self._capture_fixed_token_graph()
 
@@ -1430,7 +1704,16 @@ class GLM5NextCCCPModel:
         if len(ids) == 1 and self._fixed_token_graph is not None:
             _hidden, logits = self._forward_fixed_token(ids[0])
             return logits.squeeze(0)
-        hidden = self.forward_hidden(ids)
+        chunk_size = self._prefill_chunk_size()
+        if (
+            chunk_size
+            and len(ids) > chunk_size
+            and self.pos == 0
+            and not self._multimodal_active
+        ):
+            hidden = self._prefill_chunked_last(ids, chunk_size)
+        else:
+            hidden = self.forward_hidden(ids)
         return self.logits_of(hidden[-1:]).squeeze(0)
 
 
